@@ -751,100 +751,36 @@ class RemainingUsageTests(unittest.TestCase):
         finally:
             cache_env()
 
-    def test_daily_guards_share_one_fold(self):
-        # 三个护栏共用一次设置读取与一次折叠（open_upstream 每请求都调）。
-        # 桩必须照抄真实池的返回形状：AccountPool.apply_daily_* 返回的是各自
-        # 的 limits 字典，不是计数——返回 1 会让「拿返回值做算术」的错误溜过去。
+    def test_daily_guards_are_pushed_to_every_provider(self):
+        # 守卫设置与限额校验由每个提供方自己做；这里只保证两个提供方都被推进，
+        # 且 refresh 标志原样传到（设置保存后立即生效的唯一途径）。
         calls = []
 
-        class _Pool(object):
-            def apply_daily_token_limit(self, limits, usage):
-                calls.append(("token", dict(limits), usage)); return dict(limits)
+        class _Provider(object):
+            def __init__(self, name):
+                self.name = name
 
-            def apply_daily_credit_limit(self, limits, credits, free_models):
-                calls.append(("credit", dict(limits), credits)); return dict(limits)
+            def apply_pool_guards(self, refresh=False):
+                calls.append((self.name, refresh))
+                return 1
 
-            def apply_model_daily_token_limit(self, limits, per_model):
-                calls.append(("model", dict(limits), per_model)); return dict(limits)
-
-        stats_calls = {"n": 0}
-        real_stats = U.daily_usage_stats
-
-        def counting_stats(ttl=None):
-            stats_calls["n"] += 1
-            return real_stats(ttl=ttl)
-
-        old_pool = P.POOL
-        old_dir = P.ACCOUNTS_DIR
-        P.POOL = _Pool()
-        # ACCOUNTS_DIR 是脚本自身目录、不走环境变量，这里显式指到临时目录，
-        # 否则护栏读的是仓库里的 accounts/。
-        P.ACCOUNTS_DIR = ACCOUNTS_DIR
-        U.daily_usage_stats = counting_stats
+        providers = [_Provider("workbuddy"), _Provider("codearts")]
+        real = U._providers
+        U._providers = lambda: providers
         try:
-            # 没配限额：一次折叠都不该发生，也不该碰池子。
-            for key in ("daily_token_limit", "daily_credit_limit",
-                        "model_daily_token_limit"):
-                wb_settings.set_limit(ACCOUNTS_DIR, key, "global", 0)
-            self.assertEqual(U.apply_daily_guards(), 0)
-            self.assertEqual(stats_calls["n"], 0)
-            self.assertEqual(calls, [])
-
-            wb_settings.set_limit(ACCOUNTS_DIR, "daily_token_limit", "global", 1000)
-            wb_settings.set_limit(ACCOUNTS_DIR, "model_daily_token_limit", "global", 50)
-            write_log([usage_row(time.time() - HOUR, "acct-A", 700)])
             self.assertEqual(U.apply_daily_guards(), 2)
-            self.assertEqual(stats_calls["n"], 1, "三份限额共用一次折叠")
-            self.assertEqual([c[0] for c in calls], ["token", "model"])
-            # 折叠失败（读不到日志）时三份都拿到 None，绝不据此停号。
+            self.assertEqual(calls, [("workbuddy", False), ("codearts", False)])
             calls[:] = []
-            P.USAGE_LOG, saved = P.USAGE_LOG + ".gone", P.USAGE_LOG
-            try:
-                # refresh=True 绕开计数器的 TTL，确保这次真的去读（读不到）。
-                # 设置保存路径会把三条护栏都推一次，值为 0 的也推。
-                self.assertEqual(U.apply_daily_guards(refresh=True), 3)
-            finally:
-                P.USAGE_LOG = saved
-            self.assertTrue(all(c[2] is None for c in calls),
-                            "读不到计数时必须传 None（未知 ≠ 0）")
-
-            # 真池再走一遍：桩的返回形状写错（比如返回 1）时这条会红。
-            real_pool = wb_accounts.AccountPool(ACCOUNTS_DIR, log=None)
-            real_pool.accounts = [account("acct-A")]
-            P.POOL = real_pool
-            self.assertEqual(U.apply_daily_guards(refresh=True), 3)
-            self.assertEqual(real_pool.accounts[0].daily_token_limit, 1000)
-
-            # 一次读取多键：逐值与单键入口一致，且只读一次限额表。
-            reads = {"n": 0}
-            real_limits_data = wb_settings.limits_data
-
-            def counting_limits_data(directory):
-                reads["n"] += 1
-                return real_limits_data(directory)
-
-            wb_settings.limits_data = counting_limits_data
-            try:
-                many = wb_settings.limit_values_many(
-                    ACCOUNTS_DIR, ("daily_token_limit", "daily_credit_limit",
-                                   "model_daily_token_limit"))
-                self.assertEqual(reads["n"], 1, "三份限额共用一次读取")
-            finally:
-                wb_settings.limits_data = real_limits_data
-            for key in ("daily_token_limit", "daily_credit_limit",
-                        "model_daily_token_limit"):
-                self.assertEqual(many[key],
-                                 wb_settings.limit_values(ACCOUNTS_DIR, key))
+            self.assertEqual(U.apply_daily_guards(refresh=True), 2)
+            self.assertEqual(calls, [("workbuddy", True), ("codearts", True)])
+            calls[:] = []
+            U.apply_daily_token_limit(refresh=True)
+            U.apply_daily_credit_limit()
+            U.apply_model_daily_token_limit()
+            names = [name for name, _refresh in calls]
+            self.assertEqual(names, ["workbuddy", "codearts"] * 3)
         finally:
-            P.POOL = old_pool
-            P.ACCOUNTS_DIR = old_dir
-            U.daily_usage_stats = real_stats
-            for key in ("daily_token_limit", "daily_credit_limit",
-                        "model_daily_token_limit"):
-                try:
-                    wb_settings.set_limit(ACCOUNTS_DIR, key, "global", 0)
-                except Exception:
-                    pass
+            U._providers = real
 
     def test_live_cap_event_is_persisted_and_survives_restart(self):
         # 请求路径在判定撞线的那一刻就记下它：引发撞线的行已在日志里，但可能
@@ -1269,11 +1205,10 @@ class RemainingPriorityTests(unittest.TestCase):
         clear_events()
         restart_fold()
 
-    def _pool(self, accounts, weights=None, smart=True):
+    def _pool(self, accounts, weights=None):
         directory = tempfile.mkdtemp(prefix="remaining-priority-")
         pool = wb_accounts.AccountPool(directory, log=lambda _m: None)
         pool.accounts = accounts
-        pool.smart_routing = smart
         if weights is not None:
             pool.apply_remaining_weights(weights)
         return pool
@@ -1351,12 +1286,6 @@ class RemainingPriorityTests(unittest.TestCase):
                           weights={("acct-A", MODEL): 4, ("acct-B", MODEL): 2})
         picks = [pool.pick(realm="intl", model=MODEL).uid for _ in range(30)]
         self.assertGreater(picks.count("acct-A"), picks.count("acct-B"), picks)
-
-    def test_without_smart_routing_the_table_is_ignored(self):
-        pool = self._pool([account("acct-A"), account("acct-B")],
-                          weights={("acct-A", MODEL): 4}, smart=False)
-        picked = [pool.pick(realm="intl", model=MODEL).uid for _ in range(4)]
-        self.assertEqual(picked, ["acct-A", "acct-B", "acct-A", "acct-B"])
 
     def test_clearing_the_table_removes_the_bonus(self):
         pool = self._pool([account("acct-A"), account("acct-B")],

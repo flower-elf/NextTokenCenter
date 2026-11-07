@@ -16,6 +16,7 @@ import time
 import wb_accounts
 import wb_activity
 import wb_catalog
+import wb_channels
 import wb_cost
 import wb_pricing
 import wb_settings
@@ -93,7 +94,8 @@ def _gw():
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0,
-            "credit": 0.0, "cost_cny": 0.0, "cost_missing": {},
+            "credit": 0.0, "credit_missing": 0, "cost_cny": 0.0,
+            "cost_missing": {},
             "started": time.time(), "by_model": {},
             # 按 (model, realm) 再聚合一份，指标表可以按出口分行。
             "by_model_realm": {},
@@ -131,17 +133,24 @@ def normalize_usage_cache_aliases(usage):
     return usage
 
 def _extract_usage(usage):
-    """把上游 usage 块归一为网关跟踪的字段。"""
+    """把上游 usage 块归一为网关跟踪的字段。
+
+    上游没报单次扣费时 credit 留空（None），不写 0：0 会被当成「免费请求」，
+    聚合与费用估算都会把它算成真实花费 0。缺失就保持缺失，面板显示「—」。
+    """
     if not usage:
         return {}
     details = usage.get("completion_tokens_details") or {}
+    credit = usage.get("credit")
+    if isinstance(credit, bool) or not isinstance(credit, (int, float)):
+        credit = None
     return {
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
         "cached_tokens": _best_cached_tokens(usage),
         "total_tokens": usage.get("total_tokens") or 0,
-        "credit": usage.get("credit") or 0,
+        "credit": credit,
     }
 def row_realm(row):
     """日志行所属的 realm。
@@ -153,8 +162,8 @@ def row_realm(row):
     if r:
         return r
     acct_uid = row.get("account")
-    if acct_uid and _gw().POOL:
-        acc = _gw().POOL.get(acct_uid)
+    if acct_uid:
+        _provider, acc = wb_channels.find_account(acct_uid)
         if acc:
             return acc.realm
     model = row.get("model")
@@ -269,6 +278,23 @@ def audit_columns(audit):
         "api": audit.get("api") or "",
     }
 
+
+def _apply_route_columns(row, audit):
+    """按请求上下文写出实际调用的出口与上游模型 id，客户端请求的 id 记进 requested_model。"""
+    audit = audit or {}
+    routed = audit.get("upstream_model")
+    if routed and routed != row["model"] and "requested_model" not in row:
+        row["requested_model"] = row["model"]
+        row["model"] = routed
+    if audit.get("realm"):
+        row["realm"] = audit["realm"]
+
+
+def _route_log_tags(row):
+    requested = row.get("requested_model")
+    return "realm=%s model=%s%s" % (row.get("realm") or "-", row.get("model"),
+                                    " requested=%s" % requested if requested else "")
+
 _REQUEST_AUDIT = threading.local()
 
 def bind_audit(audit):
@@ -354,7 +380,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
-    acc = _gw().POOL.get(account) if (account and _gw().POOL) else None
+    acc = None
+    if account:
+        _provider, acc = wb_channels.find_account(account)
     row["realm"] = acc.realm if acc else _gw().CURRENT_REALM
     # 没有提供 key 时也写入空值：空值与老行的缺失字段区分了未带 key 和
     # 字段出现之前写入，看板把它们统计为两个不同的桶。
@@ -362,12 +390,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     if audit is None:
         audit = current_audit()
     row.update(audit_columns(audit))
+    _apply_route_columns(row, audit)
     if not row["key_id"]:
         row["key_id"] = row["key"]
     row["status"] = int((audit or {}).get("status") or 200)
     # 本次请求使用的价格策略，以引用形式保存，便于表去重与清扫。
     # 没有引用的行回退到时间线计价。
-    row["cost_policy"] = wb_pricing.current_policy_id(model)
+    row["cost_policy"] = wb_pricing.current_policy_id(row["model"])
     # 只在请求带了推理档位时写入：面板只为带该字段的行显示标记，
     # 没有推理档位的模型没有可报的内容。
     if effort:
@@ -387,7 +416,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         key_tag = f" key={_gw().key_label(key)}" if key else ""
         speed_tag = f" {row.get('tokens_per_sec', 0)}t/s" if row.get("tokens_per_sec") else ""
         miss_tag = " usage=missing" if usage_missing else ""
-        _gw().log(f"chat done: model={model}{acc_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
+        _gw().log(f"chat done: {_route_log_tags(row)}{acc_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
     except Exception:
         pass
     return row
@@ -626,12 +655,13 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         row.update(fp)
     if account:
         row["account"] = account
-        acc = _gw().POOL.get(account) if _gw().POOL else None
+        _provider, acc = wb_channels.find_account(account)
         row["realm"] = acc.realm if acc else _gw().CURRENT_REALM
     row["key"] = key or ""
     if audit is None:
         audit = current_audit()
     row.update(audit_columns(audit))
+    _apply_route_columns(row, audit)
     if not row["key_id"]:
         row["key_id"] = row["key"]
     _persist_usage(row, "error persist failed")
@@ -641,7 +671,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     acc_tag = f" acct={account[:8]}" if account else ""
     # 限流是上游给的窗口，不是故障：日志按警告记，红色错误留给真正的失败。
     level = "WARN" if outcome == "rate_limited" else "ERROR"
-    _gw().log(f"request error: model={model}{dur}{acc_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
+    _gw().log(f"request error: {_route_log_tags(row)}{dur}{acc_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
         level=level, tag="chat")
     return row
 
@@ -822,92 +852,56 @@ def seconds_until_local_midnight():
     nxt = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
     return max(60, int(nxt - time.time()))
 
-def apply_daily_token_limit(refresh=False):
-    """把每日 token 限额设置与今日计数推进池子。
+def _providers():
+    """每个提供方一次；intl/cn 共用一个提供方，不能重复推进。"""
+    import wb_channels
+    out, seen = [], set()
+    for realm in wb_channels.ids():
+        prov = wb_channels.provider(realm)
+        if prov.name in seen:
+            continue
+        seen.add(prov.name)
+        out.append(prov)
+    return out
 
-    设置按 realm 求值：两个出口可以限不同数字，没有覆盖值的 realm
-    仍跟随全局默认。
+
+def apply_pool_guards(refresh=False):
+    """把守卫设置与今日计数推给每个提供方的账号池。
+
+    每条关卡（保留积分、每日 token、每日积分、单模型 token、临期窗口）由提供方
+    自己读设置并落到账号上；这里只保证两个提供方都被推进，没有账号的提供方跳过。
     """
-    if _gw().POOL is None:
-        return 0
-    limits = wb_settings.limit_values(_gw().ACCOUNTS_DIR, "daily_token_limit")
-    usage = None
-    if any(value > 0 for value in limits.values()):
-        usage = daily_tokens_by_account(ttl=0 if refresh else None)
-    return _gw().POOL.apply_daily_token_limit(limits, usage)
-
-def apply_daily_credit_limit(refresh=False):
-    """把每日积分限额设置、今日消耗与免费模型视图推进池子。"""
-    if _gw().POOL is None:
-        return 0
-    limits = wb_settings.limit_values(_gw().ACCOUNTS_DIR, "daily_credit_limit")
-    credits = None
-    free_models = None
-    if any(value > 0 for value in limits.values()):
-        stats = daily_usage_stats(ttl=0 if refresh else None)
-        credits = stats["credits"] if stats is not None else None
-        free_models = free_models_by_realm()
-    return _gw().POOL.apply_daily_credit_limit(limits, credits, free_models)
-
-def apply_model_daily_token_limit(refresh=False):
-    """把按模型每日 token 限额设置与今日计数推进池子。"""
-    if _gw().POOL is None:
-        return 0
-    limits = wb_settings.limit_values(_gw().ACCOUNTS_DIR, "model_daily_token_limit")
-    per_model = None
-    if any(value > 0 for value in limits.values()):
-        stats = daily_usage_stats(ttl=0 if refresh else None)
-        per_model = stats["models"] if stats is not None else None
-    return _gw().POOL.apply_model_daily_token_limit(limits, per_model)
-
-def apply_daily_guards(refresh=False):
-    """一次推进三条每日护栏。
-
-    三条共用一份设置与同一批日计数：读一次设置、折一次日志、推三次。各自
-    语义不变：按 realm 的限额、积分护栏的免费模型豁免，以及「没配限额 ->
-    计数未知，绝不跳过账号」（日志读不出时三份计数都是 None）。`refresh`
-    强制绕过计数 TTL，设置保存后立即可见。
-    """
-    if _gw().POOL is None:
-        return 0
-    ttl = 0 if refresh else None
-    guards = wb_settings.limit_values_many(
-        _gw().ACCOUNTS_DIR, ("daily_token_limit", "daily_credit_limit",
-                       "model_daily_token_limit"))
-    token_limits = guards["daily_token_limit"]
-    credit_limits = guards["daily_credit_limit"]
-    model_limits = guards["model_daily_token_limit"]
-    wants = (any(v > 0 for v in token_limits.values())
-             or any(v > 0 for v in credit_limits.values())
-             or any(v > 0 for v in model_limits.values()))
-    stats = daily_usage_stats(ttl=ttl) if wants else None
-    # 池上这三个 apply_* 的返回值是它们各自的 limits 字典（不是计数），调用方
-    # 谁也没用过；这里数的是「推了几条护栏」，别拿返回值做算术。
-    #
-    # 限额只活在账号对象的内存里，清掉旧值只能靠再推一次。设置保存路径
-    # （refresh=True）对三条护栏都推送，值为 0 也推；请求热路径保持
-    # 「没配限额就完全不碰池子」，不为此多付开销。
     published = 0
-    if refresh or any(v > 0 for v in token_limits.values()):
-        _gw().POOL.apply_daily_token_limit(
-            token_limits, stats["tokens"] if stats is not None else None)
-        published += 1
-    if refresh or any(v > 0 for v in credit_limits.values()):
-        _gw().POOL.apply_daily_credit_limit(
-            credit_limits, stats["credits"] if stats is not None else None,
-            free_models_by_realm())
-        published += 1
-    if refresh or any(v > 0 for v in model_limits.values()):
-        _gw().POOL.apply_model_daily_token_limit(
-            model_limits, stats["models"] if stats is not None else None)
+    for prov in _providers():
+        prov.apply_pool_guards(refresh=refresh)
         published += 1
     return published
+
+
+def apply_daily_token_limit(refresh=False):
+    """把每日 token 限额推进每个提供方的账号池。"""
+    return apply_pool_guards(refresh=refresh)
+
+
+def apply_daily_credit_limit(refresh=False):
+    """把每日积分限额推进每个提供方的账号池。"""
+    return apply_pool_guards(refresh=refresh)
+
+
+def apply_model_daily_token_limit(refresh=False):
+    """把按模型每日 token 限额推进每个提供方的账号池。"""
+    return apply_pool_guards(refresh=refresh)
+
+
+def apply_daily_guards(refresh=False):
+    """一次推进所有提供方的账号池守卫。"""
+    return apply_pool_guards(refresh=refresh)
 
 # ---------------------------------------------------------------------------
 # 智能选号：把每个账号今天的积分消耗折算成消耗速度，交给选号器打分
 #
 # usage.jsonl 只追加，所以这里用字节偏移做增量折叠；缓存键带上「今天」的
-# 本地日键，跨过午夜自然从零开始。只有开关打开时才读日志。
+# 本地日键，跨过午夜自然从零开始。请求路径按推送间隔触发一次折叠。
 # ---------------------------------------------------------------------------
 _route_credits = {"day": "", "credits": None, "offset": 0, "at": 0.0}
 _route_credits_lock = threading.Lock()
@@ -959,27 +953,37 @@ def daily_credits_by_account(ttl=None):
                                "offset": offset, "at": now})
         return dict(credits), True
 
-# 本月消耗：面板在今日积分卡片下面显示一行，只需要一个总数。与今日的按账号
-# 折叠分开：那份每天清零，这份按本地 1 号清零，两者共用同一套增量扫描与
-# 截断保护，但各自保留自己的 offset。
-_month_credit = {"month": "", "key": None, "offset": 0, "tail": b"",
-                 "totals": None, "at": 0.0}
+# 本月消耗：面板在今日积分卡片下面显示一行，需要总数与「未采集」判定。与今日
+# 的按账号折叠分开：那份每天清零，这份按本地 1 号清零，两者共用同一套增量扫描
+# 与截断保护，但各自保留自己的 offset。缓存里每个出口一份 {credit, requests,
+# missing}；schema 变化时丢弃旧条目从零重折，不沿用旧形状的数字。
+_MONTH_CREDIT_SCHEMA = 2
+_month_credit = {"schema": _MONTH_CREDIT_SCHEMA, "month": "", "key": None,
+                 "offset": 0, "tail": b"", "totals": None, "at": 0.0}
 _month_credit_lock = threading.Lock()
 
+def _month_credit_bucket(totals, realm):
+    bucket = totals.get(realm)
+    if bucket is None:
+        bucket = totals[realm] = {"credit": 0.0, "requests": 0, "missing": 0}
+    return bucket
+
 def _scan_month_credits(offset, totals, start):
-    """从 offset 起把本月行的 credit 折进 realm -> 总额。"""
+    """从 offset 起把本月完成行折进 realm -> {credit, requests, missing}。"""
     def fold(row):
         if (row.get("at") or 0) < start:
             return
-        if row_outcome(row) == "client_aborted":
+        # 与 /usage 的 credit_missing 同口径：只数完成行，客户端取消与失败行
+        # 不进入分母。
+        if row_outcome(row) != "completed":
             return
+        bucket = _month_credit_bucket(totals, row_realm(row))
+        bucket["requests"] += 1
         spent = row.get("credit")
         if isinstance(spent, bool) or not isinstance(spent, (int, float)):
+            bucket["missing"] += 1
             return
-        if not spent:
-            return
-        realm = row_realm(row)
-        totals[realm] = totals.get(realm, 0.0) + float(spent)
+        bucket["credit"] += float(spent)
 
     offset, reset = _center_fold_rows(offset, fold)
     if reset:
@@ -996,7 +1000,8 @@ def month_credits(ttl=None):
     with _month_credit_lock:
         entry = _month_credit
         key = _usage_log_key()
-        fresh = (entry["month"] == month
+        fresh = (entry.get("schema") == _MONTH_CREDIT_SCHEMA
+                 and entry["month"] == month
                  and _log_offset_holds(entry["key"], key, entry["offset"])
                  and entry["totals"] is not None
                  and entry["tail"] == _log_tail_signature(entry["offset"]))
@@ -1013,20 +1018,26 @@ def month_credits(ttl=None):
             if fresh:
                 return dict(entry["totals"]), False
             return {}, False
-        _month_credit.update({"month": month, "key": _usage_log_key(),
+        _month_credit.update({"schema": _MONTH_CREDIT_SCHEMA,
+                              "month": month, "key": _usage_log_key(),
                               "offset": offset,
                               "tail": _log_tail_signature(offset),
                               "totals": totals, "at": now})
         return dict(totals), True
 
 def month_credit_view(realm=None):
-    """本月消耗的积分；realm 为空或 all 时返回两个出口的合计。"""
+    """本月消耗的积分与未采集扣费的完成行数；realm 为空或 all 时合计全部出口。"""
     r = realm_scope(realm, _gw().CURRENT_REALM)
     totals, ok = month_credits()
-    credit = totals.get(r, 0.0) if r else sum(totals.values())
+    buckets = [totals.get(r) or {}] if r else list(totals.values())
+    credit = sum(float(item.get("credit") or 0.0) for item in buckets)
+    requests = sum(int(item.get("requests") or 0) for item in buckets)
+    missing = sum(int(item.get("missing") or 0) for item in buckets)
     return {"realm": r or "all",
             "month": time.strftime("%Y-%m"),
             "credit": round(credit, 6),
+            "requests": requests,
+            "credit_missing": missing,
             "ok": ok}
 
 def month_credit_etag(realm=None):
@@ -1053,13 +1064,14 @@ _ROUTING_PUSH_SECONDS = 2.0
 _routing_push = {"at": 0.0, "credits": None}
 
 def apply_routing_inputs(refresh=False):
-    """把每个账号最近的积分消耗推给池子，供评分选路使用。
+    """把每个账号最近的积分消耗推给每个提供方，供评分选路使用。
 
     热路径上每个请求都会走到这里；日折叠本身有 TTL，但把结果逐个写回账号要拿
     账号池锁。两秒的推送间隔足够跟上按天计的消耗速度，refresh=True 仍然立即
-    推送（启动与设置变更）。
+    推送（启动与设置变更）。CodeArts 的消耗速度由它自己的套餐快照推导，传入的
+    uid 映射只服务 WorkBuddy。
     """
-    if _gw().POOL is None or not getattr(_gw().POOL, "smart_routing", False):
+    if _gw().POOL is None:
         return None
     now = time.time()
     if not refresh and (now - _routing_push["at"]) < _ROUTING_PUSH_SECONDS:
@@ -1068,7 +1080,9 @@ def apply_routing_inputs(refresh=False):
     if not ok:
         return None
     scale = credit_rate_scale()
-    _gw().POOL.apply_credit_rates({uid: value * scale for uid, value in credits.items()})
+    rates = {uid: value * scale for uid, value in credits.items()}
+    for prov in _providers():
+        prov.apply_routing_inputs(rates)
     _routing_push.update({"at": now, "credits": credits})
     return credits
 
@@ -1889,6 +1903,8 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
         return
     # 每个被统计字段只读一次：这行落进下面四个桶，每个桶都遍历同样的字段。
     present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row]
+    credit_reported = isinstance(row.get("credit"), (int, float)) \
+        and not isinstance(row.get("credit"), bool)
     m = model or "unknown"
     rr = row_realm(row)
     acct_id = row.get("account")
@@ -1899,6 +1915,8 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
         tgt["requests"] += 1
         for k, value in present:
             tgt[k] += value
+        if not credit_reported:
+            tgt["credit_missing"] = tgt.get("credit_missing", 0) + 1
         _fold_cost(tgt, cost, model)
         per = tgt["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
         per_realm = tgt["by_model_realm"].setdefault(m, {}).setdefault(
@@ -1912,6 +1930,8 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
             bucket["requests"] += 1
             for k, value in present:
                 bucket[k] += value
+            if not credit_reported:
+                bucket["credit_missing"] = bucket.get("credit_missing", 0) + 1
             if known:
                 bucket["cost_cny"] += cny
             if acct_id:
@@ -2231,15 +2251,20 @@ def _usage_snapshot_uncached(realm=None, since=None, until=None):
     snap["realm"] = r or "all"
     # 成本数字是人民币；面板按这个汇率折算显示美元，不必来回换算。
     snap["usd_cny"] = wb_pricing.usd_cny()
-    snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm} for a in _gw().POOL.accounts} if _gw().POOL else {}
+    snap["accounts_map"] = {
+        view["uid"]: {"nickname": view.get("nickname") or view["uid"],
+                      "realm": view.get("realm") or ""}
+        for view in wb_channels.all_views() if view.get("uid")
+    }
+    counts = _gw().provider_counts()
     snap["account"] = {
         "uid": (rep.uid if rep else ""),
         "domain": (rep.domain if rep else ""),
         "issuer": (wb_accounts.jwt_issuer(rep.access_token) if rep else ""),
         "credential_file": (os.path.basename(rep.path) if rep and rep.path else ""),
         "expires_at": (rep.expires_at if rep else 0),
-        "accounts": (len(_gw().POOL.accounts) if _gw().POOL else 0),
-        "accounts_ready": (_gw().POOL.count_ready() if _gw().POOL else 0),
+        "accounts": counts["total"],
+        "accounts_ready": counts["ready"],
     }
     return snap
 
@@ -2699,38 +2724,62 @@ def usage_filters(realm=None, key=None, status=None, model=None, account=None,
     return out
 
 def realm_state_file():
-    """持久化 realm 开关的路径。
+    """持久化默认路由的路径。
 
     每次访问时求值，不缓存成模块常量：常量在导入时按默认 _gw().ACCOUNTS_DIR
     构造，后给的 --accounts-dir（或指向别处的 Docker 卷）会让读写仍落在脚本旁
-    的 realm 开关上——面板报出的出口与配置的账号库不符。
+    的文件上——面板报出的出口与配置的账号库不符。
     """
     return os.path.join(_gw().ACCOUNTS_DIR, "active_realm.json")
 
-def load_persisted_realm():
+def _set_route(route):
+    _gw().ROUTE = tuple(route)
+    _gw().CURRENT_REALM = route[0]
+
+def load_persisted_route():
+    """读回默认路由，去掉此刻没有可用账号的渠道；一个都不剩时用登记表的第一个渠道。
+
+    旧版本把默认出口存成 {"realm": "cn"}；文件损坏或内容不认识时记一笔日志并
+    保持当前默认路由，启动不能因为一个状态文件失败。
+    """
     path = realm_state_file()
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                d = json.load(fh)
-                r = d.get("realm")
-                if r in ("intl", "cn"):
-                    _gw().CURRENT_REALM = r
-                    return _gw().CURRENT_REALM
-        except Exception as e:
-            _gw().log("could not load active realm: %s" % e)
-    return _gw().CURRENT_REALM
-def save_persisted_realm(realm):
-    if realm in ("intl", "cn"):
-        _gw().CURRENT_REALM = realm
-        try:
-            _ensure_dir(_gw().ACCOUNTS_DIR)
-            with _open_write(realm_state_file()) as fh:
-                json.dump({"realm": realm, "updated_at": time.time(), "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S")}, fh, indent=2)
-            _gw().log("persisted active realm '%s' to disk" % realm)
-        except Exception as exc:
-            _gw().log("failed to persist active realm: %s" % exc)
-    return _gw().CURRENT_REALM
+    if not os.path.isfile(path):
+        return _gw().ROUTE
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        _gw().log("persisted route unreadable: %s" % exc)
+        return _gw().ROUTE
+    if not isinstance(data, dict):
+        _gw().log("persisted route ignored: expected an object")
+        return _gw().ROUTE
+    raw = data.get("route")
+    if raw is None:
+        legacy = str(data.get("realm") or "").strip().lower()
+        raw = [legacy] if legacy in wb_channels.ids() else []
+    try:
+        route = wb_channels.parse_route(raw)
+    except ValueError as exc:
+        _gw().log("persisted route ignored: %s" % exc)
+        return _gw().ROUTE
+    usable = tuple(r for r in route
+                   if wb_channels.provider(r).configured(_gw().ACCOUNTS_DIR))
+    if usable != route:
+        _gw().log("persisted route %s: channels without usable accounts dropped"
+                  % ",".join(route))
+    _set_route(usable or (wb_channels.ids()[0],))
+    return _gw().ROUTE
+
+def save_persisted_route(route):
+    """设置并保存默认路由；route 必须是 wb_channels.parse_route 校验过的非空元组。"""
+    _set_route(route)
+    _ensure_dir(_gw().ACCOUNTS_DIR)
+    with _open_write(realm_state_file()) as fh:
+        json.dump({"route": list(route), "updated_at": time.time(),
+                   "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S")}, fh, indent=2)
+    _gw().log("persisted default route '%s' to disk" % ",".join(route))
+    return _gw().ROUTE
 
 # --------------------------------------------------------- 积分获取历史（发放记录）
 # 上游对每个账号返回一份积分包清单（免费套餐、每日活跃奖励的 Bonus Pack、活动包…），
@@ -3031,6 +3080,9 @@ def _new_analytics_stat():
             "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
             "cached_tokens": 0, "total_tokens": 0,
             "credit": 0.0,
+            # 上游没报单次扣费的完成行数。只有部分行缺失时仍显示已采集的金额，
+            # 全部缺失时面板把积分标成未采集，不能把 0 当成免费。
+            "credit_missing": 0,
             "cost_cny": 0.0,
             "ttft_sum": 0.0, "ttft_n": 0,
             "speed_sum": 0.0, "speed_n": 0,
@@ -3072,7 +3124,10 @@ def _analytics_row_values(row):
             row.get("credit") or 0,
             row.get("ttft_ms"),
             row.get("tokens_per_sec"),
-            row.get("elapsed_ms"))
+            row.get("elapsed_ms"),
+            # 0 是合法的扣费，缺失才是没采集；bool 是 int 的子类，要挡掉。
+            isinstance(row.get("credit"), (int, float))
+            and not isinstance(row.get("credit"), bool))
 
 def _feed_analytics(stat_obj, vals, is_err, cost_cny):
     """把一行的数字折进一个 analytics stat 对象。
@@ -3091,6 +3146,10 @@ def _feed_analytics(stat_obj, vals, is_err, cost_cny):
     stat_obj["cached_tokens"] += vals[3]
     stat_obj["total_tokens"] += vals[4]
     stat_obj["credit"] += vals[5]
+    # 与 /usage 的 credit_missing 同口径：只数完成行。分母是 requests，
+    # 面板据此判断这条汇总的积分是否全部未采集。
+    if not is_err and not vals[9]:
+        stat_obj["credit_missing"] += 1
     stat_obj["cost_cny"] += cost_cny
     if vals[6]:
         stat_obj["ttft_sum"] += vals[6]
@@ -4704,11 +4763,11 @@ def _build_key_rows(key_map, realm=None):
     key_map = key_map or {}
     rows = {}
 
-    def empty_row(k_id, name, declared_realm, enabled, source):
+    def empty_row(k_id, name, declared_route, enabled, source):
         return {
             "key": k_id,
             "name": name,
-            "realm": declared_realm,
+            "route": declared_route,
             "enabled": enabled,
             "source": source,
             "window": _new_analytics_stat(),
@@ -4723,9 +4782,9 @@ def _build_key_rows(key_map, realm=None):
         k_id = entry.get("id") or ""
         if not k_id:
             continue
-        declared = entry.get("realm") or ""
-        # 绑定到另一出口的 key 在这个视图里不可能有行。
-        if realm and declared and declared != realm:
+        declared = list(entry.get("route") or [])
+        # 路由里没有这个渠道的 key 在这个视图里不可能有行。
+        if realm and declared and realm not in declared:
             continue
         deleted = bool(entry.get("deleted_at"))
         rows[k_id] = empty_row(
@@ -4740,9 +4799,9 @@ def _build_key_rows(key_map, realm=None):
     # 说明不了谁花了多少。只有日志显示它确实被用过时才给它一行，那是它唯一
     # 值得对账的历史。
     if "launcher" not in rows and "launcher" in key_map:
-        rows["launcher"] = empty_row("launcher", "启动参数", "", True, "launcher")
+        rows["launcher"] = empty_row("launcher", "启动参数", [], True, "launcher")
     if "panel" in key_map:
-        rows["panel"] = empty_row("panel", "面板测试台", "", False, "panel")
+        rows["panel"] = empty_row("panel", "面板测试台", [], False, "panel")
 
     def adopt(row, km):
         row["window"] = km["window"]
@@ -4755,17 +4814,17 @@ def _build_key_rows(key_map, realm=None):
     unknown = None
     for k_id, km in key_map.items():
         if k_id == KEY_BUCKET_BEFORE:
-            rows[k_id] = empty_row(k_id, "(切换前)", "", False, "bucket")
+            rows[k_id] = empty_row(k_id, "(切换前)", [], False, "bucket")
             adopt(rows[k_id], km)
         elif k_id == KEY_BUCKET_ANON:
-            rows[k_id] = empty_row(k_id, "(无 key)", "", False, "bucket")
+            rows[k_id] = empty_row(k_id, "(无 key)", [], False, "bucket")
             adopt(rows[k_id], km)
         elif k_id in rows:
             adopt(rows[k_id], km)
         else:
             if unknown is None:
                 unknown = rows[KEY_BUCKET_UNKNOWN] = empty_row(
-                    KEY_BUCKET_UNKNOWN, "(未知 key)", "", False, "bucket")
+                    KEY_BUCKET_UNKNOWN, "(未知 key)", [], False, "bucket")
             _add_analytics_stat(unknown["window"], km["window"])
             _add_analytics_stat(unknown["all_time"], km["all_time"])
             for tgt, src in ((unknown["window_models"], km["window_models"]),
@@ -4787,8 +4846,7 @@ def _build_key_rows(key_map, realm=None):
         _finalize_analytics_stat(row["window"])
         _finalize_analytics_stat(row["all_time"])
         row["models"], row["models_other"] = _top_models(row["window_models"])
-        # 没有 realm 绑定的 key 跟随它被请求的模型，两个出口都可能服务——它的
-        # 积分列于是把两种产品的价格加在一起。页面必须能把这一点说出来。
+        # 一把 key 可能被多个渠道服务，积分列于是把几种产品的价格加在一起。页面必须能把这一点说出来。
         row["cross_realm"] = len([x for x in row["realms"] if x]) > 1
         row["key_id"] = row["key"]
         row["key_name"] = row["name"]
@@ -4797,28 +4855,29 @@ def _build_key_rows(key_map, realm=None):
     return out
 
 def _enrich_accounts_from_pool(acct_map, realm=None):
-    """为没有流量的账号补上 nickname/realm/credits。"""
-    if _gw().POOL:
-        for a in _gw().POOL.accounts:
-            if realm and a.realm != realm:
-                continue
-            if a.uid in acct_map:
-                acct_map[a.uid]["nickname"] = a.nickname
-                acct_map[a.uid]["realm"] = a.realm
-                acct_map[a.uid]["domain"] = a.domain
-                acct_map[a.uid]["credits"] = getattr(a, "credits", None) or {}
-            else:
-                    acct_map[a.uid] = {
-                        "uid": a.uid,
-                        "nickname": a.nickname,
-                        "realm": a.realm,
-                        "domain": a.domain,
-                        "credits": getattr(a, "credits", None) or {},
-                        "window": _new_analytics_stat(),
-                        "all_time": _new_analytics_stat(),
-                        "window_models": {},
-                        "all_models": {},
-                    }
+    """为没有流量的账号补上 nickname/realm/credits，两个提供方都补。"""
+    for view in wb_channels.all_views(realm=realm):
+        uid = view.get("uid")
+        if not uid:
+            continue
+        credits = view.get("credits") or {}
+        if uid in acct_map:
+            acct_map[uid]["nickname"] = view.get("nickname") or uid
+            acct_map[uid]["realm"] = view.get("realm") or ""
+            acct_map[uid]["domain"] = view.get("domain") or ""
+            acct_map[uid]["credits"] = credits
+        else:
+            acct_map[uid] = {
+                "uid": uid,
+                "nickname": view.get("nickname") or uid,
+                "realm": view.get("realm") or "",
+                "domain": view.get("domain") or "",
+                "credits": credits,
+                "window": _new_analytics_stat(),
+                "all_time": _new_analytics_stat(),
+                "window_models": {},
+                "all_models": {},
+            }
 
 def _finalize_analytics_stat(stat_obj):
         p = stat_obj["prompt_tokens"]

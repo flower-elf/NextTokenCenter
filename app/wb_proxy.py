@@ -27,10 +27,18 @@ import threading
 import time
 import urllib.error
 import subprocess
+if sys.version_info < (3, 12):
+    raise RuntimeError("NextTokenCenter 需要 Python 3.12 或更新版本，当前是 %d.%d"
+                       % sys.version_info[:2])
 import wb_accounts
 import wb_catalog
+import wb_channels
+import wb_codearts
 import wb_egress
 import wb_logstore
+import wb_media
+import wb_media_client
+import wb_media_tasks
 import wb_messages_responses
 import wb_pricing
 import wb_settings
@@ -73,7 +81,7 @@ stream_responses_to_message = wb_messages_responses.stream_responses_to_message
 IS_WINDOWS = os.name == "nt"
 
 # 一键配置客户端只在看板与网关同机打开时可用。
-# 该功能写的是网关进程所在机器的客户端配置，服务端、Docker 与 OpenWrt 部署下
+# 该功能写的是网关进程所在机器的客户端配置，服务端与 Docker 部署下
 # 看板是远程打开的，改动到不了用户电脑，还会白付探测与常驻开销。
 # wb_agents 因此懒加载：只有下面这道检查放行、路由真正命中时才 import。
 _AGENTS_MODULE = None
@@ -90,7 +98,7 @@ def agents_module():
 
 
 def server_deployment_form():
-    """进程是否以服务端形态运行，只认容器与 OpenWrt 标记；结果缓存，进程存活期间不变。
+    """进程是否以服务端形态运行，只认容器标记；结果缓存，进程存活期间不变。
     看板是否本机打开由 agents_client_allowed 按请求来源地址判断。"""
     global _SERVER_DEPLOYMENT
     if _SERVER_DEPLOYMENT is None:
@@ -104,15 +112,6 @@ def server_deployment_form():
                 blocked = any(m in cgroup for m in ("docker", "containerd", "kubepods"))
         except Exception:
             blocked = False
-        if not blocked:
-            try:
-                if os.path.exists("/etc/openwrt_release"):
-                    blocked = True
-                elif os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release", encoding="utf-8", errors="replace") as fh:
-                        blocked = "id=openwrt" in fh.read().lower()
-            except Exception:
-                blocked = False
         _SERVER_DEPLOYMENT = blocked
     return _SERVER_DEPLOYMENT
 
@@ -137,7 +136,10 @@ def port_owner_hint(port):
     if IS_WINDOWS:
         return "netstat -ano | findstr :%d" % port
     return "lsof -nP -iTCP:%d -sTCP:LISTEN" % port
-CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
+# 默认路由：没有绑定渠道的 Key 在这些渠道之间混合调度，只经 wb_usage.save_persisted_route 修改。
+# CURRENT_REALM 是它的第一个渠道，看板与统计在没有指定渠道时用它。
+ROUTE = wb_channels.parse_route(os.environ.get("WB_PROXY_DEFAULT_REALM") or "intl")
+CURRENT_REALM = ROUTE[0]
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
 INTL_EXCLUSIVE = {
     "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
@@ -159,6 +161,30 @@ def detect_model_realm(model_id):
     if m in _CN_DETECT_ONLY or m.startswith(("minimax-", "deepseek-v4-pro")):
         return "cn"
     return CURRENT_REALM
+
+
+def realm_options():
+    """可选的出口列表，来自渠道登记表。渠道是否有账号不影响能否查看；没账号时请求自然不可用。"""
+    return list(wb_channels.ids())
+
+
+def save_persisted_route(route):
+    return wb_usage.save_persisted_route(route)
+
+
+def load_persisted_route():
+    return wb_usage.load_persisted_route()
+
+
+def realm_state_file():
+    return wb_usage.realm_state_file()
+
+
+def credits_is_free(value):
+    """目录里的 credits 字符串表示免费时返回 True；未知值不算免费。"""
+    return str(value or "").strip().lower() in ("x0.00", "x0", "0", "0.00")
+
+
 # 只在单侧出口提供的模型。deepseek-v4.1-flash、hy3、glm-5.3 等两侧都提供，
 # 不能按冲突处理。glm-5.3-flash 由国际出口提供，也不在单侧列表里。
 CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
@@ -328,21 +354,8 @@ CORS_PATH_PREFIXES = ("/v1", "/chat", "/completions", "/models", "/responses")
 MANAGEMENT_PATH_PREFIXES = ("/v1/usage", "/usage", "/accounts", "/settings",
                             "/tasks", "/scheduler", "/panel", "/logs")
 
-#: 账号被上游限制、网关停止时仍然拒绝的 POST 路径。只放行本机管理动作
-#: （启停账号、导入导出、设置），凡是会带账号令牌访问上游的入口都返回 503。
-STAND_DOWN_POST_PATHS = frozenset((
-    "/v1/chat/completions", "/chat/completions",
-    "/v1/completions", "/completions",
-    "/v1/responses", "/responses",
-    "/v1/messages", "/messages",
-    "/v1/messages/count_tokens", "/messages/count_tokens",
-    "/accounts/checkin", "/accounts/credits",
-    "/accounts/daily-chat", "/accounts/daily-chat-web",
-    "/accounts/test", "/accounts/test-all", "/accounts/refresh",
-    "/accounts/login/start",
-    "/tasks/run", "/tasks/travel", "/tasks/streak-bonus",
-    "/scheduler/trigger", "/catalog/refresh",
-))
+#: 停止开关只在 open_upstream() 里按提供方判定，入口不再按路径拦截：同一个请求体
+#: 里的 CodeArts 流量不该被 WorkBuddy 的限制连坐。
 def cors_origin_allowed(path):
     path = (path or "").split("?")[0]
     if path.startswith(MANAGEMENT_PATH_PREFIXES):
@@ -351,6 +364,23 @@ def cors_origin_allowed(path):
 
 
 _chat_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CHAT)
+
+
+def provider_counts():
+    """两个提供方的账号总数与可用数；面板状态、/health 与并发槽共用一份口径。"""
+    out = {"total": 0, "ready": 0, "by_provider": {}}
+    seen = set()
+    for realm in wb_channels.ids():
+        prov = wb_channels.provider(realm)
+        if prov.name in seen:
+            continue
+        seen.add(prov.name)
+        total = prov.total_count()
+        ready = prov.ready_count()
+        out["by_provider"][prov.name] = {"total": total, "ready": ready}
+        out["total"] += total
+        out["ready"] += ready
+    return out
 
 
 def resize_chat_slots(ready_accounts):
@@ -368,15 +398,15 @@ def resize_chat_slots(ready_accounts):
         return MAX_CONCURRENT_CHAT
     MAX_CONCURRENT_CHAT = wanted
     _chat_slots = threading.BoundedSemaphore(wanted)
-    log("chat slots : %d (one per ready account; WB_MAX_CONCURRENT_CHAT=auto)"
-        % wanted)
+    log("chat slots : %d (one per ready account across providers; "
+        "WB_MAX_CONCURRENT_CHAT=auto)" % wanted)
     return wanted
 #: 目录落盘存档：每次成功从上游 /v3/config 拉到清单就写一份响应体副本，仅留档，
 #: 网关自己不读。与 usage 一样运行时产生并列入 .gitignore；目录用
 #: WB_PROXY_CATALOG_DIR 覆盖。
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(APP_DIR)
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 # 用量记账：每个上游响应都带 usage 块，网关同时为每个请求写一行 JSONL。
 # 默认目录在本脚本旁边，可用 --usage-dir 或 WB_PROXY_USAGE_DIR 覆盖。
 USAGE_DIR = os.environ.get("WB_PROXY_USAGE_DIR") \
@@ -464,6 +494,7 @@ POOL = None
 SCHEDULER = None
 PRICING = None
 CREDITS_REFRESHER = None
+CREDENTIAL_REFRESHER = None
 # 只做 Release 发现：检查器从不下载或安装任何东西。
 UPDATES = None
 ACCOUNTS_DIR = os.environ.get("ACCOUNTS_DIR") \
@@ -473,6 +504,13 @@ ACCOUNTS_DIR = os.environ.get("ACCOUNTS_DIR") \
 API_KEY = None
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
 
+
+def identity_options_view():
+    """各提供方的出站身份选项；设置页与账号视图共用同一份定义。"""
+    return {
+        "workbuddy": [dict(item) for item in wb_channels.WORKBUDDY_IDENTITIES],
+        "codearts": [dict(item) for item in wb_codearts.IDENTITY_OPTIONS],
+    }
 
 def runtime_settings_view():
     """面板可见的当前设置；从不返回密码或 key 明文。"""
@@ -489,7 +527,7 @@ def runtime_settings_view():
         item = {
             "id": entry.get("id") or "",
             "name": entry.get("name") or "",
-            "realm": entry.get("realm") or "",
+            "route": list(entry.get("route") or []),
             "models": list(entry.get("models") or []),
             "concurrency_limit": entry.get("concurrency_limit") or 0,
             "enabled": entry.get("enabled", True) is not False,
@@ -511,19 +549,6 @@ def runtime_settings_view():
         }
         item["status"] = wb_settings.key_status(item, stat, now)
         keys.append(item)
-    # 已删除的 key 是只读历史：密钥已不存在，面板只能列出名称与日期，
-    # 不能提供复制按钮。
-    deleted_keys = []
-    for entry in wb_settings.api_keys(ACCOUNTS_DIR, include_deleted=True):
-        if not entry.get("deleted_at"):
-            continue
-        deleted_keys.append({
-            "id": entry.get("id") or "",
-            "name": entry.get("name") or "",
-            "realm": entry.get("realm") or "",
-            "created_at": entry.get("created_at") or "",
-            "deleted_at": entry.get("deleted_at") or "",
-        })
     return {
         "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
         "api_key_set": bool(key),
@@ -531,7 +556,7 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
-        "deleted_api_keys": deleted_keys,
+        "identity_options": identity_options_view(),
         "limits": wb_settings.limits_snapshot(ACCOUNTS_DIR),
         "reserve_credits": wb_settings.reserve_credits(ACCOUNTS_DIR),
         "daily_token_limit": wb_settings.daily_token_limit(ACCOUNTS_DIR),
@@ -540,8 +565,8 @@ def runtime_settings_view():
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
         "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
         "cost_estimate": wb_settings.cost_estimate(ACCOUNTS_DIR),
-        "section_max_height": wb_settings.section_max_height(ACCOUNTS_DIR),
-        "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
+        "media": wb_settings.media_config(ACCOUNTS_DIR),
+        "codearts": wb_codearts.masked_config(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
@@ -558,20 +583,16 @@ def runtime_settings_view():
         "daily_chat_web_attempts":
             wb_settings.daily_chat_web_attempts(ACCOUNTS_DIR,
                                                 default=wb_accounts.WEB_TURN_ATTEMPTS),
-        "daily_chat_web_attempts_default": wb_accounts.WEB_TURN_ATTEMPTS,
         "daily_chat_web_attempts_max": wb_settings.DAILY_CHAT_WEB_ATTEMPTS_MAX,
         "daily_chat_web_timeout":
             wb_settings.daily_chat_web_timeout(ACCOUNTS_DIR,
                                                default=wb_accounts.WEB_TURN_TIMEOUT),
-        "daily_chat_web_timeout_default": wb_accounts.WEB_TURN_TIMEOUT,
         "daily_chat_web_timeout_max": wb_settings.DAILY_CHAT_WEB_TIMEOUT_MAX,
         "task_jitter_max": wb_settings.task_jitter_max(ACCOUNTS_DIR),
-        "task_jitter_min": wb_settings.TASK_JITTER_MIN,
         "task_jitter_max_limit": wb_settings.TASK_JITTER_MAX,
+        "workbuddy_tasks_auto": wb_settings.workbuddy_tasks_auto(ACCOUNTS_DIR),
         "scheduler_hours": wb_settings.scheduler_hours(ACCOUNTS_DIR),
-        "scheduler_hours_default": wb_settings.DEFAULT_SCHEDULER_HOURS,
         "daily_chat_model": wb_settings.daily_chat_model(ACCOUNTS_DIR),
-        "daily_chat_model_default": wb_accounts.DAILY_CHAT_MODEL,
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "prompt_cache_key": wb_settings.panel_flag(ACCOUNTS_DIR, "prompt_cache_key", False),
         "affinity_debug": wb_settings.panel_flag(ACCOUNTS_DIR, "affinity_debug", False),
@@ -586,10 +607,6 @@ def runtime_settings_view():
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
         "log_db_max_bytes": wb_settings.log_db_max_bytes(ACCOUNTS_DIR),
-        "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
-        "accounts_separate_tab": wb_settings.accounts_separate_tab(ACCOUNTS_DIR),
-        "key_before_hidden": wb_settings.key_before_hidden(ACCOUNTS_DIR),
-        "hidden_pages": wb_settings.hidden_pages(ACCOUNTS_DIR),
         "update_check_enabled":
             wb_settings.panel_flag(ACCOUNTS_DIR, "update_check_enabled", False),
         "update_check_interval_hours":
@@ -602,15 +619,12 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "smart_routing": wb_settings.smart_routing(ACCOUNTS_DIR),
         "session_affinity": wb_settings.session_affinity(ACCOUNTS_DIR),
         "routing": (POOL.routing_snapshot() if POOL else {}),
         "messages_format": wb_settings.messages_format(ACCOUNTS_DIR),
         "messages_format_default": wb_settings.DEFAULT_MESSAGES_FORMAT,
         "test_model_intl": wb_settings.test_model(ACCOUNTS_DIR, "intl"),
         "test_model_cn": wb_settings.test_model(ACCOUNTS_DIR, "cn"),
-        "test_model_intl_default": wb_settings.test_model_default(ACCOUNTS_DIR, "intl"),
-        "test_model_cn_default": wb_settings.test_model_default(ACCOUNTS_DIR, "cn"),
         "test_model_is_custom": {
             "intl": wb_settings.test_model(ACCOUNTS_DIR, "intl")
                     != wb_settings.test_model_default(ACCOUNTS_DIR, "intl"),
@@ -618,6 +632,7 @@ def runtime_settings_view():
                   != wb_settings.test_model_default(ACCOUNTS_DIR, "cn"),
         },
         "disabled_models": wb_settings.disabled_models(ACCOUNTS_DIR),
+        "model_aliases": wb_settings.model_aliases(ACCOUNTS_DIR),
         "version": VERSION,
     }
 def current_account():
@@ -716,9 +731,11 @@ _LOG_COUNTER = 0
 # 错误全落到 INFO，看板按 ERROR 筛选看不到。
 _LOG_ERROR_HINTS = (
     "error", "exception", "failed", "fail:", "reject", "traceback", "errno", "fatal",
-    "11-128", "11101", "11140",
+    "11-128",
     "失败", "异常", "错误", "拒绝", "不可用", "无效",
 )
+# 上游错误码按完整数字匹配，避免命中 tokens=111017 这类计数。
+_LOG_ERROR_CODE_RE = re.compile(r"(?<!\d)(?:11101|11140)(?!\d)")
 _LOG_WARN_HINTS = (
     "warn", "warning", "retry", "timeout", "throttl",
     "重试", "超时", "告警", "警告", "降级", "限流",
@@ -761,7 +778,7 @@ def add_log_entry(msg, level=None, tag=None):
     msg_str = str(msg).rstrip()
     if not level:
         lower = msg_str.lower()
-        if any(k in lower for k in _LOG_ERROR_HINTS):
+        if any(k in lower for k in _LOG_ERROR_HINTS) or _LOG_ERROR_CODE_RE.search(lower):
             level = "ERROR"
         elif any(k in lower for k in _LOG_WARN_HINTS):
             level = "WARN"
@@ -1064,10 +1081,11 @@ def banned_model_message(model):
             % (model, allowed))
 
 
-def disabled_model_message(model):
-    return ("模型 %s 已在看板的模型列表里取消勾选，本网关不处理这个模型 id 的请求。"
-            "要恢复请打开看板「网关与运维」页，在模型列表里重新勾上 %s。"
-            % (model, model))
+def disabled_model_message(model, realm=""):
+    label = wb_channels.label(realm or CURRENT_REALM)
+    return ("模型 %s 已在看板「模型」页的「%s」目录里关闭，本网关不处理这个模型 id 的请求。"
+            "要恢复请打开看板「模型」页，切换到「%s」后重新开启 %s。"
+            % (model, label, label, model))
 
 
 def key_model_message(entry, model):
@@ -1527,6 +1545,12 @@ def read_http_error(exc, limit=600):
         return b""
 
 
+def _brief_error_body(detail, limit=200):
+    """日志用的上游错误正文：压成一行并截断，空正文写明为空。"""
+    text = " ".join(str(detail or "").split())
+    return text[:limit] or "empty body"
+
+
 def model_scoped_errors_penalize_account():
     """兼容开关：恢复「任何 5xx 都记在账号上」的旧行为。"""
     raw = os.environ.get("WB_MODEL_SCOPED_ERRORS_PENALIZE", "")
@@ -1548,27 +1572,10 @@ def auth_failure_text(text):
     return any(marker in low for marker in _AUTH_FAILURE_MARKERS)
 
 
-# 「本机没网」的指纹：DNS 解析不出来、路由不可达、网卡没起来。这些失败里账号
-# 连一个字节都没发出去，结局却和「上游挂了」长得一样（都是 URLError），所以必须
-# 单独认出来。
-LOCAL_NETWORK_MARKERS = (
-    "gaierror", "getaddrinfo failed", "name or service not known",
-    "nodename nor servname", "temporary failure in name resolution",
-    "network is unreachable", "network is down", "no route to host",
-    "errno -2", "errno -3", "errno -5", "errno 100", "errno 101", "errno 113",
-    "winerror 11001", "winerror 10050", "winerror 10051", "winerror 10065",
-)
-
-def looks_like_local_network(exc):
-    """这次失败是「本机没网」还是「上游出问题」，两者在账号治理上必须分开：本机断网时
-    每一次尝试都会失败，逐账号记一笔并冷却 60 秒，等网络恢复时池子里已经全是冷却中的
-    账号——生产上就是这么把 9 个能用的账号全关掉的。"""
-    if isinstance(exc, socket.gaierror):
-        return True
-    reason = getattr(exc, "reason", None)
-    text = "%s %s %s" % (type(exc).__name__, exc, "" if reason is None else reason)
-    lower = text.lower()
-    return any(marker in lower for marker in LOCAL_NETWORK_MARKERS)
+# 「本机没网」的指纹与判定两个提供方共用一份（wb_channels）：WorkBuddy 与 CodeArts
+# 的失败必须得到同一个结论，否则一边记账号冷却、另一边不记。
+LOCAL_NETWORK_MARKERS = wb_channels.LOCAL_NETWORK_MARKERS
+looks_like_local_network = wb_channels.looks_like_local_network
 
 class LocalNetworkError(Exception):
     """本机网络不通：不是账号的问题，也不是上游的问题。单独成一个类型是因为调用方要给出
@@ -1721,7 +1728,11 @@ def stand_down_active():
 
 
 def stand_down_state():
-    return dict(STAND_DOWN)
+    # 停止开关只由 WorkBuddy 上游的 403 触发，也只拦 WorkBuddy 路由；面板按这个字段
+    # 决定哪个渠道标签显示停止卡片。
+    state = dict(STAND_DOWN)
+    state["provider"] = "workbuddy"
+    return state
 
 
 def clear_stand_down():
@@ -1846,27 +1857,29 @@ def _retry_same_account(account, counters):
 
 
 class SlotLease(object):
-    """一个请求占着的「账号 + 模型」并发名额，响应体读完才归还。open_upstream() 选号时占下、
-    成功后交给它保管；续写轮传入同一个对象，选回原账号就沿用，换号就先占新名额再归还旧的。"""
+    """一个请求占着的账号并发名额（全部模型合计），响应体读完才归还。open_upstream() 选号时
+    占下、成功后交给它保管；续写轮传入同一个对象，选回原账号就沿用，换号就先占新名额再
+    归还旧的。模型名只用来记账与展示，不参与名额判定。"""
 
     def __init__(self):
         self.account = None
         self.model = None
 
-    def _holds(self, account, model):
-        return account is self.account and model == self.model
+    def _holds(self, account, _model=None):
+        return account is self.account
 
     def claim(self, account, model):
-        if self._holds(account, model):
+        if self._holds(account):
             return True
         return account.acquire_request(model)
 
     def drop(self, account, model):
-        if not self._holds(account, model):
+        if not self._holds(account):
             account.release_request(model)
 
     def keep(self, account, model):
-        if self._holds(account, model):
+        if self._holds(account):
+            self.model = model
             return
         self.release()
         self.account, self.model = account, model
@@ -1895,21 +1908,24 @@ def _free_model_credit_fallback_enabled():
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
                   allow_credit_fallback=True, allow_product_switch=True,
                   only_uid=None, lease=None):
-    # 选号前刷新日限额守卫；底层折叠带 TTL 缓存，一次调用覆盖三个守卫，被守卫停住的
-    # 账号和其他不可用账号一样跳过。
+    # 守卫与选路输入先于提供方分流：CodeArts 聊天也必须按今天的用量刷新
+    # 每日/单模型限额与消耗速度，不能只在看板打开或启动时推进。
     wb_usage.apply_daily_guards()
-    # 评分分配用今日消耗速度算欠账，必须跟着当天用量推进；底层日折叠有 15 秒 TTL 且
-    # 增量读取，智能分配关着时直接返回。
     wb_usage.apply_routing_inputs()
+    # 网页工具的后续轮次等调用方只知道出口名，其它提供方的渠道在这里分流到各自的账号池。
+    # 名额由提供方自己按账号占下与归还（CodeArts 的流关闭时释放），这里只传调试账号。
+    channel_provider = wb_channels.provider(target_realm or CURRENT_REALM)
+    if channel_provider.name != wb_channels.WorkBuddyProvider.name:
+        return channel_provider.open_stream(
+            payload, session_key, target_realm or CURRENT_REALM,
+            only_uid=only_uid)
     # 账号被上游限制过就停止发送任何请求：继续轮询下一个账号会把账号池关联起来。
     if stand_down_active():
         raise GatewayStandDown(STAND_DOWN.get("detail") or "",
                                account_uid=STAND_DOWN.get("uid") or None)
-    # 剩余用量估计并入智能分配：把「估计剩余接近耗尽」的 (账号, 模型) 权重推给池；
-    # 智能分配关着时清空，省掉剩余估算的读取成本。
+    # 剩余用量估计并入智能分配：把「估计剩余接近耗尽」的 (账号, 模型) 权重推给池。
     if POOL is not None:
-        smart = bool(getattr(POOL, "smart_routing", False))
-        POOL.apply_remaining_weights(wb_usage.remaining_schedule_weights() if smart else None)
+        POOL.apply_remaining_weights(wb_usage.remaining_schedule_weights())
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
     # 复用调用方已建好的 body，避免白付一次序列化；403 降级重试时仍按 payload 重建
@@ -2144,6 +2160,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                        single_account=(total <= 1), detail=detail)
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
+                    if pending_lease is not None:
+                        lease.drop(*pending_lease)
+                        pending_lease = None
                     stand_down_accounts(account.uid, detail)
                     raise GatewayStandDown(detail, account_uid=account.uid)
                 # 面板 degrade.go：passthrough/append 模式的内容拒绝通常是 system 提示指纹
@@ -2178,7 +2197,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if exc.code == 401:
                 if account.uid not in refreshed_401:
                     refreshed_401.add(account.uid)
-                    if account.refresh():
+                    # 被拒的是刚发出去的令牌：必须真的换一个，不能因为本地还没到
+                    # 期就跳过刷新。
+                    if account.refresh(force=True):
                         tried.discard(account.uid)
                         log("account %s rejected (HTTP 401), token refreshed; "
                             "retrying the same account" % account.uid[:8])
@@ -2231,17 +2252,20 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     continue
                 if _retry_same_account(account, transient_retries):
                     tried.discard(account.uid)
-                    log("upstream %s for '%s', retrying on the same account"
-                        % (exc.code, model))
+                    log("upstream %s for '%s' (%s), retrying on the same account"
+                        % (exc.code, model, _brief_error_body(detail)))
                     last_error = exc
                     continue
                 charge_account(account, "HTTP %d" % exc.code, unknown=False)
-                log("upstream %s for '%s', retrying (fails=%d)"
-                    % (exc.code, model, account.fails))
+                log("upstream %s for '%s' (%s), retrying (fails=%d)"
+                    % (exc.code, model, _brief_error_body(detail), account.fails))
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
+            if pending_lease is not None:
+                lease.drop(*pending_lease)
+                pending_lease = None
             raise
         except Exception as exc:
             if looks_like_local_network(exc):
@@ -2350,8 +2374,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if enabled and model:
         servable = [a for a in enabled if a.ready(model=model)]
         if servable and all(not a.has_request_capacity(model) for a in servable):
-            reason = ("concurrent request limit reached for this account and "
-                      "model; retry when an in-flight request finishes")
+            reason = ("concurrent request limit reached for this account; retry "
+                      "when an in-flight request finishes")
             raise RateLimited(None, reason, wait=1, message=reason)
     if enabled and all(a.daily_limit_blocked() for a in enabled):
         reason = ("every usable account reached today's token limit (%s per "
@@ -2416,7 +2440,7 @@ def extract_session_key(headers, payload):
 # ---------------------------------------------------------------------------
 from wb_http import Handler
 
-Handler.server_version = "wb-proxy-center/" + VERSION
+Handler.server_version = "NextTokenCenter/" + VERSION
 
 
 def running_version():

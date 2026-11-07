@@ -124,7 +124,11 @@ def _number(value):
 def estimate(by_model, config):
     """按官方价格折算每个模型的费用，对比积分折算的支出；by_model 是用量快照的
     by_model 桶，config 是 normalise() 的结果。没有价格（或三项全 0）的模型
-    priced=False、金额按 0 计、不进入合计；缓存命中价已按剩余输入算，不重复计费。"""
+    priced=False、金额按 0 计、不进入合计；缓存命中价已按剩余输入算，不重复计费。
+
+    credit_missing 计数来自折叠：上游没报单次扣费的行（例如 CodeArts）不写 0，
+    这里把该模型标成「未采集」，paid/saved 不参与合计；否则 0 会被当成免费请求，
+    把官方价全额算成节省。"""
     config = config if isinstance(config, dict) else _default_config()
     credit_price = _number(config.get("credit_price"))
     prices = {}
@@ -132,8 +136,8 @@ def estimate(by_model, config):
         if isinstance(row, dict) and row.get("model"):
             prices[row["model"]] = row
     rows = []
-    official_total = paid_total = credit_total = 0.0
-    priced_models = unpriced_models = requests_total = 0
+    official_total = paid_total = saved_total = credit_total = 0.0
+    priced_models = unpriced_models = requests_total = missing_models = 0
     unpriced = []
     for model in sorted(by_model or {}):
         bucket = by_model.get(model) or {}
@@ -142,9 +146,15 @@ def estimate(by_model, config):
         output = _number(bucket.get("completion_tokens"))
         credit = _number(bucket.get("credit"))
         requests = int(_number(bucket.get("requests")))
+        missing = int(_number(bucket.get("credit_missing")))
+        # 全部行都没有扣费数据时 credit 不可用；部分缺失仍按已采集的部分记账，
+        # 但行上保留标记，面板能提示这个数字不完整。
+        credit_uncollected = requests > 0 and missing >= requests
         price = prices.get(model)
         priced = price is not None and any(
             _number(price.get(field)) for field in PRICE_KEYS)
+        if credit_uncollected:
+            missing_models += 1
         official = paid = 0.0
         if priced:
             official = ((prompt - cached) * _number(price.get("input"))
@@ -152,8 +162,10 @@ def estimate(by_model, config):
                         + output * _number(price.get("output"))) / UNIT
             paid = credit * credit_price
             official_total += official
-            paid_total += paid
-            credit_total += credit
+            if not credit_uncollected:
+                paid_total += paid
+                credit_total += credit
+                saved_total += official - paid
             requests_total += requests
             priced_models += 1
         else:
@@ -166,15 +178,17 @@ def estimate(by_model, config):
             "cached_tokens": cached,
             "completion_tokens": output,
             "total_tokens": _number(bucket.get("total_tokens")),
-            "credit": credit,
+            "credit": None if credit_uncollected else credit,
+            "credit_missing": bool(missing),
             "priced": priced,
             "prices": ({"input": _number(price.get("input")),
                         "cached_input": _number(price.get("cached_input")),
                         "output": _number(price.get("output"))}
                        if priced else None),
             "official_cny": official,
-            "paid_cny": paid,
-            "saved_cny": official - paid if priced else 0.0,
+            "paid_cny": None if credit_uncollected else paid,
+            "saved_cny": (None if credit_uncollected
+                          else (official - paid if priced else 0.0)),
         })
     rows.sort(key=lambda row: (not row["priced"], -row["official_cny"], row["model"]))
     return {
@@ -184,10 +198,12 @@ def estimate(by_model, config):
         "summary": {
             "official_cny": official_total,
             "paid_cny": paid_total,
-            "saved_cny": official_total - paid_total,
+            "saved_cny": saved_total,
             "credit": credit_total,
             "requests": requests_total,
             "priced_models": priced_models,
             "unpriced_models": unpriced_models,
+            # 扣费未采集的模型行数；这些行不计入 paid/saved。
+            "credit_missing": missing_models,
         },
     }

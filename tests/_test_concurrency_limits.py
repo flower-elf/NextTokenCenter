@@ -21,7 +21,6 @@ def stub_pool(account, pick=None):
     """open_upstream 需要的最小账号池替身；pick 覆盖选号，复现真实选号跳过满名额账号的效果。"""
     class Pool(object):
         accounts = [account]
-        smart_routing = False
         affinity = types.SimpleNamespace(unbind=lambda _key: None,
                                          demote=lambda _key, _uid=None: None)
 
@@ -42,8 +41,24 @@ def stub_pool(account, pick=None):
         def apply_daily_token_limit(self, value=None, usage=None):
             return value or 0
 
+        def apply_daily_credit_limit(self, value=None, credits=None,
+                                     free_models=None):
+            return value or 0
+
+        def apply_model_daily_token_limit(self, value=None, per_model=None):
+            return value or 0
+
+        def apply_reserve_credits(self, values=None):
+            return None
+
+        def apply_expiring_window(self, values=None):
+            return None
+
         def apply_remaining_weights(self, weights=None):
             return weights or {}
+
+        def apply_credit_rates(self, per_day=None):
+            return None
 
     return Pool()
 
@@ -62,22 +77,22 @@ class ConcurrencyLimitTests(unittest.TestCase):
         finally:
             proxy.POOL = old_pool
 
-    def test_concurrency_limit_is_per_account_and_per_model(self):
+    def test_concurrency_limit_counts_per_account_across_models(self):
         account = self.account()
         account.concurrency_limit = 1
         self.assertTrue(account.acquire_request("glm-5.3"))
-        self.assertFalse(account.acquire_request("glm-5.3"),
-                         "同一账号同一模型的第二个请求应当被挡下")
-        self.assertTrue(account.acquire_request("deepseek-v4.1"),
-                        "另一个模型有自己的名额，不该被 glm-5.3 占用")
+        self.assertFalse(account.acquire_request("deepseek-v4.1"),
+                         "上限按账号合计，另一个模型也要被挡下")
         self.assertEqual(account.active_for_model("glm-5.3"), 1)
-        self.assertEqual(account.active_for_model("deepseek-v4.1"), 1)
-        self.assertEqual(account.public()["activeRequests"], 2)
+        self.assertEqual(account.active_for_model("deepseek-v4.1"), 0)
+        self.assertEqual(account.public()["activeRequests"], 1)
         account.release_request("glm-5.3")
-        self.assertTrue(account.acquire_request("glm-5.3"), "退掉的名额要能立刻再用")
-        account.release_request("glm-5.3")
-        account.release_request("glm-5.3")
-        self.assertEqual(account.active_for_model("glm-5.3"), 0, "计数不能被退成负数")
+        self.assertTrue(account.acquire_request("deepseek-v4.1"),
+                        "退掉的名额要能立刻被另一个模型使用")
+        account.release_request("deepseek-v4.1")
+        account.release_request("deepseek-v4.1")
+        self.assertEqual(account.public()["activeRequests"], 0,
+                         "计数不能被退成负数")
 
     def test_zero_means_unlimited_and_the_limit_round_trips(self):
         account = self.account()
@@ -117,22 +132,20 @@ class ConcurrencyLimitTests(unittest.TestCase):
         self.assertEqual(account.concurrency_limit, 0)
 
     def test_the_cap_is_honoured_by_the_selection_paths(self):
-        """名额满的账号要从两个选号路径里都消失，退了名额再回来。"""
+        """名额满的账号要从选号路径里消失，退了名额再回来。"""
         account = self.account()
         account.concurrency_limit = 1
         pool = accounts.AccountPool(tempfile.mkdtemp(prefix="cap-pick-"))
         pool.accounts = [account]
 
-        for smart in (False, True):
-            pool.smart_routing = smart
-            self.assertIs(pool.pick(realm="cn", model="glm-5.3"), account,
-                          "smart=%s 时空闲账号应当被选中" % smart)
-            self.assertTrue(account.acquire_request("glm-5.3"))
-            self.assertIsNone(pool.pick(realm="cn", model="glm-5.3"),
-                              "smart=%s 时名额已满的账号不该再被选中" % smart)
-            self.assertIs(pool.pick(realm="cn", model="other-model"), account,
-                          "smart=%s 时另一个模型不受影响" % smart)
-            account.release_request("glm-5.3")
+        self.assertIs(pool.pick(realm="cn", model="glm-5.3"), account,
+                      "空闲账号应当被选中")
+        self.assertTrue(account.acquire_request("glm-5.3"))
+        self.assertIsNone(pool.pick(realm="cn", model="glm-5.3"),
+                          "名额已满的账号不该再被选中")
+        self.assertIsNone(pool.pick(realm="cn", model="other-model"),
+                          "限额按账号合计，另一个模型也不能再选中")
+        account.release_request("glm-5.3")
 
     def test_a_saturated_pool_answers_429_instead_of_503(self):
         """名额用满是「暂不接单」，要报 429，不能报「账号池不可用」。"""

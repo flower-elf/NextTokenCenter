@@ -7,6 +7,7 @@ import json
 import time
 import urllib.error
 
+import wb_channels
 import wb_messages_responses
 import wb_settings
 import wb_usage
@@ -80,18 +81,30 @@ class ChatRoutes(object):
                sorted(custom_names) or "-", _g().key_label(self._key_id()) or "-")
         )
         try:
-            req_realm = self._request_realm() or _g().CURRENT_REALM
+            req_realm, public = self._route_model(chat_req)
+        except wb_channels.ChannelError as exc:
+            return self._channel_error(model, exc, t_start)
+        if public:
+            model = public
+        try:
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
-            banned = self._banned_model_error(chat_req.get("model"))
+            banned = self._banned_model_error(chat_req.get("model"), req_realm)
             if banned:
                 return self._error(400, banned, "invalid_request_error")
-            key_blocked = self._key_model_error(chat_req.get("model"))
+            key_blocked = self._key_model_error(public)
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
-            upstream, account, effort = _g().open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm)
+            # 每次请求一个名额租约：选号时占下，响应体读完或出错时归还。网页工具
+            # 续写轮会把它带进下一次选号，换号时先占新名额再归还旧的。
+            lease = _g().SlotLease()
+            try:
+                upstream, account, effort = _g().open_upstream(
+                    chat_req, session_key=session_key, target_realm=req_realm,
+                    only_uid=self._debug_account(), lease=lease)
+            except wb_channels.ChannelError as exc:
+                return self._channel_error(model, exc, t_start)
         except _g().GatewayStandDown as exc:
             wb_usage.record_error(model, 503, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -135,16 +148,19 @@ class ChatRoutes(object):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream:
-            if want_stream:
-                return self._responses_stream_response(
+        try:
+            with upstream:
+                if want_stream:
+                    return self._responses_stream_response(
+                        upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
+                        base_body=chat_req, session_key=session_key, realm=req_realm,
+                        effort=effort, tool_alias=tool_alias, lease=lease)
+                return self._responses_nonstream_response(
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                     base_body=chat_req, session_key=session_key, realm=req_realm,
-                    effort=effort, tool_alias=tool_alias)
-            return self._responses_nonstream_response(
-                upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
-                base_body=chat_req, session_key=session_key, realm=req_realm,
-                effort=effort, tool_alias=tool_alias)
+                    effort=effort, tool_alias=tool_alias, lease=lease)
+        finally:
+            lease.release()
 
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, lease=None, tool_alias=None):
         self.send_response(200)
@@ -358,18 +374,28 @@ class ChatRoutes(object):
                chat_req.get("reasoning_effort"), len(chat_req.get("tools") or []),
                _g().key_label(self._key_id()) or "-"))
         try:
-            req_realm = self._request_realm() or _g().CURRENT_REALM
+            req_realm, public = self._route_model(chat_req)
+        except wb_channels.ChannelError as exc:
+            return self._channel_error(model, exc, t_start, anthropic=True)
+        if public:
+            model = public
+        try:
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
             if blocked:
                 return self._anthropic_error(400, blocked, "invalid_request_error")
-            banned = self._banned_model_error(chat_req.get("model"))
+            banned = self._banned_model_error(chat_req.get("model"), req_realm)
             if banned:
                 return self._anthropic_error(400, banned, "invalid_request_error")
-            key_blocked = self._key_model_error(chat_req.get("model"))
+            key_blocked = self._key_model_error(public)
             if key_blocked:
                 return self._anthropic_error(400, key_blocked, "invalid_request_error")
-            upstream, account, effort = _g().open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm)
+            lease = _g().SlotLease()
+            try:
+                upstream, account, effort = _g().open_upstream(
+                    chat_req, session_key=session_key, target_realm=req_realm,
+                    only_uid=self._debug_account(), lease=lease)
+            except wb_channels.ChannelError as exc:
+                return self._channel_error(model, exc, t_start, anthropic=True)
         except _g().GatewayStandDown as exc:
             wb_usage.record_error(model, 503, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -420,16 +446,19 @@ class ChatRoutes(object):
             if status == 503:
                 message += " - add or enable one at the dashboard (/)"
             return self._anthropic_error(status, message)
-        with upstream:
-            if want_stream:
-                return self._messages_stream_response(
+        try:
+            with upstream:
+                if want_stream:
+                    return self._messages_stream_response(
+                        upstream, model, fp, account, t_start,
+                        base_body=chat_req, session_key=session_key,
+                        realm=req_realm, effort=effort, tool_alias=tool_alias)
+                return self._messages_nonstream_response(
                     upstream, model, fp, account, t_start,
                     base_body=chat_req, session_key=session_key,
                     realm=req_realm, effort=effort, tool_alias=tool_alias)
-            return self._messages_nonstream_response(
-                upstream, model, fp, account, t_start,
-                base_body=chat_req, session_key=session_key,
-                realm=req_realm, effort=effort, tool_alias=tool_alias)
+        finally:
+            lease.release()
 
     def _messages_nonstream_response(self, upstream, model, fp, account, t_start,
                                      base_body=None, session_key=None, realm=None,
@@ -528,6 +557,14 @@ class ChatRoutes(object):
                                    "invalid_request_error")
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
+        model = payload.get("model") or "hy4-preview"
+        t_start = time.time()
+        try:
+            req_realm, public = self._route_model(payload)
+        except wb_channels.ChannelError as exc:
+            return self._channel_error(model, exc, t_start)
+        if wb_channels.provider(req_realm).name != wb_channels.WorkBuddyProvider.name:
+            return self._handle_channel_chat(payload, req_realm, public, t_start)
         # 诊断日志：客户端实际请求与转发内容。
         # 只记影响行为的开关，绝不记消息正文。
         dsh_request = bool(payload.get("tools")) and is_dsh_payload(payload)
@@ -536,8 +573,9 @@ class ChatRoutes(object):
         given = _g().client_effort_of(payload) or payload.get("reasoning") \
             or payload.get("thinking") or payload.get("enable_thinking")
         _g().log(
-            "chat: model=%s client_effort=%r -> upstream_effort=%r stream=%s msgs=%d key=%s"
+            "chat: realm=%s model=%s client_effort=%r -> upstream_effort=%r stream=%s msgs=%d key=%s"
             % (
+                req_realm,
                 payload.get("model"),
                 given,
                 _g().upstream_effort_of(forwarded, payload.get("model")),
@@ -549,22 +587,25 @@ class ChatRoutes(object):
         session_key = _g().extract_session_key(self.headers, payload)
         fp = _g().prompt_fingerprint(forwarded.get("messages"))
         want_stream = bool(payload.get("stream"))
-        model = payload.get("model") or "hy4-preview"
-        t_start = time.time()
+        model = public or model
         try:
-            req_realm = self._request_realm() or _g().CURRENT_REALM
             blocked = self._cross_realm_error(payload.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
-            banned = self._banned_model_error(payload.get("model"))
+            banned = self._banned_model_error(payload.get("model"), req_realm)
             if banned:
                 return self._error(400, banned, "invalid_request_error")
-            key_blocked = self._key_model_error(payload.get("model"))
+            key_blocked = self._key_model_error(public)
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
-            upstream, account, effort = _g().open_upstream(
-                payload, session_key=session_key, target_realm=req_realm,
-                prebuilt_body=forwarded)
+            lease = _g().SlotLease()
+            try:
+                upstream, account, effort = _g().open_upstream(
+                    payload, session_key=session_key, target_realm=req_realm,
+                    prebuilt_body=forwarded, only_uid=self._debug_account(),
+                    lease=lease)
+            except wb_channels.ChannelError as exc:
+                return self._channel_error(model, exc, t_start)
         except _g().GatewayStandDown as exc:
             wb_usage.record_error(model, 503, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -608,14 +649,75 @@ class ChatRoutes(object):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream:
-            if want_stream:
-                return self._chat_stream_response(
+        try:
+            with upstream:
+                if want_stream:
+                    return self._chat_stream_response(
+                        upstream, model, fp, account, t_start, effort=effort,
+                        tool_alias=tool_alias)
+                return self._chat_nonstream_response(
                     upstream, model, fp, account, t_start, effort=effort,
                     tool_alias=tool_alias)
-            return self._chat_nonstream_response(
-                upstream, model, fp, account, t_start, effort=effort,
-                tool_alias=tool_alias)
+        finally:
+            lease.release()
+
+    def _channel_error(self, model, exc, t_start, anthropic=False):
+        """提供方拒绝请求：记一行失败流水，按接口形状回错误。
+
+        ChannelError 带着账号归属、结果分类与等待时间：限流走 _rate_limited 给出
+        Retry-After，本机断网回 503 且不归咎账号，其余保留上游 HTTP 状态。
+        """
+        outcome = getattr(exc, "outcome", "failed") or "failed"
+        wb_usage.record_error(model, exc.status, str(exc)[:200],
+                              elapsed_ms=int((time.time() - t_start) * 1000),
+                              account=getattr(exc, "account_uid", None),
+                              outcome=outcome, key=self._key_id())
+        if getattr(exc, "local_network", False):
+            message = ("本机网络不可用：%s - 请检查本机网络/代理后重试"
+                       "（本次不计入账号熔断）" % str(exc))
+            if anthropic:
+                return self._anthropic_error(503, message, "api_error")
+            return self._error(503, message, "invalid_request_error")
+        if outcome == "rate_limited":
+            if anthropic:
+                return self._anthropic_rate_limited(exc)
+            return self._rate_limited(exc)
+        if anthropic:
+            return self._anthropic_error(exc.status, str(exc), exc.etype)
+        return self._error(exc.status, str(exc), exc.etype)
+
+    def _handle_channel_chat(self, payload, realm, public, t_start):
+        """非 WorkBuddy 提供方的 Chat Completions：提供方自己组装上游请求体。"""
+        model = public or "unknown"
+        blocked = self._key_model_error(public)
+        if blocked:
+            return self._error(400, blocked, "invalid_request_error")
+        banned = self._banned_model_error(payload.get("model"), realm)
+        if banned:
+            return self._error(400, banned, "invalid_request_error")
+        want_stream = bool(payload.get("stream"))
+        session_key = _g().extract_session_key(self.headers, payload)
+        fp = _g().prompt_fingerprint(payload.get("messages"))
+        lease = _g().SlotLease()
+        try:
+            upstream, account, effort = _g().open_upstream(
+                payload, session_key=session_key, target_realm=realm,
+                only_uid=self._debug_account(), lease=lease)
+        except wb_channels.ChannelError as exc:
+            return self._channel_error(model, exc, t_start)
+        _g().log("chat: realm=%s model=%s stream=%s msgs=%d key=%s"
+                 % (realm, getattr(upstream, "_wb_billed_model", None) or payload.get("model"),
+                    want_stream, len(payload.get("messages") or []),
+                    _g().key_label(self._key_id()) or "-"))
+        try:
+            with upstream:
+                if want_stream:
+                    return self._chat_stream_response(upstream, model, fp, account, t_start,
+                                                      effort=effort)
+                return self._chat_nonstream_response(upstream, model, fp, account, t_start,
+                                                     effort=effort)
+        finally:
+            lease.release()
 
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
                               tool_alias=None):
@@ -687,6 +789,9 @@ class ChatRoutes(object):
                     if maybe is not None and tool_alias:
                         restore_dsh_tool_names(maybe, tool_alias)
                     if isinstance(maybe, dict):
+                        if maybe.get("model"):
+                            # 别名合并的模型由哪个渠道承接，客户端都看到自己请求的 id
+                            maybe["model"] = model
                         failure = upstream_error_text(maybe)
                         if failure:
                             flush_out()

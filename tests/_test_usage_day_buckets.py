@@ -578,9 +578,9 @@ print()
 print("[4] checkpoint：日桶随状态落盘/加载，重启后逐字节一致")
 check("写盘成功", make_checkpoint())
 stored = cache_data()
-check("每个 kind 文件都是 schema=当前版本（v5）的 JSON 对象",
+check("每个 kind 文件都是 schema=当前版本（v6）的 JSON 对象",
       all(json.load(io.open(KIND_FILES[k], encoding="utf-8"))["schema"]
-          == U._USAGE_CACHE_SCHEMA and U._USAGE_CACHE_SCHEMA == 5
+          == U._USAGE_CACHE_SCHEMA and U._USAGE_CACHE_SCHEMA == 6
           for k in U._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
       U._USAGE_CACHE_SCHEMA)
 check("四个 kinds 都在",
@@ -729,7 +729,8 @@ mutate(lambda d: newest_day(d, "series")["hours"].__setitem__(
 # 6.2 schema：旧文件整体作废（一次性全量重扫，结果正确）
 mutate_schema(lambda d: d.update({"schema": 2}), "旧 schema（v2，没有日桶）")
 mutate_schema(lambda d: d.update({"schema": 4}), "旧 schema（v4，价格指纹是旧形状）")
-mutate_schema(lambda d: d.update({"schema": 6}), "未来的 schema")
+mutate_schema(lambda d: d.update({"schema": U._USAGE_CACHE_SCHEMA + 1}),
+              "未来的 schema")
 mutate_schema(lambda d: d.update({"schema": True}), "schema 写成 true")
 
 print()
@@ -855,7 +856,7 @@ if hasattr(time, "tzset"):
     #     这几个字段，任何时区、任何日期都比不平（Linux 上这段真的会跑，
     #     Windows 没有 tzset 所以一直没暴露）。
     #   * 先确认「本机真的被切到了柏林」再断言：有 zoneinfo 的系统认 IANA 名，
-    #     只有 POSIX TZ 支持的系统（musl/OpenWrt 路由器这类没装 zoneinfo 的
+    #     只有 POSIX TZ 支持的系统（musl 这类没装 zoneinfo 的
     #     镜像）会把它悄悄降级成 UTC——那时日边界没有被挪动，断言就会以
     #     「切片竟然成立」这种误导性的方式失败。用 10-25 那天是不是 25 小时
     #     来验证，两个 TZ 值都做不到就跳过这段。

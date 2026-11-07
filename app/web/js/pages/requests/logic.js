@@ -1,5 +1,6 @@
-// 请求日志页的纯逻辑：筛选状态、查询串组装、行内容与详情字段；任何 UI 模板都放在 requests.js 里，只允许 import core/format.js，方便在 Node 里直接测试。
-import { fmtCredit, fmtDateTime, fmtLatency, fmtNumber, fmtNumberDash, fmtPercent, realmLabel } from '../../core/format.js';
+// 请求日志页的纯逻辑：筛选状态、查询串组装、行内容与详情字段；任何 UI 模板都放在 requests.js 里，只依赖 core/format.js 与 core/channels.js，方便在 Node 里直接测试。
+import { fmtCredit, fmtDateTime, fmtLatency, fmtNumber, fmtNumberDash, fmtPercent } from '../../core/format.js';
+import { channelLabel, channelOptions } from '../../core/channels.js';
 
 export const PAGE_SIZES = [20, 50, 100];
 export const LIMIT_STORE_KEY = 'wb-requests-limit';
@@ -25,11 +26,26 @@ export const RANGE_OPTIONS = Object.freeze([
   { id: 'all', label: '全部' },
 ]);
 
-export const REALM_OPTIONS = Object.freeze([
-  { id: 'all', label: '全部' },
-  { id: 'intl', label: '国际版' },
-  { id: 'cn', label: '国内版' },
-]);
+/** 渠道筛选的选项：「全部」加上网关当前可用的渠道。 */
+export function realmOptions(realms) {
+  return channelOptions(realms, [{ id: 'all', label: '全部' }]);
+}
+
+/**
+ * 账号筛选的选项：只列所选渠道的账号，选「全部」时列出全部。
+ * 渠道与账号是两个联动条件，把别的渠道的账号列在选项里只会筛出空表。
+ */
+export function accountOptions(accounts, realm = 'all') {
+  const list = (accounts || []).filter((account) => !realm || realm === 'all'
+    || String((account && account.realm) || '') === realm);
+  return [
+    { id: '', label: '全部账号' },
+    ...list.map((account) => ({
+      id: String(account.uid || ''),
+      label: account.nickname || String(account.uid || '').slice(0, 8),
+    })),
+  ];
+}
 
 export const STATUS_OPTIONS = Object.freeze([
   { id: '', label: '全部' },
@@ -52,9 +68,9 @@ const OUTCOME_LABELS = Object.freeze({
   failed: '失败',
 });
 
-/** 初始筛选条件：版本默认跟随右上角「查看的版本」，与其它页面一致。 */
-export function defaultFilters(realm = DEFAULT_FILTERS.realm) {
-  return { ...DEFAULT_FILTERS, realm: REALM_OPTIONS.some((o) => o.id === realm) ? realm : DEFAULT_FILTERS.realm };
+/** 初始筛选条件：渠道默认跟随右上角「查看的渠道」，与其它页面一致；不在可用渠道里时回到全部。 */
+export function defaultFilters(realm = DEFAULT_FILTERS.realm, realms = []) {
+  return { ...DEFAULT_FILTERS, realm: realms.includes(realm) ? realm : DEFAULT_FILTERS.realm };
 }
 
 export function normalizeLimit(value) {
@@ -72,9 +88,14 @@ export function changeFilter(filters, name, value) {
   return { ...filters, [name]: value };
 }
 
-/** 任一筛选条件变化都要回到第 1 页，否则新条件下的页码可能已经越界。 */
-export function withFilter(state, name, value) {
-  return { ...state, filters: changeFilter(state.filters, name, value), page: 1 };
+/** 任一筛选条件变化都要回到第 1 页，否则新条件下的页码可能已经越界。切换渠道时清掉不属于新渠道的账号筛选。 */
+export function withFilter(state, name, value, accounts = null) {
+  const filters = changeFilter(state.filters, name, value);
+  if (name === 'realm' && accounts) {
+    const ids = accountOptions(accounts, filters.realm).map((option) => option.id);
+    if (!ids.includes(filters.account)) filters.account = '';
+  }
+  return { ...state, filters, page: 1 };
 }
 
 export function withLimit(state, limit) {
@@ -97,7 +118,7 @@ export function pruneFilters(filters, { keyIds = [], accountIds = [] } = {}) {
 
 /**
  * 组装 /usage/recent 的查询串。
- * realm 一律显式下发：网关在参数缺失时会退回默认出口，只显示一半的记录。
+ * realm 一律显式下发：网关在参数缺失时会退回默认渠道，只显示一半的记录。
  */
 export function buildRecentQuery(state, now = Math.floor(Date.now() / 1000)) {
   const filters = state.filters || defaultFilters();
@@ -107,7 +128,7 @@ export function buildRecentQuery(state, now = Math.floor(Date.now() / 1000)) {
     params.set('range', 'custom');
     params.set('since', String(Math.floor(now - span)));
   }
-  params.set('realm', REALM_OPTIONS.some((o) => o.id === filters.realm) ? filters.realm : 'all');
+  params.set('realm', filters.realm || 'all');
   if (filters.key) params.set('key', filters.key);
   if (filters.status) params.set('status', filters.status);
   const model = String(filters.model || '').trim();
@@ -259,6 +280,14 @@ export function pageList(page, pages) {
   return out;
 }
 
+/** 模型列的悬停说明：客户端请求的 id 与实际调用的 id 不同时把两者都写出来。 */
+export function modelTitle(row) {
+  if (row.requested_model && row.requested_model !== row.model) {
+    return `客户端请求 ${row.requested_model}，实际调用 ${row.model}`;
+  }
+  return row.model || '';
+}
+
 /** 详情弹窗里的逐项字段：copy 非空时渲染复制按钮，title 是鼠标悬停时的说明；失败记录多一行错误原因。 */
 export function requestDetail(row, ctx = {}) {
   const keys = ctx.keysById || {};
@@ -272,7 +301,7 @@ export function requestDetail(row, ctx = {}) {
   const rows = [
     { label: '请求时间', value: fmtDateTime(rowTimestamp(row)) },
     { label: '调用接口', value: apiLabel(row.api) },
-    { label: '账号区域', value: realmLabel(row.realm) },
+    { label: '调用渠道', value: channelLabel(row.realm), title: '实际处理这次请求的渠道' },
     { label: 'API 密钥', value: keyLabel(row, keys) },
   ];
   if (keyId) rows.push({ label: '密钥 ID', value: keyId, copy: keyId, title: '密钥的编号，用来筛选请求日志' });
@@ -281,8 +310,13 @@ export function requestDetail(row, ctx = {}) {
     { label: '账号', value: accountLabel(row.account, accounts) },
   );
   if (row.account) rows.push({ label: '账号 UID', value: String(row.account), copy: String(row.account) });
+  rows.push({ label: '模型', value: row.model || '—', copy: row.model || '',
+              title: '实际发给上游的模型 id' });
+  if (row.requested_model) {
+    rows.push({ label: '客户端请求的模型', value: String(row.requested_model),
+                copy: String(row.requested_model) });
+  }
   rows.push(
-    { label: '模型', value: row.model || '—', copy: row.model || '' },
     { label: '思考档位', value: effortText(row), title: '本次请求实际使用的思考档位' },
     { label: '请求结果', value: resultText(row) },
     { label: '返回方式', value: row.stream ? '流式' : '非流式' },

@@ -1,9 +1,11 @@
 /* 用量页纯逻辑：查询串组装、账号与密钥用量行、模型矩阵的行与合计、筛选条件与失效清理。
  * 关键行为：合计只在可见行上重算，延迟与速度按样本数加权。 */
 import assert from 'node:assert/strict';
+import './_channels_fixture.js';
 import {
   RANGES, rangeLabel, scopeRealm, scopeText, buildQuery, trendQuery, trendGranularity, TREND_MODES, trendSeries,
   accountRows, keyRows, idleKeyNames, matrixOptions, reconcileFilters, buildMatrix, allocateShares,
+  creditValue, creditKnown, creditCollected, monthCreditState, accountIndex, withAccountIndex,
 } from '../../app/web/js/pages/stats/logic.js';
 
 const S = (avg, samples = 1) => ({ avg, p50: avg, p90: avg, p95: avg, p99: avg, samples });
@@ -193,6 +195,23 @@ assert.deepEqual(rows.map((r) => r.uid), ['big', 'small']);
 assert.deepEqual(rows[0].models.map((m) => m.id), ['a', 'b']);
 assert.equal(rows[0].credits.remain, 500);
 assert.deepEqual(accountRows(null), []);
+
+// ---- /accounts 补昵称、区域与余额：服务端已有字段优先
+const unifiedAccounts = [{ uid: 'acct-A', nickname: 'Alice 主号', realm: 'intl', credits: { remain: 88, size: 100 } }];
+const enriched = accountRows({
+  accounts: [{ uid: 'acct-A', window: stat(1, 10, 5, 5), all_time: stat(1, 10, 5, 5), window_models: {} }],
+}, unifiedAccounts);
+assert.equal(enriched[0].nickname, 'Alice 主号');
+assert.equal(enriched[0].realm, 'intl');
+assert.equal(enriched[0].credits.remain, 88);
+const mergedMap = withAccountIndex({ accounts_map: {} }, unifiedAccounts);
+assert.equal(mergedMap.accounts_map['acct-A'].nickname, 'Alice 主号');
+assert.equal(mergedMap.accounts_map['acct-A'].credits.remain, 88);
+assert.deepEqual(withAccountIndex(null, unifiedAccounts), null);
+assert.deepEqual(withAccountIndex({ accounts_map: {} }, []).accounts_map, {}, '没有账号时原样返回');
+const keepServer = withAccountIndex({ accounts_map: { 'acct-A': { nickname: '服务端名字', realm: 'intl' } } }, unifiedAccounts);
+assert.equal(keepServer.accounts_map['acct-A'].nickname, '服务端名字', '服务端已有昵称不被覆盖');
+assert.equal(accountIndex([{ uid: 'x' }, { uid: '' }, null]).size, 1);
 // 未归属桶窗口内无调用但历史有记录，按真实记录保留
 const kept = accountRows({ accounts: [{ uid: '(unattributed)', window: stat(0, 0, 0, 0), all_time: stat(4, 40, 20, 20), window_models: {} }] });
 assert.equal(kept.length, 1);
@@ -216,6 +235,74 @@ assert.deepEqual(idleKeyNames({ keys: [
   { key_id: 'panel', window: stat(0, 0, 0, 0) },
 ] }), ['闲置密钥', 'panel'], '没有名字的密钥用 id 显示');
 assert.deepEqual(keyRows(null), []);
+
+// ---- 积分缺失：保持 null（界面显示破折号），采集到的 0 是真实值
+assert.equal(creditValue(null), null);
+assert.equal(creditValue(undefined), null);
+assert.equal(creditValue(''), null);
+assert.equal(creditValue('x'), null);
+assert.equal(creditValue(0), 0);
+assert.equal(creditKnown(0), true);
+assert.equal(creditKnown(null), false);
+const noCredit = accountRows({
+  accounts: [{
+    uid: 'ca', nickname: '云道', realm: 'codearts', window: stat(2, 20, 10, 10), all_time: stat(2, 20, 10, 10), window_models: {},
+  }],
+});
+assert.equal(noCredit[0].credit, null, '上游没有返回扣费时不能记成 0');
+const zeroCredit = accountRows({
+  accounts: [{
+    uid: 'wb', nickname: '一号', realm: 'intl', window: stat(1, 10, 5, 5, { credit: 0 }), all_time: stat(1, 10, 5, 5), window_models: {},
+  }],
+});
+assert.equal(zeroCredit[0].credit, 0, '采集到的 0 积分要原样保留');
+const keyCreditRows = keyRows({
+  keys: [
+    { key_id: 'k-null', window: stat(1, 10, 5, 5), all_time: stat(1, 10, 5, 5) },
+    { key_id: 'k-zero', window: stat(1, 10, 5, 5, { credit: 0 }), all_time: stat(1, 10, 5, 5) },
+  ],
+});
+assert.deepEqual(keyCreditRows.map((k) => k.credit).sort((a, b) => (a === null ? 1 : 0) - (b === null ? 1 : 0)), [0, null]);
+
+// ---- 完成行全部没有扣费时，合计的 0 是未采集，不是没花钱
+assert.equal(creditCollected({ requests: 2, credit_missing: 2 }), false, '两笔完成行都没有扣费');
+assert.equal(creditCollected({ requests: 3, credit_missing: 2 }), true, '只有部分缺失时仍显示已采集的金额');
+assert.equal(creditCollected({ requests: 0 }), true, '没有请求时不受缺失计数影响');
+assert.equal(creditCollected({ requests: 2 }), true, '旧服务端没有 credit_missing 时按已采集处理');
+assert.equal(creditCollected(null), false);
+const uncollected = accountRows({
+  accounts: [{
+    uid: 'ca', nickname: '云道', realm: 'codearts',
+    window: stat(2, 20, 10, 10, { credit: 0, credit_missing: 2 }),
+    all_time: stat(2, 20, 10, 10), window_models: {},
+  }],
+});
+assert.equal(uncollected[0].credit, null, '完成行全部未采集时不显示 0');
+const partlyCollected = accountRows({
+  accounts: [{
+    uid: 'ca', nickname: '云道', realm: 'codearts',
+    window: stat(2, 20, 10, 10, { credit: 1.5, credit_missing: 1 }),
+    all_time: stat(2, 20, 10, 10), window_models: {},
+  }],
+});
+assert.equal(partlyCollected[0].credit, 1.5, '部分采集时显示已采集的金额');
+const missingKeys = keyRows({
+  keys: [{ key_id: 'k-ca', window: stat(2, 20, 10, 10, { credit: 0, credit_missing: 2 }), all_time: stat(2, 20, 10, 10) }],
+});
+assert.equal(missingKeys[0].credit, null, '密钥维度同样不把未采集画成 0');
+const allMissing = monthCreditState({ ok: true, requests: 3, credit_missing: 3, credit: 0 });
+assert.equal(allMissing.known, false, '本月完成行全部未采集时显示未采集');
+assert.equal(allMissing.partial, false);
+const partlyMissing = monthCreditState({ ok: true, requests: 3, credit_missing: 1, credit: 2 });
+assert.equal(partlyMissing.known, true, '部分缺失时仍显示已采集的金额');
+assert.equal(partlyMissing.partial, true, '部分缺失时标记为不完整');
+assert.equal(partlyMissing.missing, 1);
+const realZero = monthCreditState({ ok: true, requests: 2, credit_missing: 0, credit: 0 });
+assert.equal(realZero.known, true, '全部采集到 0 时本月 0 是真实值');
+assert.equal(realZero.partial, false);
+assert.equal(monthCreditState({ ok: true, requests: 0, credit: 0 }).known, true, '本月没有请求时 0 是真实值');
+assert.equal(monthCreditState({ ok: false, requests: 3, credit: 12 }).known, false, '当月读取失败时不显示数字');
+assert.deepEqual(monthCreditState(null), { known: false, partial: false, missing: 0, requests: 0, credit: 0 });
 
 // ---- 趋势序列：请求数左轴、Token 右轴、失败数跟随请求数
 const buckets = [

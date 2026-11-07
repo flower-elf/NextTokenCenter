@@ -46,7 +46,7 @@ export function createUpdateBlock(page) {
       <div class="setting">
         <div class="setting-main">
           <div class="setting-name">立即检查更新</div>
-          <div class="setting-desc">现在向 GitHub 查询一次最新稳定版，不受自动检查间隔限制。</div>
+          <div class="setting-desc">立即向 GitHub 查询一次最新稳定版。</div>
           <div class="field-hint ${hint.warn ? 'tone-warning' : ''}">${hint.text}</div>
           ${url
             ? html`<div class="field-hint">

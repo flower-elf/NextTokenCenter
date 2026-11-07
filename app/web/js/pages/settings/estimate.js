@@ -134,7 +134,7 @@ export function createCostTab(page) {
                 </td>
               </tr>`)}
             ${form.rows.length === 0 ? html`
-              <tr><td colspan="5" class="text-xs muted">还没有配置模型价格。没有价格的模型不参与费用估算。</td></tr>` : nothing}
+              <tr><td colspan="5" class="text-xs muted">还没有配置模型价格，未定价的模型不参与估算。</td></tr>` : nothing}
           </tbody>
         </table>
       </div>`;
@@ -146,7 +146,7 @@ export function createCostTab(page) {
       return settingCard({
         iconName: 'Calculator',
         title: '费用估算',
-        desc: '官方价格按每百万 Token 填写，用于计算「如果直接调用官方 API 要花多少钱」；默认内置 deepseek-v4.1-flash 的官方高峰时段价格。未配置价格的模型按 0 计，不参与估算。',
+        desc: '官方价格按每百万 Token 填写，用于计算直接调用官方 API 的花费。',
         dirty: isDirty(),
         saving,
         onRevert: revert,
@@ -158,13 +158,13 @@ export function createCostTab(page) {
               field: 'creditPrice',
               suffix: '元 / 积分',
               step: '0.0001',
-              desc: '1 积分折合多少元，用来把消耗的积分换算成支出。填写 0 表示积分不计支出，省了多少等于官方价格合计。',
+              desc: '1 积分折合多少元，0 表示积分不计支出。',
             })}
           </div>
           <div class="card-head">
             <div>
               <h3 class="card-title">模型官方价格</h3>
-              <div class="card-sub">单位为元 / 百万 Token；缓存命中价格留空时按输入价格计费。</div>
+              <div class="card-sub">单位为元 / 百万 Token，缓存命中价格留空时按输入价格计费。</div>
             </div>
             <button class="btn btn-outline btn-sm" ?disabled=${saving} @click=${addRow}>
               ${icon('Plus')}添加模型
@@ -172,7 +172,7 @@ export function createCostTab(page) {
           </div>
           ${modelTable()}
           <p class="field-hint">
-            内置价格只有 deepseek-v4.1-flash，其余模型需要在这里填写后才会进入费用估算。
+            内置价格只有 deepseek-v4.1-flash，其余模型需要填写价格。
           </p>`,
       });
     },

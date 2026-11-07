@@ -20,7 +20,7 @@ class VersionStringTests(unittest.TestCase):
         sys.path.insert(0, os.path.join(ROOT, "app"))
         import wb_proxy
         self.assertEqual(wb_proxy.Handler.server_version,
-                         "wb-proxy-center/" + wb_proxy.VERSION)
+                         "NextTokenCenter/" + wb_proxy.VERSION)
         self.assertEqual(wb_proxy.running_version(), wb_proxy.VERSION)
         self.assertEqual(wb_proxy.runtime_settings_view().get("version"),
                          wb_proxy.VERSION)
@@ -72,7 +72,7 @@ class RepoHygieneTests(unittest.TestCase):
 
     # 运行时数据与打包产物（.gitignore 里那些）：它们不是源码，不该被扫。
     SKIP_DIRS = (".git", "__pycache__", "node_modules", "accounts", "usage",
-                 "logs", "suite-logs", "dist", "python", ".sdk-cache")
+                 "logs", "suite-logs", "dist", "python")
 
     def test_no_conflict_markers_in_the_tree(self):
         offenders = []

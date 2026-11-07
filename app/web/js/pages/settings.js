@@ -3,22 +3,33 @@ import { html, render, nothing } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { getJSON, postJSON } from '../core/api.js';
 import { SETTINGS_TABS } from '../core/routes.js';
+import { getState } from '../core/store.js';
+import { channelProvider } from '../core/channels.js';
 import { hrefFor, setNavigationGuard } from '../core/router.js';
 import { loadErrorPage, sectionTabs, skeletonRows } from '../ui/widgets.js';
 import { openDialog } from '../ui/dialog.js';
 import { toastError } from '../ui/toast.js';
 import { createAboutTab } from './settings/about.js';
 import { createAdvancedTab } from './settings/advanced.js';
+import { createCodeartsTab } from './settings/codearts.js';
 import { createCostTab } from './settings/estimate.js';
 import { createGatewayTab } from './settings/gateway.js';
 import { createMaintenanceTab } from './settings/maintenance.js';
 import { createProxyTab } from './settings/proxy.js';
 import { createSecurityTab } from './settings/security.js';
+import { createWorkbuddyTab } from './settings/workbuddy.js';
+
+/** 渠道提供方的标签只在网关有这个提供方的渠道时显示。 */
+function visibleTabs() {
+  const providers = new Set(getState().realms.map(channelProvider));
+  return SETTINGS_TABS.filter((tab) => !tab.provider || providers.has(tab.provider));
+}
 
 // 设置项随标签切换重新读取，不做定时刷新。
 
 export function mount(host, ctx) {
-  const activeId = SETTINGS_TABS.some((tab) => tab.id === ctx.sub) ? ctx.sub : SETTINGS_TABS[0].id;
+  const tabsShown = visibleTabs();
+  const activeId = tabsShown.some((tab) => tab.id === ctx.sub) ? ctx.sub : tabsShown[0].id;
   const state = { view: null, loading: true, loaded: false, error: '' };
 
   function draw() {
@@ -43,10 +54,7 @@ export function mount(host, ctx) {
       state.error = '';
       state.loading = false;
       state.loaded = true;
-      tabs.gateway.seed(data);
-      tabs.cost.seed(data);
-      tabs.advanced.seed(data);
-      tabs.maintenance.seed(data);
+      seedTabs(data);
       draw();
       return true;
     } catch (err) {
@@ -63,10 +71,7 @@ export function mount(host, ctx) {
       const data = await getJSON('/settings');
       state.view = data;
       state.error = '';
-      tabs.gateway.seed(data);
-      tabs.cost.seed(data);
-      tabs.advanced.seed(data);
-      tabs.maintenance.seed(data);
+      seedTabs(data);
     } catch (err) {
       toastError('设置刷新失败', err);
     }
@@ -111,6 +116,8 @@ export function mount(host, ctx) {
 
   const tabs = {
     gateway: createGatewayTab(page),
+    workbuddy: createWorkbuddyTab(page),
+    codearts: createCodeartsTab(page),
     cost: createCostTab(page),
     advanced: createAdvancedTab(page),
     maintenance: createMaintenanceTab(page),
@@ -118,6 +125,13 @@ export function mount(host, ctx) {
     security: createSecurityTab(page),
     about: createAboutTab(page),
   };
+
+  /** 带表单的标签用服务端的值填满控件。 */
+  function seedTabs(data) {
+    for (const tab of Object.values(tabs)) {
+      if (tab.seed) tab.seed(data);
+    }
+  }
   const active = tabs[activeId];
 
   // 离开这个标签或整个设置页之前，先处理没保存的改动。
@@ -134,7 +148,7 @@ export function mount(host, ctx) {
   });
 
   function header() {
-    const navItems = SETTINGS_TABS.map((tab) => ({
+    const navItems = tabsShown.map((tab) => ({
       id: tab.id,
       label: tab.title,
       icon: tab.icon,
@@ -142,10 +156,10 @@ export function mount(host, ctx) {
     }));
     return html`
       <div class="page-head">
-        <div class="col" style="gap:10px">
+        <div class="col page-head-main">
           <div>
             <h1 class="page-title">设置</h1>
-            <p class="page-desc">网关行为、费用估算、代理槽、面板密码、高级功能、运维与运行信息</p>
+            <p class="page-desc">通用设置在前，各账号来源的设置在自己的标签里。</p>
           </div>
           ${sectionTabs(navItems, activeId)}
         </div>

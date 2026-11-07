@@ -47,11 +47,14 @@ now = time.time()
 _lt = time.localtime(now)
 TODAY0 = time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday, 0, 0, 0, 0, 0, -1))
 MONTH0 = time.mktime((_lt.tm_year, _lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+_uncollected = row(MONTH0 + 7200, "glm-5.3", 1000, 0)
+_uncollected.pop("credit")
 with io.open(P.USAGE_LOG, "w", encoding="utf-8") as fh:
     for item in (
         row(MONTH0 + 3600, "deepseek-v4.1-flash", 1000000, 1000000, credit=5),
         row(now - 120, "deepseek-v4.1-flash", 1000000, 0, cached=500000, credit=2),
         row(now - 60, "glm-5.3", 500000, 0, credit=3),
+        _uncollected,
     ):
         fh.write(json.dumps(item, ensure_ascii=False) + chr(10))
 
@@ -101,9 +104,16 @@ analytics = U.compute_usage_analytics(realm="intl", range="today")
 check("今日窗口只有今天两行", analytics["summary"]["window"]["credit"] == 5,
       analytics["summary"]["window"]["credit"])
 month = U.month_credit_view(realm="intl")
-check("本月消耗为本月全部三行", month["credit"] == 10, month)
-check("另一个出口没有消耗", U.month_credit_view(realm="cn")["credit"] == 0)
-check("两个出口合计为本月全部三行", U.month_credit_view(realm="all")["credit"] == 10)
+check("本月消耗为本月全部已采集行", month["credit"] == 10, month)
+check("本月完成行数含未采集行", month["requests"] == 4, month)
+check("未采集扣费的完成行数", month["credit_missing"] == 1, month)
+cn_month = U.month_credit_view(realm="cn")
+check("另一个出口没有消耗", cn_month["credit"] == 0
+      and cn_month["requests"] == 0 and cn_month["credit_missing"] == 0, cn_month)
+all_month = U.month_credit_view(realm="all")
+check("两个出口合计为本月全部行",
+      all_month["credit"] == 10 and all_month["requests"] == 4
+      and all_month["credit_missing"] == 1, all_month)
 
 # 追加一行后必须从旧 offset 继续，不能因为文件变大就从头重扫。
 _ = U.month_credits(ttl=0)
@@ -126,8 +136,9 @@ try:
 finally:
     U._center_fold_rows = _real_center
 check("追加行后从旧 offset 继续折叠", _calls == [_start_offset], _calls)
-check("追加行的积分进入本月合计", ok and totals.get("intl") == 12,
-      (totals, ok))
+check("追加行的积分进入本月合计",
+      ok and totals["intl"]["credit"] == 12 and totals["intl"]["requests"] == 5
+      and totals["intl"]["missing"] == 1, (totals, ok))
 
 _after_offset = U._month_credit["offset"]
 _calls = []
@@ -137,7 +148,24 @@ try:
 finally:
     U._center_fold_rows = _real_center
 check("第二次读取从文件尾开始", _calls == [_after_offset], _calls)
-check("第二次读取不重复累加", ok and totals.get("intl") == 12, (totals, ok))
+check("第二次读取不重复累加",
+      ok and totals["intl"]["credit"] == 12 and totals["intl"]["requests"] == 5,
+      (totals, ok))
+
+# 旧形状的缓存没有 schema，必须整份丢弃并从零重折，不能沿用 realm -> 浮点数
+# 的旧记法。
+U._month_credit.update({"schema": 1, "totals": {"intl": 999.0},
+                        "offset": _after_offset})
+_calls = []
+U._center_fold_rows = _spy_center
+try:
+    totals, ok = U.month_credits(ttl=0)
+finally:
+    U._center_fold_rows = _real_center
+check("旧缓存形状从零重建", _calls == [0], _calls)
+check("旧缓存数字被丢弃",
+      ok and totals["intl"]["credit"] == 12 and totals["intl"]["requests"] == 5
+      and totals["intl"]["missing"] == 1, (totals, ok))
 
 print("[5] 调用量化为 0 的模型")
 empty = U.cost_estimate_view(realm="cn", range="today")

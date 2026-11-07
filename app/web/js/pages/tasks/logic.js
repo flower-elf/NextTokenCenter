@@ -1,20 +1,20 @@
-// 任务页的纯逻辑：调度器文案、成长任务状态、猫猫旅行状态、积分变动记录；只依赖 core/format.js 与账号页的 logic 模块，可以在 Node 里直接测试。
+// 任务页的纯逻辑：调度器文案、成长任务状态、猫猫旅行状态、积分变动记录；只依赖 core/format.js、core/channels.js 与账号页的 logic 模块，可以在 Node 里直接测试。
 
-import { fmtCredit, fmtDateTime, fmtNumber, fmtTime, realmLabel } from '../../core/format.js';
+import { fmtCredit, fmtDate, fmtDateTime, fmtNumber, fmtTime, spaceMixed } from '../../core/format.js';
+import { channelLabel } from '../../core/channels.js';
 
 /** 调度器状态整理成页面上要显示的四段文字。 */
 export function schedulerView(status, realm) {
   const s = status || {};
   const enabled = !!s.enabled;
-  const mode = realm === 'cn'
-    ? (s.mode_cn || s.mode || '整点排程')
-    : (s.mode_intl || s.mode || '每日 22:00 集中巡检');
+  // 调度器按渠道给出 mode_<渠道> 说明，没有时用通用说明
+  const mode = s['mode_' + realm] || s.mode || '整点排程';
   return {
     enabled,
     stateText: enabled ? '运行中 · ' + mode : '已暂停',
     timesText: '上次巡检 ' + (s.last_run_time || '尚未运行') + ' · 下次巡检 ' + (s.next_run_time || '待调度'),
     toggleText: enabled ? '暂停调度' : '恢复调度',
-    triggerText: realm === 'intl' ? '立即保活刷新' : '立即巡检保活',
+    triggerText: '立即巡检保活',
     logs: Array.isArray(s.logs) ? s.logs : [],
   };
 }
@@ -64,7 +64,7 @@ export function travelView(travel, now = Date.now()) {
     return {
       text: '旅行归来，可以领奖',
       tone: 'success',
-      desc: reward > 0 ? '奖励 ' + fmtNumber(reward) + ' 积分，下次出发前不领取就会作废' : '点「猫猫旅行」领取奖励',
+      desc: reward > 0 ? '奖励 ' + fmtNumber(reward) + ' 积分，下次出发前不领取会作废' : '点「猫猫旅行」领取奖励',
     };
   }
   if (state === 'traveling') {
@@ -72,16 +72,16 @@ export function travelView(travel, now = Date.now()) {
     return { text: '旅行中', tone: 'info', desc: eta ? '预计 ' + eta + ' 归来' : '预计稍后归来' };
   }
   if (tr.daily_limit_reached) {
-    return { text: '今天已经旅行过', tone: 'muted', desc: '本地时间 0 点之后可以再次出发旅行' };
+    return { text: '今天已经旅行过', tone: 'muted', desc: '本地时间 0 点之后可以再次出发' };
   }
   if (state === 'idle') {
-    return { text: '在家', tone: 'muted', desc: '每天可以出发旅行一次，点「猫猫旅行」出发' };
+    return { text: '在家', tone: 'muted', desc: '每天可以出发一次' };
   }
   return { text: '状态未知', tone: 'muted', desc: '没有读取到猫猫旅行的状态' };
 }
 
 export function growthAccountOptions(accounts, current) {
-  const options = [{ value: 'all', label: '全部国内账号 (批量)' }];
+  const options = [{ value: 'all', label: '全部账号（批量）' }];
   for (const account of accounts || []) {
     const uid = String(account.uid || '');
     options.push({ value: uid, label: (account.nickname || uid.slice(0, 8)) + ' ' + uid.slice(0, 6) });
@@ -90,7 +90,7 @@ export function growthAccountOptions(accounts, current) {
   return { options, selected };
 }
 
-/** 账号选择器的取值：「全部国内账号」时留空，由网关逐个执行。 */
+/** 账号选择器的取值：「全部账号」时留空，由网关逐个执行。 */
 export function checkinSelection(growthUid) {
   return growthUid && growthUid !== 'all' ? growthUid : undefined;
 }
@@ -113,13 +113,50 @@ export function creditEventRows(events) {
 
 /** 积分变动记录为空时的说明，写清什么时候才会有记录。 */
 export function creditEventsEmptyText(realm) {
-  return '还没有读到' + realmLabel(realm) + '的积分变动记录。每次读取余额成功且余额比上一次增加时才会记一条，第一次读取只建立基线；'
-    + 'Buddy 加油站、每日活跃打卡与猫猫旅行的奖励到账之后就会出现在这里。';
+  return spaceMixed('还没有读到' + channelLabel(realm) + '的积分变动记录，余额增加后会自动记录。');
+}
+
+/**
+ * 签到类渠道的账号行：只列启用的账号，今天的状态来自统一账号视图的 lastCheckin。
+ * 昨天的成功记录不算今天已完成。
+ */
+export function checkinRows(accounts, realm, now = Date.now()) {
+  const stamp = fmtDate(now);
+  return (accounts || [])
+    .filter((account) => (account.realm || '') === realm && account.enabled)
+    .map((account) => {
+      const last = account.lastCheckin || null;
+      const at = Number(last && last.at) || 0;
+      const today = at > 0 && fmtDate(at) === stamp;
+      const ok = !!(last && last.ok);
+      const credits = Number(last && last.credits);
+      return {
+        uid: String(account.uid || ''),
+        name: account.nickname || String(account.uid || '').slice(0, 8) || '账号',
+        state: today ? (ok ? 'done' : 'failed') : 'none',
+        text: today ? (ok ? '已签到' : '签到失败') : '未签到',
+        tone: today ? (ok ? 'success' : 'danger') : 'muted',
+        at: today ? fmtDateTime(at) : '',
+        message: String((last && last.message) || ''),
+        credits: today && ok && Number.isFinite(credits) && credits > 0 ? credits : null,
+      };
+    });
+}
+
+/** 今日签到到账的积分合计；没有任何一条带积分时返回 null，页面显示破折号。 */
+export function checkinCredits(rows) {
+  let total = 0;
+  let known = 0;
+  for (const row of rows || []) {
+    if (row.credits === null || row.credits === undefined) continue;
+    total += row.credits;
+    known += 1;
+  }
+  return known ? total : null;
 }
 
 export function growthEmptyText(realm) {
-  if (realm !== 'cn') return '成长任务只对国内版账号开放，切换到国内版之后可以在这里批量执行任务并领取积分。';
-  return '当前没有读到成长任务。请确认至少有一个可用的国内版账号，然后点右上角的「刷新」重试。';
+  return spaceMixed('没有读到成长任务，请确认有可用的' + channelLabel(realm) + '账号后刷新。');
 }
 
 export function schedulerLogLines(status, limit = 20) {

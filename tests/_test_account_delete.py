@@ -76,9 +76,8 @@ class AccountDeleteRouteTests(unittest.TestCase):
 
     def test_deleting_an_unknown_uid_reports_it_and_keeps_the_rest(self):
         handler = self._delete({"uid": "uid-missing"})
-        self.assertEqual(handler.code, 200)
-        self.assertIs(handler.payload["deleted"], False)
-        self.assertEqual([row["uid"] for row in handler.payload["accounts"]],
+        self.assertEqual(handler.code, 404)
+        self.assertEqual([a.uid for a in self.pool.accounts],
                          ["uid-del", "uid-keep"])
 
     def test_delete_without_a_uid_is_rejected(self):

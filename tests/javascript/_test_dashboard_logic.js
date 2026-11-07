@@ -146,16 +146,17 @@ assert.equal(creditTone(account({ credits: { remain: 0 } })).tone, 'danger');
 assert.equal(creditTone(account({ credits: { remain: 100 }, reserveCredits: 200 })).tone, 'warning');
 assert.equal(creditTone(account({ credits: { remain: 5000 }, reserveCredits: 200 })).tone, '');
 
-// ---- 出口密钥数：绑定该出口的启用密钥加未绑定版本的启用密钥，停用的不算
+// ---- 出口密钥数：跟随面板路由的启用密钥受影响，自带路由的启用密钥不受影响，停用的不算
 const keys = [
-  { realm: 'intl', enabled: true },
-  { realm: 'cn', enabled: true },
-  { realm: '', enabled: true },
-  { realm: 'intl', enabled: false },
+  { route: [], enabled: true },
+  { route: ['cn'], enabled: true },
+  { enabled: true },
+  { route: ['intl', 'codearts'], enabled: true },
+  { route: [], enabled: false },
+  { route: ['codearts'], enabled: false },
 ];
-assert.deepEqual(keyEffect(keys, 'intl'), { bound: 1, follow: 1, total: 2 });
-assert.deepEqual(keyEffect(keys, 'cn'), { bound: 1, follow: 1, total: 2 });
-assert.deepEqual(keyEffect(null, 'intl'), { bound: 0, follow: 0, total: 0 });
+assert.deepEqual(keyEffect(keys), { following: 2, routed: 2, total: 4 });
+assert.deepEqual(keyEffect(null), { following: 0, routed: 0, total: 0 });
 
 // ---- 趋势合计：请求次数、失败次数与 Token 消耗一起给
 const trendTotals = trendSummary([{ requests: 3, errors: 1, total_tokens: 1200 }, { requests: 5, errors: 0, total_tokens: 3400 }]);
@@ -166,5 +167,10 @@ assert.deepEqual(trendSummary(null), { requests: 0, failures: 0, tokens: 0 });
 assert.equal(usageHints({ errors: 0, credit: 1.5 }).requestHint, usageHints({ errors: 0, credit: 0 }).requestHint);
 assert.ok(usageHints({ errors: 3, credit: 0 }).requestHint.includes('3'));
 assert.ok(usageHints({ errors: 0, credit: 2.5 }).tokenHint.includes(fmtCredit(2.5)));
+assert.equal(usageHints({ errors: 0, credit: null }).tokenHint, '积分未采集', '上游没有返回扣费时不要写成 0 积分');
+assert.equal(usageHints({ errors: 0 }).tokenHint, '积分未采集');
+assert.ok(usageHints({ errors: 0, credit: 0 }).tokenHint.includes('0'), '采集到的 0 是真实值，照常显示');
+assert.equal(usageHints({ errors: 0, requests: 2, credit: 0, credit_missing: 2 }).tokenHint, '积分未采集',
+  '完成行全部没有扣费时不能写成 0 积分');
 
 console.log('dashboard logic assertions passed');

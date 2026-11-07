@@ -74,7 +74,24 @@ class RefreshIssuerTests(unittest.TestCase):
                     self.assertIn("b3", headers)
                     self.assertNotIn("Origin", headers)
                     self.assertNotIn("Referer", headers)
-                    self.assertNotIn("X-User-Id", headers)
+                    # 官方插件的 AuthenticationHttpInterceptor 给所有 REST 请求补
+                    # Authorization / X-User-Id / X-Enterprise-Id / X-Domain，刷新请求
+                    # 没有 X-No-* 豁免；X-Product 与 X-IDE-* 由产品与 IDE 拦截器补齐。
+                    self.assertEqual(headers["X-User-Id"], "uid-refresh")
+                    self.assertEqual(headers["Authorization"], "Bearer old-token")
+                    self.assertEqual(headers["X-Product"], "SaaS")
+                    expected_ide = {"workbuddy": "WorkBuddy",
+                                    "vscode": "VSCode",
+                                    "cli": "CLI"}[login_product]
+                    self.assertEqual(headers["X-IDE-Type"], expected_ide)
+                    self.assertEqual(headers["X-IDE-Name"], expected_ide)
+                    if login_product == "vscode":
+                        self.assertEqual(headers["X-Product-Version"],
+                                         wb_identity.DEFAULT_VSCODE_PLUGIN_VERSION)
+                        self.assertEqual(headers["X-Env-ID"], "production")
+                    else:
+                        self.assertNotIn("X-Product-Version", headers)
+                        self.assertNotIn("X-Env-ID", headers)
                     self.assertEqual(account.access_token, "new-token")
                     self.assertEqual(account.refresh_token, "new-refresh")
 

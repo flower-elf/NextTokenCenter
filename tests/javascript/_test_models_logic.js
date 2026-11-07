@@ -3,10 +3,11 @@
  */
 import assert from 'node:assert/strict';
 import {
-  LONG_CONTEXT_TOKENS, accountAvailableCount, accountCanUse, capabilityBadges, contextText,
-  coverageFor, creditInfo, creditsValue, disabledIds, fmtTokens, hasCredits, hasReasoning,
+  LONG_CONTEXT_TOKENS, accountAvailableCount, accountCanUse, aliasBadge, aliasEntries,
+  capabilityBadges, contextText,
+  coverageFor, creditInfo, creditsValue, fmtTokens, hasCredits, hasExcluded, hasReasoning,
   hasVision, hiddenExcludedCount, realmAccounts, reasoningLevels, panelModelsUrl,
-  selectModels, sourceLabel, summary, withEnabled,
+  selectModels, sourceLabel, summary, withAlias, withEnabled, withoutAlias,
 } from '../../app/web/js/pages/models/logic.js';
 
 const MODELS = [
@@ -125,14 +126,20 @@ assert.equal(panelModelsUrl('intl'), '/panel/models?realm=intl');
 assert.equal(panelModelsUrl('cn', true), '/panel/models?realm=cn&refresh=1');
 assert.equal(panelModelsUrl('all'), '/panel/models?realm=all');
 
-// 勾选写回：disabled_models 是「当前没有勾选」的模型 id，取消勾选的模型仍留在表里
-assert.deepEqual(disabledIds(MODELS), ['default-model', 'deepseek-v4.1-flash-sg']);
+// 勾选写回：取消勾选的模型仍留在表里
 assert.ok(ids(selectModels(withEnabled(MODELS, 'glm-5.3', false), {})).includes('glm-5.3'));
-assert.deepEqual(disabledIds(withEnabled(MODELS, 'kimi-k2.6', false)),
-                 ['kimi-k2.6', 'default-model', 'deepseek-v4.1-flash-sg']);
-assert.deepEqual(disabledIds(withEnabled(MODELS, 'default-model', true)), ['deepseek-v4.1-flash-sg']);
 assert.notEqual(withEnabled(MODELS, 'kimi-k2.6', false), MODELS, '返回新数组');
 assert.equal(MODELS[4].enabled, true, '不修改传入的数据');
+
+// 别名表：源 id 不区分大小写替换，排序稳定，删除不影响其他条目
+const aliases = withAlias({ 'GLM-5.2-x': 'glm-5.2' }, 'deepseek-v4.1-flash-1017', 'deepseek-v4.1-flash');
+assert.deepEqual(aliasEntries(aliases).map((r) => r.source), ['deepseek-v4.1-flash-1017', 'GLM-5.2-x']);
+assert.deepEqual(withAlias(aliases, 'glm-5.2-X', 'glm-5.3'),
+                 { 'deepseek-v4.1-flash-1017': 'deepseek-v4.1-flash', 'glm-5.2-X': 'glm-5.3' });
+assert.deepEqual(withoutAlias(aliases, ' DEEPSEEK-V4.1-FLASH-1017 '), { 'GLM-5.2-x': 'glm-5.2' });
+assert.equal(aliasBadge({ id: 'x' }), null);
+assert.equal(aliasBadge({ id: 'x', alias: { target: 'y', active: true } }).tone, 'info');
+assert.equal(aliasBadge({ id: 'x', alias: { target: 'y', active: false } }).tone, 'muted');
 
 // 分账号查看：账号名单、模型可用性与聚合覆盖
 const ACCOUNTS = [
@@ -151,5 +158,30 @@ assert.deepEqual(coverageFor({ id: 'hy3' }, realmAccounts(ACCOUNTS, 'intl')),
 assert.equal(accountAvailableCount(MODELS, ACCOUNTS[0]),
   MODELS.filter((m) => m.enabled && m.id !== 'glm-5.3').length);
 assert.equal(accountAvailableCount(MODELS, ACCOUNTS[1]), stats.enabled);
+
+// ---- 逐账号模型目录：models 为 null 表示全部可用，列表限定账号能接的模型
+const catalogAccount = { uid: 'e', realm: 'codearts', enabled: true, disabledModels: [], models: ['glm-5.3', 'Kimi-K2.6'] };
+assert.equal(accountCanUse({ id: 'glm-5.3' }, catalogAccount), true);
+assert.equal(accountCanUse({ id: 'GLM-5.3' }, catalogAccount), true, '目录比较不区分大小写');
+assert.equal(accountCanUse({ id: 'hy4-preview-f' }, catalogAccount), false, '目录里没有的模型不可用');
+assert.equal(accountCanUse({ id: 'glm-5.3' }, { uid: 'f', models: null }), true, 'models 为 null 表示提供方没有逐账号目录');
+assert.equal(accountCanUse({ id: 'glm-5.3' }, { uid: 'g', models: undefined }), true);
+assert.equal(accountCanUse({ id: 'glm-5.3' }, { uid: 'h', models: ['glm-5.3'], disabledModels: ['glm-5.3'] }), false,
+  '排除名单优先于目录');
+const catalogCoverage = coverageFor({ id: 'glm-5.3' }, [{ uid: 'e', enabled: true, models: ['glm-5.3'] }, catalogAccount]);
+assert.deepEqual(catalogCoverage, { can: 2, total: 2, text: '2/2' });
+assert.equal(accountAvailableCount(MODELS, catalogAccount), 2, '只数目录里开启的模型');
+
+// ---- 免费判定：目录福利标记与账号 freeModels 都算免费
+assert.equal(creditInfo({ id: 'benefit-model', benefit: true }, 'codearts').free, true);
+assert.equal(creditInfo({ id: 'benefit-model', benefit: true }, 'codearts').label, '免费');
+assert.equal(creditInfo({ id: 'glm-5.3', credits: 'x0.7' }, 'codearts', { freeModels: ['glm-5.3'] }).free, true);
+assert.equal(creditInfo({ id: 'glm-5.3', credits: 'x0.7' }, 'codearts', { freeModels: [] }).free, false);
+assert.equal(creditInfo({ id: 'glm-5.3', credits: 'x0.7' }, 'codearts').free, false);
+
+// ---- 只有目录里出现被排除的模型时才需要那个开关
+assert.equal(hasExcluded(MODELS), true);
+assert.equal(hasExcluded([{ id: 'a', enabled: true }]), false, '没有被排除条目时不显示开关');
+assert.equal(hasExcluded(null), false);
 
 console.log('models logic checks passed');

@@ -1,7 +1,7 @@
-// 用量与费用估算共用的时间范围控件：范围分段、版本合并开关与自定义起止时间。
+// 用量与费用估算共用的时间范围控件：范围分段、渠道合并开关与自定义起止时间。
 import { html } from '../../core/dom.js';
 import { getState } from '../../core/store.js';
-import { toLocalInputValue, fromLocalInputValue } from '../../core/format.js';
+import { toLocalInputValue, fromLocalInputValue, spaceMixed } from '../../core/format.js';
 import { segmented, chip } from '../../ui/widgets.js';
 import { RANGES, scopeRealm, scopeText, buildQuery } from './logic.js';
 
@@ -39,7 +39,7 @@ export function createRangeControls({ redraw, reload }) {
   return {
     get range() { return range; },
     get includeAll() { return includeAll; },
-    /** 当前统计的版本合并口径，供「本月积分」这类只按版本取数的接口拼查询串。 */
+    /** 当前统计的渠道合并口径，供「本月积分」这类只按渠道取数的接口拼查询串。 */
     realm() {
       return scopeRealm(getState().viewRealm, includeAll);
     },
@@ -54,11 +54,11 @@ export function createRangeControls({ redraw, reload }) {
     actions() {
       return html`
         ${segmented(RANGES, range, selectRange)}
-        ${chip(includeAll ? '含两个版本' : '仅' + scopeText(false, getState().viewRealm), includeAll, toggleScope)}`;
+        ${chip(spaceMixed(includeAll ? '全部渠道' : '仅' + scopeText(false, getState().viewRealm)), includeAll, toggleScope)}`;
     },
     customCard() {
       return html`
-        <div class="card card-tight">
+        <div class="card">
           <div class="row-wrap">
             <label class="row text-2xs muted">起点
               <input class="input input-sm" type="datetime-local" .value=${sinceInput}

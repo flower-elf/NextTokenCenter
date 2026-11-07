@@ -53,7 +53,6 @@ def stub_pool(account):
     """open_upstream 的最小账号池替身：一个账号、没有绑定。"""
     class Pool(object):
         accounts = [account]
-        smart_routing = False
         affinity = types.SimpleNamespace(unbind=lambda _key: None,
                                          demote=lambda _key, _uid=None: None)
 
@@ -70,8 +69,24 @@ def stub_pool(account):
         def apply_daily_token_limit(self, value=None, usage=None):
             return value or 0
 
+        def apply_daily_credit_limit(self, value=None, credits=None,
+                                     free_models=None):
+            return value or 0
+
+        def apply_model_daily_token_limit(self, value=None, per_model=None):
+            return value or 0
+
+        def apply_reserve_credits(self, values=None):
+            return None
+
+        def apply_expiring_window(self, values=None):
+            return None
+
         def apply_remaining_weights(self, weights=None):
             return weights or {}
+
+        def apply_credit_rates(self, per_day=None):
+            return None
 
     return Pool()
 
@@ -191,10 +206,19 @@ class ModelCooldownTests(unittest.TestCase):
             def apply_model_daily_token_limit(self, value=None, per_model=None):
                 return value or 0
 
+            def apply_reserve_credits(self, values=None):
+                return None
+
+            def apply_expiring_window(self, values=None):
+                return None
+
             def apply_remaining_weights(self, weights=None):
                 # 剩余用量权重（并入智能分配的评分）也由请求路径推给池；桩只
                 # 负责接住调用，没有加权组合时推来的是 None。
                 return weights or {}
+
+            def apply_credit_rates(self, per_day=None):
+                return None
         old_pool, old_urlopen = proxy.POOL, accounts.urlopen
         old_parser = proxy.parse_rate_limit_reset
         proxy.POOL = stub_pool(account)

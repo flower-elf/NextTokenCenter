@@ -89,8 +89,8 @@ def read_response(sock, deadline=RESPONSE_DEADLINE):
         try:
             return sock.recv(size)
         except socket.timeout:
-            # socket.timeout 在 3.10 才成为 TimeoutError 的别名，CI 下限是 3.9，
-            # 那里 recv() 抛独立的类型：统一转成 TimeoutError，一种异常表示到达上限。
+            # recv() 超时抛 socket.timeout，它是 TimeoutError 的别名（3.10 起）：
+            # 统一转成 TimeoutError，一种异常表示到达上限。
             raise TimeoutError(no_response) from None
 
     buf = b""

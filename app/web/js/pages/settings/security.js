@@ -16,7 +16,7 @@ export function createSecurityTab(page) {
       width: 440,
       icon: 'LockKeyhole',
       title: '修改面板密码',
-      desc: '用于打开本看板，与 API Key 相互独立；新密码至少 4 位。',
+      desc: '用于打开本看板，新密码至少 4 位。',
       body: () => html`
         <label class="field">
           <span class="field-label">当前密码</span>

@@ -29,15 +29,15 @@ set "PYEXE=%HERE%python\python.exe"
 goto run
 
 :try_path
-rem ---- 2) python on PATH ----
-python --version >nul 2>nul
+rem ---- 2) python on PATH（要求 3.12 起）----
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul
 if errorlevel 1 goto try_py
 set "PYEXE=python"
 goto run
 
 :try_py
-rem ---- 3) py launcher ----
-py --version >nul 2>nul
+rem ---- 3) py launcher（要求 3.12 起）----
+py -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul
 if errorlevel 1 goto no_python
 set "PYEXE=py"
 goto run
@@ -47,7 +47,7 @@ echo [ERROR] No usable Python found.
 echo.
 echo Options:
 echo   1. Use the packaged zip, which already contains python\
-echo   2. Install Python 3.9+ from https://www.python.org/downloads/
+echo   2. Install Python 3.12+ from https://www.python.org/downloads/
 echo      (tick "Add python.exe to PATH" during setup)
 echo   3. Edit this file and set PYEXE to a full path, e.g.
 echo        set "PYEXE=C:\Python312\python.exe"

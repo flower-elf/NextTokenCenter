@@ -1,0 +1,13 @@
+# 网关的第三方依赖：cryptography 用于 CodeArts 密钥交换与请求加密，brotli 与
+# zstandard 用于解压上游响应。cffi 等是 cryptography 声明的传递依赖，一并固定
+# 版本，避免 CI 与镜像随上游发布漂移。
+#
+# 最低支持 Python 3.12：三个直接依赖都提供 3.12 的 win_amd64、manylinux、
+# musllinux wheel，CI 与 Docker 都是 3.12，便携运行时也固定 3.12。
+cryptography==50.0.2
+brotli==1.2.1
+zstandard==0.25.0
+
+# cryptography 依赖 cffi>=2.0.0 与 pycparser。
+cffi==2.1.1
+pycparser==3.12

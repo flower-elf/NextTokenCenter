@@ -32,9 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # README 声明支持 Python 3.9+，最低版本在 Linux 上验证；主平台 Windows 运行当前版本。
-          - os: ubuntu-latest
-            python: "3.9"
+          # 最低支持 Python 3.12，Linux 与主平台 Windows 各跑一条。
           - os: ubuntu-latest
             python: "3.12"
           - os: windows-latest
@@ -44,6 +42,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      # 网关 import cryptography / brotli / zstandard，两条腿都要先装 requirements
+      # 里的固定版本，否则套件在导入阶段就失败。
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
       # 看板模块与 JS 套件是不带 package.json 的 ESM 文件，依赖 Node 22 起默认开启的模块语法识别。
       - uses: actions/setup-node@v4
         with:
@@ -87,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           OVERVIEW=$(grep -oP '^VERSION\s*=\s*"\K[^"]+' app/wb_proxy.py | head -n1 || true)
-          if ! grep -q 'server_version = "wb-proxy-center/" + VERSION' app/wb_proxy.py; then
+          if ! grep -q 'server_version = "NextTokenCenter/" + VERSION' app/wb_proxy.py; then
             echo "::error::server_version does not derive from VERSION"
             exit 1
           fi

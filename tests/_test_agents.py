@@ -794,7 +794,7 @@ check("a missing peer address is refused",
 saved_form = wb_proxy._SERVER_DEPLOYMENT
 try:
     wb_proxy._SERVER_DEPLOYMENT = True
-    check("a container / OpenWrt marker wins over a loopback peer",
+    check("a container marker wins over a loopback peer",
           wb_proxy.agents_client_allowed(("127.0.0.1", 51234)) is False)
 finally:
     wb_proxy._SERVER_DEPLOYMENT = saved_form

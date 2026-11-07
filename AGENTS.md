@@ -15,7 +15,7 @@
 - **网关**：`app/wb_proxy.py` 是入口，其余模块是 `app/wb_*.py`。
 - **看板**：`app/web/` 是多文件前端，使用 ES 模块和 lit-html，不需要构建。
 - **测试**：Python 套件在 `tests/`，看板的 JS 套件在 `tests/javascript/`，统一用 `python tests/run_all.py` 运行。
-- **发布**：`release/` 存放打包工具和便携包清单，`wrt/` 存放 OpenWrt 打包文件。
+- **发布**：`release/` 存放打包工具和便携包清单。
 
 ## 写作要求
 

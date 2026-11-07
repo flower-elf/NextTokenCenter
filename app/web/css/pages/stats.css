@@ -6,13 +6,8 @@
   position: absolute; inset: 0; display: grid; place-items: center;
 }
 
-/* 模型分布：一行里放多个模型的用量标签，宽度不够时换行 */
+/* 模型分布：一行里放多个模型标签，宽度不够时换行 */
 .model-pills { display: flex; flex-wrap: wrap; gap: 4px; }
-.model-pill {
-  border-radius: 9999px; background: var(--secondary); padding: 1px 8px;
-  font-size: 11px; white-space: nowrap;
-}
-.model-pill .cell-mono { display: inline; font-size: 11px; color: var(--foreground); }
 
 /* 用量占比：进度条画在固定宽度的轨道里，轨道与百分比文字一起决定单元格宽度，进度条不会伸出单元格 */
 .share-cell { white-space: nowrap; }

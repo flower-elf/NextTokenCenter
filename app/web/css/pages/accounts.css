@@ -16,8 +16,9 @@
 .table-accounts th:nth-child(6) { width: 168px; }
 .table-accounts th:nth-child(7) { width: 104px; }
 .table-accounts th:nth-child(8) { width: 104px; }
-.table-accounts th:nth-child(9) { width: 96px; }
-.table-accounts th:nth-child(10) { width: 120px; }
+.table-accounts th:nth-child(9) { width: 104px; }
+.table-accounts th:nth-child(10) { width: 96px; }
+.table-accounts th:nth-child(11) { width: 120px; }
 .table-accounts td { vertical-align: middle; }
 /* 表头与数据都居中，每列内容与标题对齐 */
 .table-accounts th,
@@ -31,6 +32,10 @@
 .account-cell .row-wrap { display: inline; }
 .account-cell .row-wrap .badge { margin-left: 6px; vertical-align: middle; }
 .account-cell .cell-mono { word-break: break-all; }
+.table-accounts .account-name {
+  display: inline-block; max-width: 112px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: bottom;
+}
 
 /* 账号列的技术信息：默认只显示昵称与版本，由「更多」菜单的「显示技术信息」展开 */
 .cell-label { margin-right: 6px; font-family: var(--font-sans); font-size: 11px; color: var(--muted-foreground); }
@@ -48,18 +53,19 @@
 .table-accounts .credit-cell, .table-accounts .token-cell { align-items: center; }
 .table-accounts .row-actions { justify-content: center; }
 
-/* 表格里的下拉框收进列宽，不按最长选项撑宽：min-width:0 允许它随列收缩，
-   选中项过长时由浏览器自身省略。身份列否则会被长标签撑宽、带偏整张表。 */
-.table-accounts td .select {
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
+/* 十一列的自动表格布局会压缩可收缩的控件：下拉框留出最长选项与箭头的宽度，
+   三个数字输入框统一宽度；状态与积分徽章只在「 · 」处换行，文字完整显示。 */
+.table-accounts td .select { width: 100%; min-width: 110px; }
+.table-accounts .input-num { width: 64px; text-align: center; }
+.table-accounts .status-cell .badge, .table-accounts .credit-cell .badge {
+  display: inline-block; white-space: normal; text-align: center; border-radius: 10px;
 }
+.table-accounts .badge-part { white-space: nowrap; }
+.table-accounts .status-cell { min-width: 112px; }
 
-/* 账号表有十列，比其他表宽，收窄下拉框后最小宽度约 894px。视口不足 1024px
-   时改用卡片列表，避免表格出现左右滚动条。其他页面的表格更窄，沿用全局的
-   768px 断点。 */
-@media (max-width: 1023px) {
+/* 账号表最小宽度约 1110px，加上页面外框需要约 1290px 视口。视口更窄时改用卡片列表，
+   避免表格出现左右滚动条。 */
+@media (max-width: 1299px) {
   .accounts-list .table-wrap.desktop-only { display: none; }
   .accounts-list .mobile-list { display: block; }
 }
@@ -86,7 +92,7 @@
 .mobile-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .mobile-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .mobile-field .select, .mobile-field .input { width: 100%; }
-.mobile-field .input-priority, .mobile-field .input-concurrency { width: 72px; }
+.mobile-field .input-priority, .mobile-field .input-weight, .mobile-field .input-concurrency { width: 72px; }
 .mobile-item .row-actions { justify-content: flex-start; }
 
 .card-note {

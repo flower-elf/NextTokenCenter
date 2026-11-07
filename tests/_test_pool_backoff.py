@@ -366,17 +366,16 @@ class PanelTestSuccessTests(unittest.TestCase):
         self.assertEqual(account.soft_streak, 1)
         self.assertEqual(wait, A.SOFT_RATE_BASE)
 
-    def test_a_panel_test_keeps_other_models_throttled(self):
-        """这条窄成功路径不能解除同账号其他模型的冷却。"""
+    def test_a_panel_test_clears_all_local_penalties(self):
+        """测试成功即清掉该账号的本地惩罚（契约 §1），包括其他模型的冷却。"""
         account = load_account("u-panel-test-siblings")
         account.note_error("HTTP 429 (model throttled)", model="glm-5.3",
                            cooldown=600)
 
         self._drive_panel_test(account)
 
-        self.assertFalse(account.ready(model="glm-5.3"))
-        self.assertIn("glm-5.3", [item["model"]
-                                  for item in account.public()["modelCooldowns"]])
+        self.assertTrue(account.ready(model="glm-5.3"))
+        self.assertEqual(account.public()["modelCooldowns"], [])
 
 
 class RetryRoundChargeTests(unittest.TestCase):
@@ -413,8 +412,17 @@ class RetryRoundChargeTests(unittest.TestCase):
             def apply_model_daily_token_limit(self, *a, **k):
                 return 0
 
+            def apply_reserve_credits(self, values=None):
+                return None
+
+            def apply_expiring_window(self, values=None):
+                return None
+
             def apply_remaining_weights(self, weights=None):
                 return weights or {}
+
+            def apply_credit_rates(self, per_day=None):
+                return None
 
         old_pool, old_urlopen = wb_proxy.POOL, A.urlopen
         wb_proxy.POOL = Pool()

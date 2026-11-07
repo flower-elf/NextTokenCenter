@@ -5,11 +5,11 @@ import { html, render, nothing } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { getJSON } from '../core/api.js';
 import { getState } from '../core/store.js';
-import { fmtNumber, fmtCredit, fmtCny } from '../core/format.js';
+import { fmtNumber, fmtCredit, fmtCny, spaceMixed } from '../core/format.js';
 import {
   pageHeader, statCard, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock,
 } from '../ui/widgets.js';
-import { rangeLabel, scopeText } from './stats/logic.js';
+import { rangeLabel, scopeText, creditKnown } from './stats/logic.js';
 import { createRangeControls } from './stats/range.js';
 
 export const autoRefresh = true;
@@ -59,6 +59,12 @@ export function mount(host) {
     return value == null ? '—' : fmtCny(value);
   }
 
+  /** 上游没有返回单次扣费：后端给 credit_missing，或 credit 缺失；这类行不参与节省额计算。 */
+  function creditMissing(row) {
+    return row.credit_missing === true
+      || row.credit === null || row.credit === undefined || row.credit === '';
+  }
+
   function priceTitle(row) {
     if (!row.priced || !row.prices) return '设置里没有配置这个模型的价格，按 0 计，不参与估算';
     return '输入 ' + fmtCny(row.prices.input) + ' · 缓存命中 ' + fmtCny(row.prices.cached_input)
@@ -67,8 +73,13 @@ export function mount(host) {
 
   function statCards() {
     const summary = (data && data.summary) || {};
-    const saved = Number(summary.saved_cny) || 0;
-    const tone = saved > 0 ? 'success' : (saved < 0 ? 'danger' : '');
+    const rows = (data && data.models) || [];
+    const pricedRows = rows.filter((row) => row.priced);
+    const knownPriced = pricedRows.filter((row) => !creditMissing(row));
+    const noPricedCredit = pricedRows.length > 0 && knownPriced.length === 0;
+    const savedKnown = !noPricedCredit && creditKnown(summary.saved_cny);
+    const tone = savedKnown && summary.saved_cny > 0 ? 'success' : (savedKnown && summary.saved_cny < 0 ? 'danger' : '');
+    const missing = Number(summary.credit_missing) || 0;
     return html`
       <div class="grid-stats cols-4">
         ${statCard({
@@ -79,22 +90,30 @@ export function mount(host) {
         })}
         ${statCard({
           label: '积分折算支出',
-          value: data ? fmtCny(summary.paid_cny || 0) : '—',
+          value: data && !noPricedCredit && creditKnown(summary.paid_cny) ? fmtCny(summary.paid_cny) : '—',
           icon: 'Coins',
-          hint: data && data.credit_price
-            ? '每积分 ' + fmtCny(data.credit_price)
-            : '积分折算单价为 0，积分不计支出',
+          hint: noPricedCredit
+            ? '已定价模型的积分全部未采集，无法折算'
+            : (missing
+              ? missing + ' 个模型未采集积分，不参与折算'
+              : (data && data.credit_price
+                ? '每积分 ' + fmtCny(data.credit_price)
+                : '积分折算单价为 0，积分不计支出')),
         })}
         ${statCard({
           label: '省了多少',
-          value: data ? fmtCny(summary.saved_cny || 0) : '—',
+          value: data && savedKnown ? fmtCny(summary.saved_cny) : '—',
           icon: 'PiggyBank',
           tone,
-          hint: data ? '官方价格合计减去积分折算支出' : '费用估算未读取到',
+          hint: noPricedCredit
+            ? '积分未采集，无法计算节省额'
+            : (missing
+              ? missing + ' 个模型未采集积分，不计入节省额'
+              : (data ? '官方价格合计减去积分折算支出' : '费用估算未读取到')),
         })}
         ${statCard({
           label: '未定价模型',
-          value: data ? fmtNumber(summary.unpriced_models || 0) : '—',
+          value: data ? fmtNumber((summary.unpriced_models || []).length || summary.unpriced_models || 0) : '—',
           icon: 'CircleHelp',
           hint: '这些模型按 0 计，不参与估算',
         })}
@@ -113,7 +132,7 @@ export function mount(host) {
       <div class="card card-flush">
         <div class="card-head">
           <h2 class="card-title">${icon('Calculator')}按模型的费用估算</h2>
-          <span class="card-sub">官方价格取自「设置 → 费用估算」；内置的 deepseek-v4.1-flash 使用官方高峰时段价格，缓存命中按命中价计费</span>
+          <span class="card-sub">官方价格取自「设置 → 费用估算」，缓存命中按命中价计费。</span>
         </div>
         <div class="table-wrap">
           <table class="table">
@@ -131,42 +150,48 @@ export function mount(host) {
               </tr>
             </thead>
             <tbody>
-              ${rows.map((row) => html`
+              ${rows.map((row) => {
+                const missing = creditMissing(row);
+                return html`
                 <tr>
                   <td>
                     <div class="cell-mono">${row.model}</div>
                     ${row.priced
                       ? nothing
                       : html`<div class="text-2xs muted">未配置价格，按 0 计</div>`}
+                    ${row.priced && missing
+                      ? html`<div class="text-2xs muted">上游未返回扣费，按未采集处理</div>`
+                      : nothing}
                   </td>
                   <td class="right nums">${fmtNumber(row.requests)}</td>
                   <td class="right nums matrix-opt">${fmtNumber(row.prompt_tokens)}</td>
                   <td class="right nums matrix-opt">${fmtNumber(row.cached_tokens)}</td>
                   <td class="right nums matrix-opt">${fmtNumber(row.completion_tokens)}</td>
                   <td class="right nums" title=${priceTitle(row)}>${row.priced ? money(row.official_cny) : html`<span class="muted">—</span>`}</td>
-                  <td class="right nums">${fmtCredit(row.credit)}</td>
-                  <td class="right nums matrix-opt">${row.priced ? money(row.paid_cny) : html`<span class="muted">—</span>`}</td>
+                  <td class="right nums">${missing ? html`<span class="muted" title="上游没有返回单次扣费">未采集</span>` : fmtCredit(row.credit)}</td>
+                  <td class="right nums matrix-opt">${row.priced && !missing ? money(row.paid_cny) : html`<span class="muted">—</span>`}</td>
                   <td class="right nums">
-                    ${row.priced
+                    ${row.priced && !missing && row.saved_cny != null
                       ? html`<span class=${row.saved_cny < 0 ? 'tone-danger' : 'tone-success'}>${money(row.saved_cny)}</span>`
                       : html`<span class="muted">—</span>`}
                   </td>
-                </tr>`)}
+                </tr>`;
+              })}
             </tbody>
           </table>
         </div>
-        <div class="card-sub" style="padding:10px 16px 14px">
-          只统计已完成的请求；失败请求即使上游已经扣了积分，也不进入这张表。
+        <div class="card-foot">
+          只统计已完成的请求，未采集扣费的模型不参与折算。
           ${(data.unpriced_models || []).length
-            ? ' 未定价的模型：' + data.unpriced_models.join('、') + '，在设置里填上官方价格后才会进入合计。'
+            ? ' 未定价模型：' + data.unpriced_models.join('、') + '，填写价格后进入合计。'
             : nothing}
         </div>
       </div>`;
   }
 
   function view() {
-    const desc = '以模型官方价格为基准，折算当前范围的请求费用，再减去积分折算的支出，得到省了多少。只统计已完成的请求。当前统计：'
-      + scopeText(rangeCtl.includeAll, getState().viewRealm) + '。';
+    const desc = spaceMixed('按官方价格与积分折算比较当前范围的支出，统计范围：'
+      + scopeText(rangeCtl.includeAll, getState().viewRealm) + '。');
     if (phase === 'loading') {
       return html`
         <div class="page">
@@ -182,8 +207,12 @@ export function mount(host) {
       <div class="page">
         ${pageHeader({ path: 'estimate', title: '费用估算', desc, actions: rangeCtl.actions() })}
         ${rangeCtl.range === 'custom' ? rangeCtl.customCard() : nothing}
-        ${missing ? loadErrorInline('费用估算没有刷新成功：' + missing + '。下面显示的是上一次读取到的结果。', retry) : nothing}
+        ${missing ? loadErrorInline('费用估算没有刷新成功，下面显示的是上次结果：' + missing + '。', retry) : nothing}
         ${statCards()}
+        ${data.summary && Number(data.summary.credit_missing) > 0 ? html`
+          <div class="notice notice-warn" role="status">${icon('TriangleAlert')}
+            <div class="grow">有 ${fmtNumber(data.summary.credit_missing)} 个模型未返回单次扣费，不参与积分折算。</div>
+          </div>` : nothing}
         ${tableCard()}
       </div>`;
   }

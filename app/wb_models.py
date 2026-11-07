@@ -16,6 +16,7 @@ import wb_host
 import wb_modelsdev
 import wb_probes
 import wb_settings
+import wb_tiers
 import wb_upstream_pool
 
 
@@ -259,6 +260,65 @@ def fetch_models(realm=None, force=False):
                                 "file_mtime": file_mtime}
         seed_default_disabled(_catalog_excluded[r])
         return entries
+
+
+def cached_model_ids(realm):
+    """该出口已缓存目录的小写 id 到原始写法的映射，不触发上游取数；缓存还空着时返回 None。"""
+    entries = (_models_cache.get(realm) or {}).get("data")
+    if not entries:
+        return None
+    return {str(mid).strip().lower(): str(mid).strip() for mid, _meta in entries}
+
+
+def canonical_model_id(aliases, model):
+    """对客户端通告的 id：别名的源 id 换成通告 id，其余原样返回。"""
+    mid = str(model or "").strip()
+    low = mid.lower()
+    for source, target in aliases.items():
+        if source.lower() == low:
+            return target
+    return mid
+
+
+def upstream_model_id(aliases, model, available, disabled):
+    """把客户端请求的 id 换成该出口能接单的 id。
+
+    available 与 disabled 是该出口目录 id 与已关闭 id 的小写集合，available 为 None 表示
+    目录未知。出口自己有通告 id 且没关闭时用它，否则用第一个指向它的可用源 id；
+    都不可用时返回通告 id，交给关闭检查与上游报错。"""
+    mid = canonical_model_id(aliases, model)
+    low = mid.lower()
+
+    def usable(value):
+        return value not in disabled and (available is None or value in available)
+
+    if usable(low):
+        return mid
+    for source, target in aliases.items():
+        if target.lower() == low and usable(source.lower()):
+            return source
+    return mid
+
+
+def announce_model_aliases(aliases, entries):
+    """`/v1/models` 用：在已剔除关闭项的条目里把源 id 改成通告 id。同一出口已有通告 id
+    的条目时丢弃源条目，与 upstream_model_id 优先用出口自己的同名模型一致。"""
+    if not aliases:
+        return entries
+    targets = {source.lower(): target for source, target in aliases.items()}
+    present = {str(e.get("id") or "").lower() for e in entries}
+    out = []
+    for entry in entries:
+        target = targets.get(str(entry.get("id") or "").lower())
+        if target:
+            if target.lower() in present:
+                continue
+            present.add(target.lower())
+            entry = dict(entry, id=target, name=target)
+        out.append(entry)
+    return out
+
+
 def model_entry(mid, meta):
     """OpenAI 规范只定义 id/object/created/owned_by，能力字段没有标准，这里同时输出 capabilities、
     supports_*、vision、abilities、modalities、architecture 等多种形状，供不同客户端各取所认的字段。"""
@@ -484,19 +544,19 @@ def parse_remote_catalog(payload):
     walk(payload)
     return ids, meta
 
-def seed_default_disabled(ids):
+def seed_default_disabled(ids, realm=""):
     """默认拒绝这些模型的路由；操作者在模型页重新勾选后，excluded_seen 保证每个模型只默认关一次，
-    下一次加载不会再关掉它。"""
-    seen = {str(m).strip().lower() for m in wb_settings.excluded_seen(_gateway().ACCOUNTS_DIR)}
+    下一次加载不会再关掉它。realm 决定写入哪个提供方的关闭名单。"""
+    accounts_dir = _gateway().ACCOUNTS_DIR
+    seen = {str(m).strip().lower() for m in wb_settings.excluded_seen(accounts_dir, realm)}
     fresh = [m for m in ids if str(m).strip().lower() not in seen]
     if not fresh:
         return
-    wb_settings.remember_excluded(_gateway().ACCOUNTS_DIR, fresh)
-    disabled = wb_settings.disabled_models(_gateway().ACCOUNTS_DIR)
+    wb_settings.remember_excluded(accounts_dir, fresh, realm)
+    disabled = wb_settings.disabled_models(accounts_dir, realm)
     known = {str(m).strip().lower() for m in disabled}
     wb_settings.set_disabled_models(
-        _gateway().ACCOUNTS_DIR, disabled + [m for m in fresh
-                                  if str(m).strip().lower() not in known])
+        accounts_dir, disabled + [m for m in fresh if str(m).strip().lower() not in known], realm)
 
 def curate_remote_catalog(realm, ids, meta=None):
     """剔除虚拟别名 default-model、auto 等非模型项，剔除 "-sg" / "-x" 付费变体，其余保持上游顺序。
@@ -539,6 +599,7 @@ def fetch_remote_product_config(realm):
         except Exception as exc:
             last = exc
             continue
+        wb_tiers.ingest(realm, payload)
         parsed = parse_remote_catalog(payload)
         if parsed:
             # 成功副本落盘到 catalog/，纯存档，见 persist_remote_catalog。

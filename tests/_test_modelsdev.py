@@ -15,6 +15,7 @@ os.environ["ACCOUNTS_DIR"] = _startup_dir.name
 os.environ["WB_PROXY_USAGE_DIR"] = _startup_dir.name
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import wb_models
 import wb_modelsdev
 import wb_proxy
 
@@ -188,14 +189,14 @@ class CatalogEntryTests(unittest.TestCase):
             def _authorized(self):
                 return True
 
-            def _request_realm(self):
-                return "intl"
+            def _request_route(self):
+                return ("intl",)
 
             def _json(self, code, obj):
                 self.captured = (code, obj)
 
         handler = Handler()
-        with mock.patch.object(wb_proxy, "fetch_models",
+        with mock.patch.object(wb_models, "fetch_models",
                                return_value=[("glm-5.2", {})]), \
                 mock.patch.object(wb_modelsdev, "refresh_async") as refresh:
             handler._get_v1_models()

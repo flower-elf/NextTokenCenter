@@ -14,7 +14,7 @@
 
 .snap-tile {
   display: flex; flex-direction: column; gap: 8px;
-  border-radius: 16px; background: color-mix(in oklab, var(--background) 60%, transparent);
+  border-radius: var(--radius-nested); background: color-mix(in oklab, var(--background) 60%, transparent);
   padding: 12px; min-width: 0;
 }
 .snap-name { font-size: 13px; font-weight: 500; }
@@ -22,7 +22,7 @@
 /* 网关出口卡片里的接口地址行 */
 .exit-url {
   display: flex; align-items: center; gap: 8px;
-  border-radius: 14px; background: color-mix(in oklab, var(--background) 60%, transparent);
+  border-radius: var(--radius-nested); background: color-mix(in oklab, var(--background) 60%, transparent);
   padding: 8px 12px;
 }
 .exit-url code { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; }

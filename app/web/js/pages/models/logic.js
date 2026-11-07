@@ -1,4 +1,5 @@
-// 模型页的纯逻辑：目录来源文案、能力判定、筛选排序、统计与勾选后的 disabled_models 计算；只依赖 core/format.js，可在 Node 里直接测试。
+// 模型页的纯逻辑：目录来源文案、能力判定、筛选排序、统计与模型别名表的增删；只依赖 core/format.js，可在 Node 里直接测试。
+import { compareText } from '../../core/format.js';
 
 const SOURCE_LABELS = {
   server: '本次从服务器获取',
@@ -85,7 +86,7 @@ export function reasoningLevels(entry) {
 export function capabilityBadges(entry) {
   const badges = [];
   if (entry.always_reasoning) {
-    badges.push({ key: 'always', label: '仅推理', tone: 'violet', title: '这个模型不能关闭思考，每次回答都会先推理' });
+    badges.push({ key: 'always', label: '仅推理', tone: 'violet', title: '这个模型不能关闭思考，每次都会先推理。' });
   }
   if (hasVision(entry)) badges.push({ key: 'vision', label: '多模态', tone: 'sky', title: '支持图片输入' });
   if (hasTools(entry)) badges.push({ key: 'tools', label: '工具调用', tone: 'muted', title: '支持 function calling' });
@@ -104,14 +105,16 @@ export function creditsValue(entry) {
 }
 
 /** 积分倍率的标签：标出限时免费与国内版的夜间折扣。 */
-export function creditInfo(entry, realm) {
+export function creditInfo(entry, realm, account = null) {
   const raw = entry.credits === null || entry.credits === undefined ? '' : String(entry.credits);
   const label = raw ? (raw.startsWith('x') ? raw.slice(1) + 'x' : raw) : '';
   const value = creditsValue(entry);
   const alwaysFree = entry.id === 'hy3' || entry.id === 'hy4-preview-f'
     || (entry.id === 'deepseek-v4.1-flash' && realm === 'intl');
-  if (value === 0 || alwaysFree) {
-    return { label: label || '0.00x', note: '', free: true };
+  const accountFree = !!account && Array.isArray(account.freeModels)
+    && account.freeModels.map((id) => String(id).toLowerCase()).includes(String(entry.id || '').toLowerCase());
+  if (entry.benefit === true || value === 0 || alwaysFree || accountFree) {
+    return { label: label || (entry.benefit === true ? '免费' : '0.00x'), note: '', free: true };
   }
   if ((entry.id === 'glm-5.2' || entry.id === 'deepseek-v4-pro') && realm === 'cn') {
     return { label: label || '0.79x', note: '夜间 0.5x', free: false };
@@ -146,6 +149,11 @@ export function capabilityLabel(id) {
 /** 筛选后仍被隐藏的模型：被排除而且没有勾选的，默认不显示。 */
 export function hiddenExcludedCount(data) {
   return (data || []).filter((m) => m.excluded && !m.enabled).length;
+}
+
+/** 目录里存在被排除的模型时，页面才需要「显示被排除的模型」开关。 */
+export function hasExcluded(data) {
+  return (data || []).some((m) => m.excluded);
 }
 
 export function hasCredits(data) {
@@ -196,11 +204,6 @@ export function withEnabled(data, id, enabled) {
   return (data || []).map((m) => (m.id === id ? { ...m, enabled: !!enabled } : m));
 }
 
-/** 要写进 disabled_models 的 id 列表：当前没有勾选的模型。 */
-export function disabledIds(data) {
-  return (data || []).filter((m) => !m.enabled).map((m) => m.id);
-}
-
 /** 当前版本的账号，用于模型页的「分账号查看」。 */
 export function realmAccounts(accounts, realm) {
   return (accounts || []).filter((a) => (a.realm || '') === realm);
@@ -212,9 +215,18 @@ function accountDeniedSet(account) {
     .map((id) => String(id).toLowerCase()));
 }
 
+/**
+ * 账号能不能接这个模型：先看账号自带的 disabledModels，
+ * 再看账号发现目录（models 为 null 表示提供方没有逐账号目录，全部可用）。
+ */
 export function accountCanUse(model, account) {
   const id = String((model && model.id) || '').toLowerCase();
-  return !accountDeniedSet(account).has(id);
+  if (accountDeniedSet(account).has(id)) return false;
+  const catalog = account && account.models;
+  if (Array.isArray(catalog)) {
+    return catalog.some((entry) => String(entry).toLowerCase() === id);
+  }
+  return true;
 }
 
 /** 聚合视图的账号覆盖：这个模型在多少个已启用账号里可用。 */
@@ -227,4 +239,37 @@ export function coverageFor(model, accounts) {
 /** 某个账号视图下可用的模型数：全局开启，并且没有被该账号排除。 */
 export function accountAvailableCount(data, account) {
   return (data || []).filter((m) => m.enabled && accountCanUse(m, account)).length;
+}
+
+/** 别名表转成按源 id 排序的行。 */
+export function aliasEntries(aliases) {
+  return Object.entries(aliases || {})
+    .map(([source, target]) => ({ source, target }))
+    .sort((a, b) => compareText(a.source, b.source));
+}
+
+/** 新增或替换一条别名，返回新对象；源 id 不区分大小写，同名的旧条目会被替换。 */
+export function withAlias(aliases, source, target) {
+  const out = withoutAlias(aliases, source);
+  out[String(source).trim()] = String(target).trim();
+  return out;
+}
+
+/** 删除一条别名，返回新对象。 */
+export function withoutAlias(aliases, source) {
+  const key = String(source).trim().toLowerCase();
+  return Object.fromEntries(Object.entries(aliases || {})
+    .filter(([name]) => name.toLowerCase() !== key));
+}
+
+/** 模型行的别名角标：返回 { text, tone, title }，不是别名源时返回 null。 */
+export function aliasBadge(model) {
+  const alias = model && model.alias;
+  if (!alias || !alias.target) return null;
+  if (alias.active) {
+    return { text: '通告为 ' + alias.target, tone: 'info',
+             title: '客户端用 ' + alias.target + ' 请求时改用本模型转发。' };
+  }
+  return { text: '别名未生效', tone: 'muted',
+           title: '别名未生效，请求会交给同来源的 ' + alias.target + '。' };
 }

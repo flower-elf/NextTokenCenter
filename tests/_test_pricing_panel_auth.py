@@ -13,7 +13,7 @@ from _isolated_dirs import isolated_data_dirs  # noqa: E402  自带数据根目�
 _TMP_ENV = isolated_data_dirs("wb-pricing-panel-auth-")
 
 import wb_proxy as proxy
-import wb_http as H          # noqa: E402
+import wb_models             # noqa: E402
 import wb_modelsdev          # noqa: E402
 import wb_settings as settings    # noqa: E402
 
@@ -50,10 +50,10 @@ class Request(object):
     _panel_token = proxy.Handler._panel_token
     _panel_ok = proxy.Handler._panel_ok
     _key_ok = proxy.Handler._key_ok
-    _key_realm = proxy.Handler._key_realm
+    _key_route = proxy.Handler._key_route
     _authorized = proxy.Handler._authorized
     _supplied_key = proxy.Handler._supplied_key
-    _request_realm = proxy.Handler._request_realm
+    _request_route = proxy.Handler._request_route
     _error = proxy.Handler._error
     _get_pricing = proxy.Handler._get_pricing
     _get_v1_models = proxy.Handler._get_v1_models
@@ -86,7 +86,7 @@ class PanelRouteBoundaryTests(unittest.TestCase):
             mock.patch.multiple(proxy, ACCOUNTS_DIR=self.directory,
                                 API_KEY=None, POOL=None),
             mock.patch.object(proxy, "PRICING", FakePricing()),
-            mock.patch.object(H, "fetch_models",
+            mock.patch.object(wb_models, "fetch_models",
                               lambda realm=None: [("gpt-4o", {})]),
             mock.patch.object(wb_modelsdev, "refresh_async",
                               lambda *a, **k: None),

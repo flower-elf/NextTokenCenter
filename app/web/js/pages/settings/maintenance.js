@@ -1,44 +1,30 @@
-// 设置 → 运维：日志保留、用量保留、上游超时、定价刷新、提示词与更新检查。
+// 设置 → 运维：日志保留、用量保留、定价刷新、可信代理与更新检查。
 import { html, live, nothing } from '../../core/dom.js';
 import { toast, toastError } from '../../ui/toast.js';
 import { parseNonNegativeInteger, parseNonNegativeNumber } from './logic.js';
 import { envHint, numberRow, settingCard, switchRow, textRow } from './rows.js';
 import { createUpdateBlock } from './update.js';
 
-const PROMPT_MODES = [
-  { value: 'passthrough', label: '原样透传' },
-  { value: 'custom', label: '使用自定义提示词文件' },
-  { value: 'append', label: '在请求末尾追加提示词文件' },
-];
-
 export function createMaintenanceTab(page) {
   const form = {
     pricingEnabled: true,
     pricingRefresh: '5',
     pricingVariant: true,
-    creditsRefresh: '12',
     logDb: false,
     logMaxRows: '',
     logMaxDays: '7',
     logMaxBytes: '',
     usageHourKeep: '48',
     usageDayKeep: '32',
-    upstreamHeader: '120',
-    upstreamIdle: '300',
-    deviceToken: '',
-    deviceTokenFile: '',
-    promptMode: 'passthrough',
-    promptFile: '',
     trustedProxies: '',
     updateCheck: false,
     updateCheckInterval: '24',
   };
   const errors = {
-    pricingRefresh: '', creditsRefresh: '',
+    pricingRefresh: '',
     logMaxRows: '', logMaxDays: '', logMaxBytes: '',
     usageHourKeep: '', usageDayKeep: '',
-    upstreamHeader: '', upstreamIdle: '',
-    promptFile: '', updateCheckInterval: '',
+    updateCheckInterval: '',
   };
   let baseline = null;
   let saving = false;
@@ -61,26 +47,16 @@ export function createMaintenanceTab(page) {
 
   function stateOf(view) {
     const usage = view.usage || {};
-    const upstream = view.upstream || {};
-    const prompt = view.prompt || {};
     return {
       pricingEnabled: view.pricing_enabled !== false,
       pricingRefresh: String(Number(view.pricing_refresh_minutes ?? 5)),
       pricingVariant: view.pricing_variant_inherit !== false,
-      creditsRefresh: String(Number(view.credits_refresh_hours ?? 12)),
       logDb: view.log_db_enabled === true,
       logMaxRows: optionalNumber(view.log_db_max_rows),
       logMaxDays: optionalNumber(view.log_db_max_days),
       logMaxBytes: optionalNumber(view.log_db_max_bytes),
       usageHourKeep: String(Number(usage.hour_keep_hours ?? 48)),
       usageDayKeep: String(Number(usage.day_keep_days ?? 32)),
-      upstreamHeader: String(Number(upstream.header_timeout_seconds ?? 120)),
-      upstreamIdle: String(Number(upstream.idle_timeout_seconds ?? 300)),
-      deviceToken: String(upstream.device_token || ''),
-      deviceTokenFile: String(upstream.device_token_file || ''),
-      promptMode: PROMPT_MODES.some((mode) => mode.value === prompt.mode)
-        ? prompt.mode : 'passthrough',
-      promptFile: String(prompt.file || ''),
       trustedProxies: String(view.trusted_proxies || ''),
       updateCheck: view.update_check_enabled === true,
       updateCheckInterval: String(Number(view.update_check_interval_hours ?? 24)),
@@ -133,7 +109,6 @@ export function createMaintenanceTab(page) {
 
   async function saveAll() {
     const pricingRefresh = numberText(form.pricingRefresh, '定价刷新间隔', { max: 43200, integer: false });
-    const creditsRefresh = numberText(form.creditsRefresh, '积分刷新间隔', { max: 720, integer: false });
     const logRows = form.logMaxRows === '' ? { ok: true, value: 0 }
       : numberText(form.logMaxRows, '日志行数上限', { max: 100000000 });
     const logDays = form.logMaxDays === '' ? { ok: true, value: 0 }
@@ -142,20 +117,14 @@ export function createMaintenanceTab(page) {
       : numberText(form.logMaxBytes, '日志大小上限', { max: 107374182400 });
     const usageHour = numberText(form.usageHourKeep, '小时层保留小时数', { min: 1, max: 336 });
     const usageDay = numberText(form.usageDayKeep, '日桶保留天数', { min: 1, max: 366 });
-    const upstreamHeader = numberText(form.upstreamHeader, '上游头部超时', { min: 1, max: 86400 });
-    const upstreamIdle = numberText(form.upstreamIdle, '上游空闲超时', { min: 1, max: 86400 });
     const checkInterval = numberText(form.updateCheckInterval, '自动检查间隔', { min: 1, max: 720 });
     errors.pricingRefresh = pricingRefresh.ok ? '' : pricingRefresh.error;
-    errors.creditsRefresh = creditsRefresh.ok ? '' : creditsRefresh.error;
     errors.logMaxRows = logRows.ok ? '' : logRows.error;
     errors.logMaxDays = logDays.ok ? '' : logDays.error;
     errors.logMaxBytes = logBytes.ok ? '' : logBytes.error;
     errors.usageHourKeep = usageHour.ok ? '' : usageHour.error;
     errors.usageDayKeep = usageDay.ok ? '' : usageDay.error;
-    errors.upstreamHeader = upstreamHeader.ok ? '' : upstreamHeader.error;
-    errors.upstreamIdle = upstreamIdle.ok ? '' : upstreamIdle.error;
     errors.updateCheckInterval = checkInterval.ok ? '' : checkInterval.error;
-    errors.promptFile = '';
     if (!Object.values(errors).every((value) => !value)) {
       page.draw();
       return false;
@@ -170,7 +139,6 @@ export function createMaintenanceTab(page) {
     add('pricing_enabled', 'pricingEnabled', form.pricingEnabled);
     add('pricing_refresh_minutes', 'pricingRefresh', pricingRefresh.value);
     add('pricing_variant_inherit', 'pricingVariant', form.pricingVariant);
-    add('credits_refresh_hours', 'creditsRefresh', creditsRefresh.value);
     add('log_db_enabled', 'logDb', form.logDb);
     add('log_db_max_rows', 'logMaxRows', logRows.value);
     add('log_db_max_days', 'logMaxDays', logDays.value);
@@ -186,26 +154,6 @@ export function createMaintenanceTab(page) {
       usage.day_keep_days = usageDay.value;
     }
     if (Object.keys(usage).length) payload.usage = usage;
-    const upstream = {};
-    if (baseline && String(form.upstreamHeader) !== String(baseline.upstreamHeader)) {
-      upstream.header_timeout_seconds = upstreamHeader.value;
-    }
-    if (baseline && String(form.upstreamIdle) !== String(baseline.upstreamIdle)) {
-      upstream.idle_timeout_seconds = upstreamIdle.value;
-    }
-    if (baseline && String(form.deviceToken) !== String(baseline.deviceToken)) {
-      upstream.device_token = form.deviceToken;
-    }
-    if (baseline && String(form.deviceTokenFile) !== String(baseline.deviceTokenFile)) {
-      upstream.device_token_file = form.deviceTokenFile;
-    }
-    if (Object.keys(upstream).length) payload.upstream = upstream;
-    const prompt = {};
-    if (baseline && form.promptMode !== baseline.promptMode) prompt.mode = form.promptMode;
-    if (baseline && String(form.promptFile) !== String(baseline.promptFile)) {
-      prompt.file = form.promptFile;
-    }
-    if (Object.keys(prompt).length) payload.prompt = prompt;
     try {
       const view = await page.save(payload);
       baseline = stateOf(view);
@@ -246,7 +194,7 @@ export function createMaintenanceTab(page) {
       <div class="setting">
         <div class="setting-main">
           <div class="setting-name">自动检查间隔</div>
-          <div class="setting-desc">每天、每周，或每隔若干小时。打开自动检查后生效。</div>
+          <div class="setting-desc">每天、每周或每隔若干小时检查一次。</div>
           ${envHint(envFor('updateCheckInterval'))}
           ${errors.updateCheckInterval ? html`<div class="field-error">${errors.updateCheckInterval}</div>` : nothing}
         </div>
@@ -284,7 +232,7 @@ export function createMaintenanceTab(page) {
       return settingCard({
         iconName: 'Gauge',
         title: '运维',
-        desc: '日志、用量聚合、上游超时、定价刷新与提示词。保存后立即生效。',
+        desc: '日志、用量聚合、定价刷新、可信代理与更新检查。',
         dirty: isDirty(),
         saving,
         onRevert: revert,
@@ -295,27 +243,23 @@ export function createMaintenanceTab(page) {
             ${switchRow(ctl, {
               name: 'OpenRouter 价格估算',
               field: 'pricingEnabled',
-              desc: '按 OpenRouter 价格估算每条请求的等价花费。关闭后停止拉取价格并按 0 计。',
+              desc: '按 OpenRouter 价格估算每条请求的花费，关闭后按 0 计。',
             })}
             ${switchRow(ctl, {
               name: '价格变体后缀继承',
               field: 'pricingVariant',
-              desc: '模型名带渠道或发行后缀时，允许从去掉后缀的基名继承价格。关闭后只按精确名称匹配。',
+              desc: '模型名带渠道或发行后缀时，从去掉后缀的基名继承价格。',
             })}
             ${numberRow(ctl, {
               name: '定价刷新间隔', field: 'pricingRefresh', suffix: '分钟',
               desc: '多久从 OpenRouter 拉取一次价格，0 表示关闭自动刷新。',
-            })}
-            ${numberRow(ctl, {
-              name: '积分后台刷新间隔', field: 'creditsRefresh', suffix: '小时',
-              desc: '余额快照超过这个时长后由后台刷新，0 表示关闭后台刷新。',
             })}
 
             <div class="section-label">运行日志</div>
             ${switchRow(ctl, {
               name: '运行日志写入数据库',
               field: 'logDb',
-              desc: '把运行日志追加写入 usage/logs.sqlite3，重启后仍能回看。默认关闭。',
+              desc: '运行日志写入 usage/logs.sqlite3，重启后仍可查看。',
             })}
             ${numberRow(ctl, {
               name: '日志行数上限', field: 'logMaxRows', suffix: '条',
@@ -327,7 +271,7 @@ export function createMaintenanceTab(page) {
             })}
             ${numberRow(ctl, {
               name: '日志大小上限', field: 'logMaxBytes', suffix: '字节',
-              desc: '数据库超过这个字节数时从最旧的日志删起，留空表示不按大小限制。',
+              desc: '超过这个字节数时删除最旧的日志，留空表示不限制。',
             })}
 
             <div class="section-label">用量聚合</div>
@@ -340,54 +284,18 @@ export function createMaintenanceTab(page) {
               desc: '日分桶保留多少天，默认 32 天。',
             })}
 
-            <div class="section-label">上游请求</div>
-            ${numberRow(ctl, {
-              name: '上游头部超时', field: 'upstreamHeader', suffix: '秒',
-              desc: '等待上游响应头的最长秒数。',
-            })}
-            ${numberRow(ctl, {
-              name: '上游空闲超时', field: 'upstreamIdle', suffix: '秒',
-              desc: '流式响应两次数据之间的最长空闲秒数。',
-            })}
-            ${textRow(ctl, {
-              name: '设备令牌', field: 'deviceToken', placeholder: '可留空',
-              desc: '出站请求使用的设备令牌；留空表示不附带。',
-            })}
-            ${textRow(ctl, {
-              name: '设备令牌文件', field: 'deviceTokenFile', placeholder: '可留空',
-              desc: '从文件读取设备令牌；配置后优先于上面的值。',
-            })}
+            <div class="section-label">网络</div>
             ${textRow(ctl, {
               name: '可信反向代理', field: 'trustedProxies',
               placeholder: '例如 127.0.0.1,10.0.0.0/8',
-              desc: '只有来自这些 IP 或 CIDR 的请求才读取 X-Real-IP 与 X-Forwarded-For。Docker 或 Nginx 反向代理时填写代理地址。',
-            })}
-
-            <div class="section-label">提示词</div>
-            <div class="setting">
-              <div class="setting-main">
-                <div class="setting-name">提示词模式</div>
-                <div class="setting-desc">客户端没有 system 消息时如何处理网关提示词。</div>
-              </div>
-              <div class="setting-control">
-                <select class="select input-sm select-wide" .value=${live(form.promptMode)} ?disabled=${saving}
-                        aria-label="提示词模式"
-                        @change=${(e) => { form.promptMode = e.target.value; markDirty(); }}>
-                  ${PROMPT_MODES.map((mode) => html`
-                    <option value=${mode.value} ?selected=${mode.value === form.promptMode}>${mode.label}</option>`)}
-                </select>
-              </div>
-            </div>
-            ${textRow(ctl, {
-              name: '提示词文件', field: 'promptFile', placeholder: '可留空',
-              desc: '自定义或追加模式使用的提示词文件路径。',
+              desc: '只有来自这些 IP 或 CIDR 的请求才读取 X-Real-IP 与 X-Forwarded-For。',
             })}
 
             <div class="section-label">更新</div>
             ${switchRow(ctl, {
               name: '自动检查更新',
               field: 'updateCheck',
-              desc: '按下面的间隔检查 GitHub 上的新版本。默认关闭。',
+              desc: '按下面的间隔检查 GitHub 上的新版本。',
             })}
             ${intervalRow()}
             ${update.render()}

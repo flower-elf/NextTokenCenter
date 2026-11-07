@@ -53,7 +53,7 @@ function openPalette() {
                   aria-selected=${i === active ? 'true' : 'false'}
                   @mousemove=${() => { if (active !== i) { active = i; ctl.update(); } }} @click=${() => go(entry)}>
             ${icon(entry.icon)}<span>${entry.label}</span><span class="palette-group">${entry.group}</span>
-          </button>`) : html`<div class="palette-empty">没有匹配的页面<br>试试「账号」「密钥」「设置」</div>`}
+          </button>`) : html`<div class="palette-empty">没有匹配的页面或设置<br>试试「账号」「密钥」「加密」</div>`}
       </div>
       <div class="palette-foot">
         <span>↑↓ 选择 · Enter 打开 · Esc 关闭</span>

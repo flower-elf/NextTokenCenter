@@ -12,8 +12,14 @@ python-build-standalone 下载，再按下面的规则裁剪。
 也在差集里，README 记录了后果（绿色包那份精简 Python 里根本没有这个模块，用它
 会直接报错），裁掉它是既定发布行为。
 
+构建自带的 ``Lib/site-packages`` 只装 pip 一类开发组件，整体裁掉；绿色包需要的
+cryptography、brotli、zstandard 及其传递依赖由 ``BUNDLED_WHEELS`` 固定，prepare
+把它们解进 ``Lib/site-packages``。wheel 与运行时一样按 sha256 校验，发布产物不随
+构建机或 PyPI 上的新版本变化。
+
     python release/portable_runtime.py download --out runtime.tar.gz
-    python release/portable_runtime.py prepare --tarball <tar.gz> --dest python
+    python release/portable_runtime.py wheels  --out wheels
+    python release/portable_runtime.py prepare --tarball <tar.gz> --dest python [--wheels wheels]
     python release/portable_runtime.py verify  --root python
 """
 from __future__ import annotations
@@ -24,7 +30,9 @@ import os
 import shutil
 import sys
 import tarfile
+import tempfile
 import urllib.request
+import zipfile
 
 # ---- 固定的发布输入 ---------------------------------------------------------
 #
@@ -37,6 +45,54 @@ RUNTIME_SHA256 = "4b6f0beebbb695a0f3ea237b8c3eaa5bd424f47a7bc25b2fbe3a43390c770f
 RUNTIME_URL = ("https://github.com/astral-sh/python-build-standalone/releases/download/"
                "%s/%s" % (RUNTIME_RELEASE, RUNTIME_ASSET))
 
+# 绿色包在 Lib/site-packages 下额外携带的 wheel：包名、版本、文件名、sha256、
+# 下载地址。运行时是 Windows x64 CPython 3.12，这里只固定这一平台的 wheel；
+# cryptography 是 abi3 wheel（cp39 标签），3.12 与更高版本都能用。
+#
+# 版本要与仓库根的 requirements.txt 一致，tests/_test_release_assets.py 会核对。
+# 升级任何一个包时同时改 requirements.txt 与这里的文件名、校验和。
+BUNDLED_WHEELS = (
+    ("cryptography", "50.0.2",
+     "cryptography-50.0.2-cp39-abi3-win_amd64.whl",
+     "4e81d95e5bafc2d6e34e4bed780e53e4d5b9a2f928573428aa4d35fbec1eb0de",
+     "https://files.pythonhosted.org/packages/f6/b6/a1faf3a27ae9405fb34b1713cc73b2d8a26b04d5c561578fa2e6ef3e5bb9/"
+     "cryptography-50.0.2-cp39-abi3-win_amd64.whl"),
+    ("cffi", "2.1.1",
+     "cffi-2.1.1-cp312-cp312-win_amd64.whl",
+     "f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a",
+     "https://files.pythonhosted.org/packages/d9/79/615cc094e2fb508cade7de88d3b4f6c4ec2bab695c97bce9153dc65aadf5/"
+     "cffi-2.1.1-cp312-cp312-win_amd64.whl"),
+    ("pycparser", "3.12",
+     "pycparser-3.12-py3-none-any.whl",
+     "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e",
+     "https://files.pythonhosted.org/packages/b6/ae/315bbeee126a769cbde43cf4908acb4b40408d8bf8bbf334dd7368d8dadf/"
+     "pycparser-3.12-py3-none-any.whl"),
+    ("brotli", "1.2.1",
+     "brotli-1.2.1-cp312-cp312-win_amd64.whl",
+     "f5342b8256476554b4045db8b7bf4dc4044d0405485f220f0cd80764bc0d7faf",
+     "https://files.pythonhosted.org/packages/3e/82/b7f6c56393f2224ff4108cf1cc255921be1c0ae5962163edbe367c8a55bc/"
+     "brotli-1.2.1-cp312-cp312-win_amd64.whl"),
+    ("zstandard", "0.25.0",
+     "zstandard-0.25.0-cp312-cp312-win_amd64.whl",
+     "ffef5a74088f1e09947aecf91011136665152e0b4b359c42be3373897fb39b01",
+     "https://files.pythonhosted.org/packages/79/3b/fa54d9015f945330510cb5d0b0501e8253c127cca7ebe8ba46a965df18c5/"
+     "zstandard-0.25.0-cp312-cp312-win_amd64.whl"),
+)
+
+# 装完 wheel 后 python/Lib/site-packages 里必须存在的入口文件。入口在，扩展模块
+# 才能被 import 找到；verify 逐个核对。
+SITE_PACKAGE_FILES = (
+    "Lib/site-packages/cryptography/__init__.py",
+    "Lib/site-packages/cryptography/hazmat/bindings/_rust.pyd",
+    "Lib/site-packages/cffi/__init__.py",
+    "Lib/site-packages/_cffi_backend.cp312-win_amd64.pyd",
+    "Lib/site-packages/pycparser/__init__.py",
+    "Lib/site-packages/brotli.py",
+    "Lib/site-packages/_brotli.cp312-win_amd64.pyd",
+    "Lib/site-packages/zstandard/__init__.py",
+    "Lib/site-packages/zstandard/backend_c.cp312-win_amd64.pyd",
+)
+
 # ---- 裁剪规则 ---------------------------------------------------------------
 
 # python.exe 旁边的、绿色包不带的目录：头文件、导入库、tcl/tk 运行时和 pip
@@ -44,7 +100,8 @@ RUNTIME_URL = ("https://github.com/astral-sh/python-build-standalone/releases/do
 DROP_TOP_DIRS = ("Scripts", "include", "libs", "tcl")
 
 # 绿色包不带的标准库包。multiprocessing 是有意裁掉的，见模块 docstring；
-# 其余是开发期附加组件。
+# 其余是开发期附加组件。构建自带的 site-packages 只有 pip，整体裁掉后由
+# BUNDLED_WHEELS 重新装入，所以这里照样整目录排除。
 DROP_LIB_DIRS = ("__pycache__", "ensurepip", "idlelib", "lib2to3", "multiprocessing",
                  "pydoc_data", "site-packages", "tkinter", "turtledemo", "venv")
 
@@ -77,6 +134,7 @@ REQUIRED_FILES = (
     "Lib/difflib.py", "Lib/fnmatch.py", "Lib/functools.py", "Lib/getpass.py", "Lib/gzip.py", "Lib/heapq.py",
     "Lib/ipaddress.py", "Lib/queue.py", "Lib/shutil.py", "Lib/random.py",
     "Lib/subprocess.py", "Lib/threading.py", "Lib/sqlite3/__init__.py",
+    "Lib/string.py",
     "Lib/html/__init__.py", "Lib/http/__init__.py", "Lib/http/client.py",
     "Lib/email/__init__.py", "Lib/email/utils.py",
     "Lib/concurrent/__init__.py", "Lib/concurrent/futures/__init__.py",
@@ -87,12 +145,14 @@ REQUIRED_FILES = (
     "DLLs/libffi-8.dll", "DLLs/libssl-3-x64.dll", "DLLs/libcrypto-3-x64.dll",
 )
 
-# 绿色包里没有这些路径，这里也必须保持没有。
+# 绿色包里没有这些路径，这里也必须保持没有。site-packages 本身要有，但只装
+# BUNDLED_WHEELS 那几包，构建自带的 pip / setuptools 不能回来。
 FORBIDDEN_PATHS = (
     "Scripts", "include", "libs", "tcl", "pythonw.exe",
     "Lib/multiprocessing", "Lib/tkinter", "Lib/idlelib", "Lib/lib2to3",
-    "Lib/ensurepip", "Lib/site-packages", "Lib/venv", "Lib/turtledemo",
-    "Lib/pydoc_data", "DLLs/_tkinter.pyd", "DLLs/tcl86t.dll", "DLLs/tk86t.dll",
+    "Lib/ensurepip", "Lib/venv", "Lib/turtledemo",
+    "Lib/pydoc_data", "Lib/site-packages/pip", "Lib/site-packages/setuptools",
+    "DLLs/_tkinter.pyd", "DLLs/tcl86t.dll", "DLLs/tk86t.dll",
     "DLLs/zlib1.dll",
 )
 
@@ -119,10 +179,56 @@ def keep(rel):
     return not rel.endswith(DROP_SUFFIXES)
 
 
-def prepare(tarball, dest, expect_sha=RUNTIME_SHA256):
-    """把固定构建解到 dest，裁剪规则要丢的成员直接跳过。
+def fetch_wheels(dest):
+    """把固定的 wheel 下到 dest，逐个核对 sha256；已存在且正确的文件直接复用。"""
+    os.makedirs(dest, exist_ok=True)
+    paths = []
+    for _name, _version, filename, digest, url in BUNDLED_WHEELS:
+        path = os.path.join(dest, filename)
+        if not (os.path.isfile(path) and sha256(path) == digest):
+            with urllib.request.urlopen(url, timeout=120) as resp:
+                with open(path, "wb") as fh:
+                    shutil.copyfileobj(resp, fh)
+            got = sha256(path)
+            if got != digest:
+                raise SystemExit("wheel 校验和不符：\n  期望 %s\n  实际 %s\n（%s）"
+                                 % (digest, got, path))
+        paths.append(path)
+    return paths
 
-    边读边过滤，被裁掉的约 110 MB 不落盘。返回 (kept_files, kept_dirs)。
+
+def install_wheels(root, wheel_dir):
+    """把固定的 wheel 解到 root/Lib/site-packages，返回写入的文件数。
+
+    wheel 没有 .data 目录，解压即安装；扩展模块（.pyd）就带在包里。
+    """
+    target_root = os.path.join(root, "Lib", "site-packages")
+    count = 0
+    for _name, _version, filename, digest, _url in BUNDLED_WHEELS:
+        path = os.path.join(wheel_dir, filename)
+        got = sha256(path) if os.path.isfile(path) else ""
+        if got != digest:
+            raise SystemExit("wheel 缺失或校验和不符：%s（%s）" % (filename, wheel_dir))
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                parts = info.filename.split("/")
+                if not parts[0] or any(p in ("", ".", "..") for p in parts):
+                    raise SystemExit("wheel 里有非法路径：%s!%s" % (filename, info.filename))
+                target = os.path.join(target_root, *parts)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as fh:
+                    fh.write(zf.read(info))
+                count += 1
+    return count
+
+
+def prepare(tarball, dest, expect_sha=RUNTIME_SHA256, wheel_dir=None):
+    """把固定构建解到 dest，裁剪规则要丢的成员直接跳过，再装固定 wheel。
+
+    边读边过滤，被裁掉的约 110 MB 不落盘。wheel_dir 为空时下载到临时目录，
+    构建机只多一次网络访问。返回 (kept_files, kept_dirs, wheel_files)。
     """
     got = sha256(tarball)
     if expect_sha and got != expect_sha:
@@ -154,13 +260,22 @@ def prepare(tarball, dest, expect_sha=RUNTIME_SHA256):
                 shutil.copyfileobj(src, fh)
             os.chmod(target, 0o755 if rel.endswith(".exe") else 0o644)
             files += 1
-    return files, dirs
+    if wheel_dir is None:
+        wheel_dir = tempfile.mkdtemp(prefix="wb-wheels-")
+        try:
+            fetch_wheels(wheel_dir)
+            installed = install_wheels(dest, wheel_dir)
+        finally:
+            shutil.rmtree(wheel_dir, ignore_errors=True)
+    else:
+        installed = install_wheels(dest, wheel_dir)
+    return files, dirs, installed
 
 
 def verify(root):
     """root 不是启动脚本可用的运行时就抛 SystemExit。"""
     problems = []
-    for rel in REQUIRED_FILES:
+    for rel in REQUIRED_FILES + SITE_PACKAGE_FILES:
         if not os.path.isfile(os.path.join(root, *rel.split("/"))):
             problems.append("缺少 %s" % rel)
     for rel in FORBIDDEN_PATHS:
@@ -177,7 +292,7 @@ def verify(root):
                            " 等 %d 个" % len(stray) if len(stray) > 5 else ""))
     if problems:
         raise SystemExit("运行时不合格（%s）：\n  - %s" % (root, "\n  - ".join(problems)))
-    return len(REQUIRED_FILES)
+    return len(REQUIRED_FILES) + len(SITE_PACKAGE_FILES)
 
 
 def _utf8_stdio():
@@ -216,11 +331,16 @@ def main(argv=None):
     d.add_argument("--sha256", default=RUNTIME_SHA256,
                    help="expected checksum ('' to skip, for local experiments)")
 
-    p = sub.add_parser("prepare", help="extract + trim the pinned runtime")
+    p = sub.add_parser("prepare", help="extract + trim the pinned runtime, install pinned wheels")
     p.add_argument("--tarball", required=True)
     p.add_argument("--dest", required=True)
+    p.add_argument("--wheels", default=None,
+                   help="reuse pinned wheels from this directory instead of downloading")
     p.add_argument("--sha256", default=RUNTIME_SHA256,
                    help="expected checksum ('' to skip, for local experiments)")
+
+    w = sub.add_parser("wheels", help="download the pinned wheels")
+    w.add_argument("--out", required=True)
 
     v = sub.add_parser("verify", help="check a runtime against the launcher contract")
     v.add_argument("--root", required=True)
@@ -232,13 +352,21 @@ def main(argv=None):
         print("runtime: %s（Python %s）" % (args.out, RUNTIME_VERSION))
         return 0
 
+    if args.cmd == "wheels":
+        paths = fetch_wheels(args.out)
+        print("wheels: %s（%d 个包）" % (args.out, len(paths)))
+        return 0
+
     if args.cmd == "prepare":
-        files, dirs = prepare(args.tarball, args.dest, args.sha256 or None)
+        files, dirs, installed = prepare(args.tarball, args.dest,
+                                         args.sha256 or None, args.wheels)
         print("runtime: %s（%d 个文件 / %d 个目录，Python %s）"
               % (args.dest, files, dirs, RUNTIME_VERSION))
+        print("wheels: %d 个文件（%s）"
+              % (installed, "、".join("%s %s" % (n, v) for n, v, *_ in BUNDLED_WHEELS)))
         verify(args.dest)
         print("runtime: 契约检查通过（%d 个必需文件都在，%d 个已裁项都没回来）"
-              % (len(REQUIRED_FILES), len(FORBIDDEN_PATHS)))
+              % (len(REQUIRED_FILES) + len(SITE_PACKAGE_FILES), len(FORBIDDEN_PATHS)))
         return 0
 
     if args.cmd == "verify":

@@ -12,23 +12,23 @@ function report(results, title, { okText, withDetail = '', emptyText }) {
   else toast.warn(title, summarizeResults(results));
 }
 
-/** Buddy 加油站签到；uid 留空时给全部国内版账号领取。 */
-export async function runCheckin({ uid, apply } = {}) {
+/** 频道签到；uid 留空时给这个渠道的全部可签到账号领取。 */
+export async function runCheckin({ uid, realm, apply } = {}) {
   try {
-    const result = await acct.checkin(uid);
+    const result = uid ? await acct.checkin(uid) : await acct.checkinRealm(realm);
     if (apply) await apply(result);
-    report(result.results || [], activity.BUDDY_LABEL + '签到',
-      { okText: '已领取', emptyText: '没有可领的国内版账号' });
+    report(result.results || [], '签到完成',
+      { okText: activity.activityKind(realm) === 'buddy' ? '已领取' : '已签到', emptyText: '没有可签到的账号' });
   } catch (err) {
     toastError('签到失败', err);
   }
 }
 
-/** 未活跃账号一键打卡：只发给今天还没打卡的已启用国际版账号。 */
+/** 未活跃账号一键打卡：只发给今天还没打卡的已启用账号。 */
 export async function runDailyChatPending({ accounts, byUid, apply } = {}) {
   const pending = activity.pendingDailyChat(accounts, byUid);
   if (!pending.length) {
-    toast.success('国际版账号今天都已打卡');
+    toast.success('账号今天都已打卡');
     return;
   }
   try {
@@ -41,11 +41,11 @@ export async function runDailyChatPending({ accounts, byUid, apply } = {}) {
   }
 }
 
-/** 网页通道打卡：每个已启用的国际版账号建一个网页端会话，会消耗少量积分。 */
+/** 网页通道打卡：每个已启用的账号建一个网页端会话，会消耗少量积分。 */
 export async function runDailyChatWeb({ apply } = {}) {
   const go = await confirmDialog({
     title: '确认网页通道打卡？',
-    desc: '会为每个已启用的国际版账号各建一个网页端会话。这会实际发起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。',
+    desc: '会为每个已启用账号建一个网页端会话，消耗少量积分。',
     confirmText: '我已了解，继续',
   });
   if (!go) return;
@@ -53,7 +53,7 @@ export async function runDailyChatWeb({ apply } = {}) {
     const result = await acct.dailyChatWeb();
     if (apply) await apply(result);
     report(result.results || [], '网页通道打卡',
-      { okText: '已建会话', withDetail: 'conversation', emptyText: '没有可打卡的国际版账号' });
+      { okText: '已建会话', withDetail: 'conversation', emptyText: '没有可打卡的账号' });
   } catch (err) {
     toastError('网页通道打卡失败', err);
   }

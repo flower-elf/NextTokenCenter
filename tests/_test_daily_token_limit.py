@@ -137,8 +137,6 @@ class DailyTokenLimitTests(unittest.TestCase):
 
         class Pool(object):
             accounts = [account]
-            # 真账号池在 __init__ 里就有这个开关；关着时请求路径不做评分折叠。
-            smart_routing = False
 
             def count_ready(self, realm, model=None):
                 return sum(a.ready(model=model) for a in self.accounts)
@@ -160,9 +158,18 @@ class DailyTokenLimitTests(unittest.TestCase):
             def apply_model_daily_token_limit(self, value=None, per_model=None):
                 return value or 0
 
+            def apply_reserve_credits(self, values=None):
+                return None
+
+            def apply_expiring_window(self, values=None):
+                return None
+
             def apply_remaining_weights(self, weights=None):
                 # 优先调度的权重表也由请求路径推给池；桩只负责接住调用。
                 return weights or {}
+
+            def apply_credit_rates(self, per_day=None):
+                return None
 
         old_pool = P.POOL
         P.POOL = Pool()

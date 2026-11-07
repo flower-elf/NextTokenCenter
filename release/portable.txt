@@ -7,17 +7,19 @@
 # 网关与看板都在 app/ 下（启动脚本跑 app/wb_proxy.py，看板静态资源由它的
 # WEB_DIR 即 app/web 提供），两者都必须随包。清单之外打包器还放两样东西，都
 # 不是本清单的行：
-#   python/                精简 CPython 运行时，见 release/portable_runtime.py，
+#   python/                精简 CPython 运行时，Lib/site-packages 里是固定的第三方
+#                          wheel（cryptography、brotli、zstandard 及传递依赖），
+#                          见 release/portable_runtime.py；
 #                          release_tools.py portable --runtime 强制要求存在，
 #                          缺了它产出的只是源码包
 #   release-manifest.json  包内标记文件，写明版本、root、受管文件与受保护目录
-# 整包放在 root 目录（默认 wb-proxy-center/）下，与绿色包同名。
+# 整包放在 root 目录（默认 next-token-center/）下，与绿色包同名。
 #
 # 刻意不包含：
 #   accounts/  usage/      用户数据，属于受保护路径，永不作为替换目标，程序启动
 #                          时自己 os.makedirs，不需要占位文件
 #   Dockerfile / docker-compose* / quick-deploy.sh   Docker 部署路径
-#   tests/  .github/  release/  wrt/  scripts/       开发与发布工具
+#   tests/  .github/  release/  scripts/       开发与发布工具
 #
 # tests/_test_release_assets.py 断言 app/ 下每个源码与看板文件都在清单里
 # （忘了登记会直接红），且清单里的路径都存在。
@@ -43,7 +45,11 @@ app/wb_activity.py
 app/wb_agents.py
 app/wb_atrest.py
 app/wb_catalog.py
+app/wb_channels.py
 app/wb_chat_routes.py
+app/wb_codearts.py
+app/wb_codearts_crypto.py
+app/wb_codearts_wire.py
 app/wb_cost.py
 app/wb_egress.py
 app/wb_fingerprint.py
@@ -53,6 +59,10 @@ app/wb_identity.py
 app/wb_ids.py
 app/wb_ipintel.py
 app/wb_logstore.py
+app/wb_media.py
+app/wb_media_client.py
+app/wb_media_routes.py
+app/wb_media_tasks.py
 app/wb_messages_responses.py
 app/wb_models.py
 app/wb_modelsdev.py
@@ -67,6 +77,7 @@ app/wb_scheduler.py
 app/wb_settings.py
 app/wb_startup.py
 app/wb_tasks.py
+app/wb_tiers.py
 app/wb_translate.py
 app/wb_usage.py
 app/wb_usage_cache.py
@@ -97,6 +108,7 @@ app/web/css/tokens.css
 app/web/favicon.svg
 app/web/index.html
 app/web/js/core/api.js
+app/web/js/core/channels.js
 app/web/js/core/dom.js
 app/web/js/core/format.js
 app/web/js/core/icons.js
@@ -112,12 +124,17 @@ app/web/js/pages/accounts.js
 app/web/js/pages/accounts/actions.js
 app/web/js/pages/accounts/activity.js
 app/web/js/pages/accounts/dialogs/add.js
+app/web/js/pages/accounts/dialogs/codearts.js
 app/web/js/pages/accounts/dialogs/desktop.js
 app/web/js/pages/accounts/dialogs/exclude.js
+app/web/js/pages/accounts/dialogs/group.js
 app/web/js/pages/accounts/dialogs/import.js
 app/web/js/pages/accounts/dialogs/note.js
+app/web/js/pages/accounts/dialogs/open.js
+app/web/js/pages/accounts/dialogs/qr.js
 app/web/js/pages/accounts/flows.js
 app/web/js/pages/accounts/logic.js
+app/web/js/pages/accounts/oauth-poll.js
 app/web/js/pages/accounts/view.js
 app/web/js/pages/credits.js
 app/web/js/pages/credits/logic.js
@@ -140,14 +157,18 @@ app/web/js/pages/requests/logic.js
 app/web/js/pages/settings.js
 app/web/js/pages/settings/about.js
 app/web/js/pages/settings/advanced.js
+app/web/js/pages/settings/codearts.js
 app/web/js/pages/settings/estimate.js
+app/web/js/pages/settings/fieldcard.js
 app/web/js/pages/settings/gateway.js
 app/web/js/pages/settings/logic.js
 app/web/js/pages/settings/maintenance.js
+app/web/js/pages/settings/poolguard.js
 app/web/js/pages/settings/proxy.js
 app/web/js/pages/settings/rows.js
 app/web/js/pages/settings/security.js
 app/web/js/pages/settings/update.js
+app/web/js/pages/settings/workbuddy.js
 app/web/js/pages/stats.js
 app/web/js/pages/stats/logic.js
 app/web/js/pages/stats/range.js
@@ -161,6 +182,7 @@ app/web/js/ui/dialog.js
 app/web/js/ui/dock.js
 app/web/js/ui/palette-logic.js
 app/web/js/ui/palette.js
+app/web/js/ui/route-editor.js
 app/web/js/ui/toast.js
 app/web/js/ui/update.js
 app/web/js/ui/widgets.js

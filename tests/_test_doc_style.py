@@ -15,7 +15,6 @@ DOCS = (
     "CONTRIBUTING.md",
     "project-rule.md",
     os.path.join("docs", "contributing-agents.md"),
-    os.path.join("wrt", "README.md"),
 )
 
 CJK = "\u4e00-\u9fff"

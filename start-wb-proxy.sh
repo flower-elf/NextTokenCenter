@@ -42,7 +42,7 @@ if [ ! -f "$SCRIPT" ]; then
   exit 1
 fi
 
-# --- find a Python 3.9+ interpreter --------------------------------
+# --- find a Python 3.12+ interpreter --------------------------------
 PYEXE=""
 
 py_ok() {
@@ -52,7 +52,7 @@ py_ok() {
   elif ! command -v "$1" >/dev/null 2>&1; then
     return 1
   fi
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1
 }
 
 try_py() {
@@ -72,20 +72,19 @@ done
 # 2) Python on PATH (macOS: /usr/bin/python3 or Homebrew python3)
 if [ -z "$PYEXE" ]; then
   for cand in python3 /usr/bin/python3 /opt/homebrew/bin/python3 \
-              /usr/local/bin/python3 python3.13 python3.12 python3.11 \
-              python3.10 python3.9 python; do
+              /usr/local/bin/python3 python3.13 python3.12 python; do
     [ -n "$PYEXE" ] && break
     try_py "$cand"
   done
 fi
 
 if [ -z "$PYEXE" ]; then
-  echo "[ERROR] No usable Python 3.9+ found."
+  echo "[ERROR] No usable Python 3.12+ found."
   echo
   echo "Options:"
   echo "  1. Install the Xcode command line tools (gives you /usr/bin/python3):"
   echo "       xcode-select --install"
-  echo "  2. Or install Python 3.9+ (Homebrew or python.org):"
+  echo "  2. Or install Python 3.12+ (Homebrew or python.org):"
   echo "       brew install python"
   echo "       https://www.python.org/downloads/macos/"
   echo "  3. Or edit this file and point PYEXE at a full path, e.g."

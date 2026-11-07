@@ -61,10 +61,10 @@ check("the new field is appended, so older readers keep working",
 _d = os.path.join(_TMP, "settings-accounts")
 os.makedirs(_d, exist_ok=True)
 S.set_api_keys(_d, [
-    {"id": "k1", "name": "甲", "key": "key-alpha", "realm": "cn"},
-    {"id": "k2", "name": "乙", "key": "key-beta", "realm": ""},
+    {"id": "k1", "name": "甲", "key": "key-alpha", "route": ["cn"]},
+    {"id": "k2", "name": "乙", "key": "key-beta", "route": []},
 ])
-S.set_api_keys(_d, [{"id": "k1", "name": "甲改名", "key": "key-alpha", "realm": "cn"}])
+S.set_api_keys(_d, [{"id": "k1", "name": "甲改名", "key": "key-alpha", "route": ["cn"]}])
 
 live = S.api_keys(_d)
 check("a key removed from the list stops being live", [e["id"] for e in live] == ["k1"])
@@ -85,7 +85,7 @@ check("two tombstones do not collapse into one",
       len(S.api_keys(_d, include_deleted=True)) == 2)
 check("saving again does not resurrect the tombstone",
       [e["id"] for e in S.set_api_keys(_d, [{"id": "k1", "name": "甲改名",
-                                             "key": "key-alpha", "realm": "cn"}])] == ["k1"])
+                                             "key": "key-alpha", "route": ["cn"]}])] == ["k1"])
 
 
 # --------------------------------------------------------------------------
@@ -128,11 +128,11 @@ with io.open(P.USAGE_LOG, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 S.set_api_keys(P.ACCOUNTS_DIR, [
-    {"id": "k1", "name": "甲", "key": "key-alpha", "realm": "cn", "enabled": True},
-    {"id": "k2", "name": "乙", "key": "key-beta", "realm": "", "enabled": False},
-    {"id": "k-idle", "name": "闲", "key": "key-idle", "realm": "intl", "enabled": True},
-    {"id": "k-follow", "name": "跟", "key": "key-follow", "realm": "", "enabled": True},
-    {"id": "k-wide", "name": "宽", "key": "key-wide", "realm": "", "enabled": True},
+    {"id": "k1", "name": "甲", "key": "key-alpha", "route": ["cn"], "enabled": True},
+    {"id": "k2", "name": "乙", "key": "key-beta", "route": [], "enabled": False},
+    {"id": "k-idle", "name": "闲", "key": "key-idle", "route": ["intl", "codearts"], "enabled": True},
+    {"id": "k-follow", "name": "跟", "key": "key-follow", "route": [], "enabled": True},
+    {"id": "k-wide", "name": "宽", "key": "key-wide", "route": [], "enabled": True},
 ])
 P.API_KEY = "launcher-secret"
 
@@ -188,7 +188,7 @@ check("an unused launcher key gets no row at all",
 
 # 出口视图不得为绑定在另一个出口上的 key 造行。
 only_cn = U._compute_usage_analytics_uncached(realm="cn")
-check("a key bound to the other exit is not listed in this view",
+check("a key whose route lacks this channel is not listed in this view",
       "k-idle" not in [k["key"] for k in only_cn["keys"]])
 check("a key with no binding is still listed, it can serve this exit",
       "k-follow" in [k["key"] for k in only_cn["keys"]])
@@ -201,78 +201,31 @@ check("dropping the new axis leaves the old payload intact",
 
 
 # --------------------------------------------------------------------------
-# 4. `(切换前)` 行的折叠开关是单个服务端布尔值。
-#
-# 面板可以要求折叠掉该行，选择记在网关而不是浏览器：accounts/settings.json
-# 的 key_before_hidden，与 accounts_collapsed 同形。只有真布尔 true 才隐藏；
-# 文件可以手工编辑，"true" 字符串或 1 必须保持该行可见，避免误删历史。
+# 10. 扣费未采集：完成行没有 credit 时按缺失计数，汇总与各维度一致。
 # --------------------------------------------------------------------------
-class FakeRequest(object):
-    """够跑保存路由的最小 handler。"""
-
-    _handle_settings_save = P.Handler._handle_settings_save
-
-    def __init__(self, payload):
-        self.payload = payload
-        self.answering = []
-
-    def _payload_or_error(self, allow_list=False):
-        return self.payload
-
-    def _error(self, status, message, kind=""):
-        self.answering.append(("error", status, message))
-        return status, message
-
-    def _json(self, status, payload):
-        self.answering.append(("json", status, payload))
-        return status, payload
-
-
-def save(payload):
-    """跑保存路由，返回它应答的错误。"""
-    request = FakeRequest(payload)
-    request._handle_settings_save()
-    return [entry for entry in request.answering if entry[0] == "error"]
-
-
-def stored():
-    with io.open(S.settings_path(P.ACCOUNTS_DIR), encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-settings_path = S.settings_path(P.ACCOUNTS_DIR)
-
-
-def write_settings(data):
-    with io.open(settings_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-
-
-if os.path.exists(settings_path):
-    os.unlink(settings_path)
-
-check("a fresh install shows the row", S.key_before_hidden(P.ACCOUNTS_DIR) is False)
-check("the save route stores a real boolean",
-      save({"key_before_hidden": True}) == []
-      and S.key_before_hidden(P.ACCOUNTS_DIR) is True
-      and stored()["key_before_hidden"] is True
-      and P.runtime_settings_view()["key_before_hidden"] is True)
-check("and stores the off choice too",
-      save({"key_before_hidden": False}) == []
-      and S.key_before_hidden(P.ACCOUNTS_DIR) is False
-      and stored()["key_before_hidden"] is False)
-check("a non-boolean is refused, not coerced",
-      all(save({"key_before_hidden": bad}) for bad in ("true", "false", 1, 0, None, [], {})))
-for bad in ("true", 1, [1], {"x": 1}):
-    write_settings({"key_before_hidden": bad})
-    check("a hand-edited %r still shows the row" % (bad,),
-          S.key_before_hidden(P.ACCOUNTS_DIR) is False)
 S.set_api_keys(P.ACCOUNTS_DIR, [
     {"id": "k-keep", "name": "留", "key": "sk-keep", "realm": "", "enabled": True}])
-S.set_key_before_hidden(P.ACCOUNTS_DIR, True)
-check("writing this key leaves the other settings alone",
-      stored().get("api_keys") is not None
-      and S.key_before_hidden(P.ACCOUNTS_DIR) is True)
+uncollected = [row("acct-M", "k-keep") for _ in range(3)]
+uncollected[0]["credit"] = None
+uncollected[2]["credit"] = None
+with io.open(P.USAGE_LOG, "w", encoding="utf-8") as fh:
+    for r in uncollected:
+        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+missing_data = U._compute_usage_analytics_uncached()
+missing_summary = missing_data["summary"]["window"]
+check("completion rows without credit are counted as missing",
+      missing_summary["requests"] == 3 and missing_summary["credit_missing"] == 2,
+      missing_summary)
+check("collected credit is still summed",
+      abs(missing_summary["credit"] - 1.5) < 1e-9, missing_summary)
+by_key_missing = {k["key"]: k for k in missing_data["keys"]}
+check("the key bucket carries the missing count",
+      by_key_missing["k-keep"]["window"]["credit_missing"] == 2,
+      by_key_missing.get("k-keep"))
+by_acct_missing = {a["uid"]: a for a in missing_data["accounts"]}
+check("the account bucket carries the missing count",
+      by_acct_missing["acct-M"]["window"]["credit_missing"] == 2,
+      by_acct_missing.get("acct-M"))
 
 shutil.rmtree(_TMP, ignore_errors=True)
 print("\n  SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

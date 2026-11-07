@@ -6,7 +6,7 @@
 矩阵里删掉时它照样是绿的，门禁会被悄悄削弱。所以腿直接解析自
 `.github/workflows/tests.yml`，输出形状与 Actions API 上报的任务名一致，
 即 `<os> / python <version>`。在那里加一条腿，门禁自动跟进。当前矩阵是
-Ubuntu 3.9、Ubuntu 3.12、Windows 3.12 三条腿，以 tests.yml 为准。
+Ubuntu 3.12、Windows 3.12 两条腿，以 tests.yml 为准。
 
     python release/matrix_legs.py
 

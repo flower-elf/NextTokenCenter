@@ -41,7 +41,7 @@ svg.lucide { flex-shrink: 0; }
 @media (min-width: 1024px) { .shell-body { padding-left: 48px; padding-right: 48px; } }
 
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.topbar-brand { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+.topbar-brand { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; text-decoration: none; }
 .topbar-brand .brand-mark {
   width: 24px; height: 24px; border-radius: 8px; display: grid; place-items: center;
   background: var(--primary); color: var(--primary-foreground);
@@ -57,6 +57,7 @@ svg.lucide { flex-shrink: 0; }
 @keyframes page-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 
 .page-head { display: flex; flex-direction: column; gap: 12px; }
+.page-head .page-head-main { gap: 10px; }
 @media (min-width: 640px) { .page-head { flex-direction: row; align-items: flex-end; justify-content: space-between; } }
 .page-title { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
 .page-desc { margin: 2px 0 0; font-size: 12px; color: var(--muted-foreground); }
@@ -83,14 +84,19 @@ svg.lucide { flex-shrink: 0; }
 .tone-sky { color: var(--sky); }
 .tone-muted { color: var(--muted-foreground); }
 .row { display: flex; align-items: center; gap: 8px; }
+.row-tight { gap: 6px; }
 .row-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .col { display: flex; flex-direction: column; gap: 8px; }
+.col-tight { gap: 2px; }
+/* 竖向排列的一组卡片：卡片之间留 12px，与 .page 的卡片间距同一档 */
+.stack { display: flex; flex-direction: column; gap: 12px; }
 .grow { flex: 1; min-width: 0; }
 
 .grid-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 @media (min-width: 768px) { .grid-stats { gap: 16px; } }
 @media (min-width: 1024px) {
+  .grid-stats.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid-stats.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .grid-stats.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }

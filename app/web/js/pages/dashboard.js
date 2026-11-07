@@ -1,12 +1,14 @@
-// 仪表盘：当前查看版本的账号池健康度、网关出口与今日用量总览。
+// 仪表盘：当前查看渠道的账号池健康度、网关默认路由与今日用量总览。
 
 import { html, render, nothing, ref, createRef } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { getJSON } from '../core/api.js';
-import { getState, subscribe, switchActiveRealm } from '../core/store.js';
-import { fmtNumber, fmtCompact, fmtNumberDash, fmtRemain, realmLabel } from '../core/format.js';
+import { getState, subscribe, switchActiveRoute } from '../core/store.js';
+import { fmtNumber, fmtCompact, fmtNumberDash, fmtRemain, spaceMixed } from '../core/format.js';
+import { channelLabel, routeText } from '../core/channels.js';
 import { hrefFor } from '../core/router.js';
-import { pageHeader, statCard, badge, emptyState, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock, progressBar, copyButton, busyClick, segmented } from '../ui/widgets.js';
+import { pageHeader, statCard, emptyState, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock, progressBar, copyButton, busyClick, segmented, badge } from '../ui/widgets.js';
+import { routeEditor } from '../ui/route-editor.js';
 import { confirmDialog } from '../ui/dialog.js';
 import { createChartHost } from '../ui/chart.js';
 import { toastError, toast } from '../ui/toast.js';
@@ -33,6 +35,7 @@ export function mount(host) {
   let missing = [];        // 本次没有取到的数据名称
   let fatal = '';          // 首屏整体失败的原因
   let phase = 'loading';    // loading 首屏骨架、error 整页失败、ready 正常
+  let draftRoute = null;   // 正在编辑的默认路由（通道 id 数组）；null 表示没有在编辑
   let seq = 0;
 
   function draw() {
@@ -94,24 +97,54 @@ export function mount(host) {
     draw();
   }
 
-  async function switchExit() {
-    const current = getState().activeRealm;
-    const next = current === 'intl' ? 'cn' : 'intl';
+  function beginEditRoute() {
+    draftRoute = getState().activeRoute.slice();
+    draw();
+  }
+
+  function cancelEditRoute() {
+    draftRoute = null;
+    draw();
+  }
+
+  function setDraftRoute(next) {
+    draftRoute = next;
+    draw();
+  }
+
+  async function saveRoute() {
+    const route = Array.isArray(draftRoute) ? draftRoute.slice() : [];
+    if (!route.length) {
+      toast.warn('默认路由至少要选一个渠道。');
+      return;
+    }
+    const text = routeText(route);
     const ok = await confirmDialog({
-      title: '切换网关默认出口？',
-      desc: '切换后，没有绑定版本的密钥会立刻改用' + realmLabel(next) + '账号；已绑定版本的密钥不受影响。这一步会影响所有正在使用网关的客户端。',
-      confirmText: '切换到' + realmLabel(next),
+      title: '保存网关默认路由？',
+      desc: '没有绑定路由的密钥会立刻改在“' + text + '”之间调度，影响所有客户端。',
+      confirmText: '保存路由',
       onConfirm: async () => {
-        await switchActiveRealm(next);
+        await switchActiveRoute(route);
       },
     });
-    if (ok) toast.success('默认出口已切换为' + realmLabel(next));
+    if (!ok) return;
+    draftRoute = null;
+    toast.success('默认路由已改为“' + text + '”');
+    draw();
+  }
+
+  /** 路由里能给出排程说明的渠道：调度器按渠道返回 mode_<渠道 id>。 */
+  function schedulerNotes() {
+    if (!scheduler) return [];
+    return getState().activeRoute
+      .map((id) => ({ id, text: scheduler['mode_' + id] || '' }))
+      .filter((item) => item.text);
   }
 
   async function addAccount() {
     try {
-      const mod = await import('./accounts/dialogs/add.js');
-      await mod.openAddAccountDialog();
+      const mod = await import('./accounts/dialogs/open.js');
+      await mod.openAccountDialog(getState().viewRealm);
     } catch (err) {
       toastError('打开「添加账号」失败', err);
     }
@@ -158,27 +191,33 @@ export function mount(host) {
   }
 
   function exitCard() {
-    const realm = getState().activeRealm;
-    const next = realm === 'intl' ? 'cn' : 'intl';
-    const effect = keyEffect(keys, realm);
+    const activeRoute = getState().activeRoute;
+    const effect = keyEffect(keys);
     const origin = location.origin;
-    const mode = scheduler ? (realm === 'cn' ? scheduler.mode_cn : scheduler.mode_intl) : '';
+    const notes = schedulerNotes();
+    const editing = Array.isArray(draftRoute);
     return html`
       <div class="card col" style="gap:12px">
         <div class="card-head" style="margin-bottom:0">
-          <h2 class="card-title">${icon('Server')}网关出口</h2>
-          ${keys ? badge(realmLabel(realm), realm === 'cn' ? 'warning' : 'sky', { small: true }) : nothing}
+          <h2 class="card-title">${icon('Server')}网关默认路由</h2>
+          ${editing ? nothing : html`<button class="btn btn-outline btn-xs" @click=${beginEditRoute}>${icon('Pencil')}编辑路由</button>`}
         </div>
-        <p class="card-sub" style="margin:0">没有绑定版本的密钥会走这一个出口，客户端请求由这里的账号接流。</p>
-        <div class="kv"><span>当前默认出口</span><b>${realmLabel(realm)}</b></div>
+        ${editing
+          ? html`
+            ${routeEditor({ route: draftRoute, onChange: setDraftRoute })}
+            <div class="row" style="gap:8px">
+              <button class="btn btn-primary btn-sm" @click=${saveRoute}>${icon('Check')}保存路由</button>
+              <button class="btn btn-ghost btn-sm" @click=${cancelEditRoute}>取消</button>
+            </div>`
+          : html`<div class="route-text">${routeText(activeRoute, '未设置')}</div>`}
+        <p class="card-sub" style="margin:0">没有绑定路由的密钥在这些渠道之间混合调度。</p>
         <div class="kv">
-          <span>生效的密钥</span>
+          <span>启用的密钥</span>
           <b>${keys ? effect.total + ' 个' : '—'}</b>
         </div>
         ${keys
-          ? html`<div class="card-sub">其中绑定${realmLabel(realm)} ${effect.bound} 个，未绑定版本 ${effect.follow} 个。</div>`
-          : html`<div class="card-sub">密钥清单没有读取到，生效数量暂不显示。</div>`}
-        <button class="btn btn-outline btn-sm" @click=${switchExit}>${icon('ArrowLeftRight')}切换为${realmLabel(next)}</button>
+          ? html`<div class="card-sub">跟随默认路由 ${effect.following} 个，自带路由 ${effect.routed} 个。</div>`
+          : html`<div class="card-sub">密钥清单没有读取到。</div>`}
         <div class="exit-url">
           <code class="break-all">${origin}/v1</code>
           ${copyButton(origin + '/v1', { title: '复制接口地址', label: '复制' })}
@@ -186,7 +225,7 @@ export function mount(host) {
         <div class="col" style="gap:4px">
           <div class="card-sub">调度器：${scheduler ? (scheduler.enabled ? '运行中' : '已暂停') : '状态未读取到'}</div>
           ${scheduler ? html`<div class="card-sub">下次巡检 ${scheduler.next_run_time || '待调度'}，上次巡检 ${scheduler.last_run_time || '尚未运行'}。</div>` : nothing}
-          ${mode ? html`<div class="card-sub">${mode}</div>` : nothing}
+          ${notes.map((note) => html`<div class="card-sub">${spaceMixed(channelLabel(note.id) + '：' + note.text)}</div>`)}
           <a class="btn btn-ghost btn-sm" href=${hrefFor('tasks')}>查看任务${icon('ChevronRight')}</a>
         </div>
       </div>`;
@@ -207,7 +246,7 @@ export function mount(host) {
           ? emptyState({
               icon: 'Users',
               title: '暂无账号',
-              desc: realmLabel(getState().viewRealm) + '账号池是空的，添加账号后网关才能接流。',
+              desc: spaceMixed(channelLabel(getState().viewRealm) + '账号池是空的，添加账号后网关才能接流。'),
               action: html`<button class="btn btn-primary btn-sm" @click=${busyClick(addAccount)}>${icon('UserPlus')}添加账号</button>`,
             })
           : html`<div class="snap-grid">${snapshotAccounts(list, SNAPSHOT_LIMIT, now).map((a) => snapshotTile(a, now))}</div>`}
@@ -238,7 +277,7 @@ export function mount(host) {
       <div class="page">
         ${pageHeader({ path: DASH, title: '仪表盘', desc: descText() })}
         ${missing.length
-          ? loadErrorInline('这些数据没有刷新成功：' + missing.join('、') + '。下面显示的是上一次读取到的结果。', retry)
+          ? loadErrorInline('这些数据没有刷新成功，下面显示的是上次结果：' + missing.join('、') + '。', retry)
           : nothing}
         <div class="grid-stats cols-5">
           ${statCard({ label: '账号总数', value: fmtNumber(summary.total), icon: 'Users', hint: '启用 ' + summary.enabled + ' 个', delay: 0 })}
@@ -256,12 +295,12 @@ export function mount(host) {
   }
 
   function descText() {
-    return realmLabel(getState().viewRealm) + '账号池健康度、网关出口与今日用量总览。';
+    return spaceMixed(channelLabel(getState().viewRealm) + '账号池健康度、网关默认路由与今日用量总览。');
   }
 
-  // 右上角切换查看版本时路由会整页卸载再挂载；默认出口的变化只重画这一页。
+  // 右上角切换查看版本时路由会整页卸载再挂载；默认路由的变化只重画这一页。
   const off = subscribe((reason) => {
-    if (reason === 'activeRealm') draw();
+    if (reason === 'activeRoute') draw();
   });
 
   draw();

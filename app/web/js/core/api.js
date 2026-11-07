@@ -1,8 +1,8 @@
 import { readStore, writeStore } from './storage.js';
 
 // 面板会话令牌放 sessionStorage，关闭标签页即失效；API Key 可经 ?key= 传入后记在 localStorage。
-const PANEL_STORE = 'wb-proxy-center-panel-token';
-const KEY_STORE = 'wb-proxy-center-api-key';
+const PANEL_STORE = 'next-token-center-panel-token';
+const KEY_STORE = 'next-token-center-api-key';
 
 let panelToken = readStore(PANEL_STORE, 'session') || '';
 let apiKey = (readStore(KEY_STORE) || '').trim();
@@ -154,7 +154,7 @@ async function requestOnce(method, url, body, retried = false) {
     throw new ApiError(401, '面板会话已失效，请重新登录', parsed);
   }
   if (response.status === 403) {
-    // 权限不足不等于会话失效：例如只用 API Key 的会话修改默认出口。
+    // 权限不足不等于会话失效：例如只用 API Key 的会话修改默认路由。
     throw new ApiError(403, errorMessage(403, parsed), parsed);
   }
   if (!response.ok) throw new ApiError(response.status, errorMessage(response.status, parsed), parsed);

@@ -118,7 +118,6 @@ class OpenUpstreamTests(unittest.TestCase):
         self.pool = wb_accounts.AccountPool(os.path.join(_TMP, "pools"))
         self.pool.accounts = [wb_accounts.Account(
             {"uid": "uid-effort", "accessToken": "t", "realm": "intl"})]
-        self.pool.smart_routing = False
         self.old_pool = P.POOL
         self.old_urlopen = wb_accounts.urlopen
         P.POOL = self.pool
@@ -194,10 +193,11 @@ class FakeHandler(object):
     _dispatch_chat_post = P.Handler._dispatch_chat_post
     _chat_stream_response = P.Handler._chat_stream_response
     _chat_nonstream_response = P.Handler._chat_nonstream_response
-    _request_realm = P.Handler._request_realm
-    _key_realm = P.Handler._key_realm
+    _request_route = P.Handler._request_route
+    _key_route = P.Handler._key_route
     _cross_realm_error = P.Handler._cross_realm_error
     _banned_model_error = P.Handler._banned_model_error
+    _route_model = P.Handler._route_model
     _key_model_error = P.Handler._key_model_error
     _debug_account = P.Handler._debug_account
 

@@ -203,7 +203,9 @@ class PageRotationTests(unittest.TestCase):
         for _ in range(4):
             pool.pick(realm="cn", page=(0, 2))
         self.assertEqual(pool._cursor, before)
-        # 普通轮换的起点不变。
+        # 页内接单也计入最近一小时的忙闲，先清掉，只看整池从原游标起步。
+        for account in pool.accounts:
+            account._pick_stamps.clear()
         self.assertEqual([pool.pick(realm="cn").uid for _ in range(3)],
                          ["a", "b", "c"])
 

@@ -9,6 +9,32 @@ export function toMillis(ts) {
 
 const pad2 = (n) => String(n).padStart(2, '0');
 
+/** 汉字与半角字母或数字的边界：中文文案里拼渠道名、模型名、数字时补一个半角空格。 */
+function isCjkChar(ch) {
+  const code = ch.codePointAt(0);
+  return (code >= 0x3400 && code <= 0x4dbf) || (code >= 0x4e00 && code <= 0x9fff);
+}
+
+function isAsciiAlnum(ch) {
+  return /^[A-Za-z0-9]$/.test(ch);
+}
+
+/** 在汉字与半角字母或数字的边界补一个空格；已有空格与标点边界保持原样。 */
+export function spaceMixed(text) {
+  const value = String(text === null || text === undefined ? '' : text);
+  let out = '';
+  let previous = '';
+  for (const ch of value) {
+    if (previous && ((isCjkChar(previous) && isAsciiAlnum(ch))
+      || (isAsciiAlnum(previous) && isCjkChar(ch)))) {
+      out += ' ';
+    }
+    out += ch;
+    previous = ch;
+  }
+  return out;
+}
+
 // 表格一轮会格式化上千个数字，复用格式化器比每次 toLocaleString 少建临时对象。
 const numberFormat = new Intl.NumberFormat('zh-CN');
 const moneyFormat = new Intl.NumberFormat('zh-CN', {
@@ -152,10 +178,6 @@ export function fromLocalInputValue(value) {
   if (!value) return null;
   const t = new Date(value).getTime();
   return Number.isNaN(t) ? null : Math.floor(t / 1000);
-}
-
-export function realmLabel(realm) {
-  return realm === 'cn' ? '国内版' : '国际版';
 }
 
 /** 进度条填充颜色：超过半数绿色，剩余不到一半黄色，再少时红色。 */

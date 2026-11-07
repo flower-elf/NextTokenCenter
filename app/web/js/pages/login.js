@@ -36,19 +36,19 @@ export function showLogin(host, { message = '', onSuccess, autoPassword = '' }) 
       <div class="login-screen">
         <div class="login-box">
           <div class="login-mark">${icon('Bot')}</div>
-          <h1 class="page-title">WorkBuddy 网关</h1>
-          <p class="page-desc">WorkBuddy / CodeBuddy 账号池 · OpenAI 兼容接口网关</p>
+          <h1 class="page-title">NextTokenCenter</h1>
+          <p class="page-desc">WorkBuddy / CodeArts 账号池 · OpenAI 兼容接口网关</p>
           <form class="card login-card" @submit=${submit}>
             <label class="field">
               <span class="field-label">面板密码</span>
               <input id="loginPassword" class="input" type="password" autocomplete="current-password" placeholder="请输入面板密码" ?disabled=${busy} autofocus>
             </label>
             ${error ? html`<p class="field-error" role="alert">${error}</p>` : nothing}
-            <button class="btn btn-primary" type="submit" style="width:100%" ?disabled=${busy}>
+            <button class="btn btn-primary btn-block" type="submit" ?disabled=${busy}>
               ${busy ? icon('LoaderCircle', 'spin') : icon('LogIn')}进入面板
             </button>
           </form>
-          <p class="login-foot">面板密码与 API Key 相互独立：密码用于登录面板，API Key 用于客户端调用。</p>
+          <p class="login-foot">面板密码用于登录面板，API Key 用于客户端调用。</p>
         </div>
       </div>`, host);
   }

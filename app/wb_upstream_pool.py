@@ -44,7 +44,7 @@ def enabled():
 
 def _pool_size():
     """每个池键最多保留的空闲连接数（默认 2）。2 条足以覆盖「一条在流式读、一条刚还回来」的常见
-    重叠；再多只会让 OpenWrt 这种小内存设备为僵尸连接多留 socket 与内核缓冲，收益很小。"""
+    重叠；再多只会让小内存设备为僵尸连接多留 socket 与内核缓冲，收益很小。"""
     try:
         return max(1, int(os.environ.get("WB_UPSTREAM_POOL_SIZE") or "2"))
     except (TypeError, ValueError):
@@ -257,7 +257,14 @@ class _PooledResponse(http.client.HTTPResponse):
             return
         self._released = True
         pool, key, conn = self._pool, self._pool_key, self._pool_conn
-        if pool is None or conn is None:
+        if conn is None:
+            return
+        if pool is None:
+            # 非池化请求：响应关闭时把连接一起关掉，别让 socket 挂到进程退出。
+            try:
+                conn.close()
+            except Exception:
+                pass
             return
         if (self._body_complete() and not self.will_close
                 and conn.sock is not None):
@@ -676,3 +683,92 @@ def urlopen(req, timeout=30, proxy=""):
             raise PoolBypass("upstream answered %d; replayed via urllib" % status)
         raise urllib.error.HTTPError(req.full_url, status, resp.reason,
                                      resp.headers, io.BytesIO(body))
+
+
+def open_ordered(url, method, headers, body=None, timeout=30, proxy="",
+                 pooled=True):
+    """按给定顺序与写法发送请求头，返回 keep-alive 响应。
+
+    官方客户端的请求头顺序由运行时决定，`Request` 会先排 unredirected 头，没法复现。
+    这里直接调 `http.client` 的 putrequest/putheader，`headers` 必须包含 Content-Length
+    （有正文时）与 Connection；池的复用、探活、归还语义与 `urlopen` 相同。
+    `pooled` 为假时新建一条连接，响应关闭时一并关闭连接。
+    """
+    scheme, host, port, selector = _target_parts(url)
+    proxy_raw = str(proxy or "").strip()
+    proxy_info, proxy_raw = _fold_bypassed(host, proxy_raw)
+    if proxy_info and scheme == "http":
+        selector = url
+    key = (scheme, host, port, proxy_raw)
+    items = [(str(name), str(value)) for name, value in headers]
+
+    def factory():
+        return _new_connection(scheme, host, port, proxy_info, timeout)
+
+    if pooled:
+        conn, reused = _POOL.acquire(key, timeout, factory)
+    else:
+        conn, reused = factory(), False
+
+    retried = False
+    while True:
+        try:
+            # http.client 的 request() 会自己补 Host 与 Content-Length 并重排，
+            # 这里逐个 putheader 才能保住官方客户端的顺序与大小写。
+            conn.putrequest(method.upper(), selector,
+                            skip_host=True, skip_accept_encoding=True)
+            for name, value in items:
+                conn.putheader(name, value)
+            conn.endheaders(body)
+        except OSError as err:
+            if pooled:
+                _POOL.discard(conn)
+            else:
+                conn.close()
+            if reused and _stale_connection_error(err):
+                raise
+            raise urllib.error.URLError(err) from None
+        except Exception:
+            if pooled:
+                _POOL.discard(conn)
+            else:
+                conn.close()
+            raise
+        try:
+            resp = conn.getresponse()
+        except ConnectionError as err:
+            if reused and _stale_connection_error(err) and not retried \
+                    and method.upper() in ("GET", "HEAD"):
+                if pooled:
+                    _POOL.discard(conn)
+                else:
+                    conn.close()
+                retried = True
+                reused = False
+                conn = factory()
+                if pooled:
+                    _POOL.note_created()
+                continue
+            if pooled:
+                _POOL.discard(conn)
+            else:
+                conn.close()
+            raise
+        except Exception:
+            if pooled:
+                _POOL.discard(conn)
+            else:
+                conn.close()
+            raise
+        resp._pool = _POOL if pooled else None
+        resp._pool_key = key
+        resp._pool_conn = conn
+        resp.url = url
+        resp.msg = resp.reason
+        status = resp.status
+        if 200 <= status < 300:
+            return resp
+        err_body = _read_error_body(resp)
+        resp.close()
+        raise urllib.error.HTTPError(url, status, resp.reason,
+                                     resp.headers, io.BytesIO(err_body))

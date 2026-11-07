@@ -17,14 +17,14 @@ def account(uid, realm):
 
 
 class LimitStorageTests(unittest.TestCase):
-    def test_global_default_covers_both_realms(self):
+    def test_global_default_covers_every_realm(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
             wb_settings.set_daily_token_limit(d, 1000)
             self.assertEqual(wb_settings.daily_token_limit(d), 1000)
             self.assertEqual(wb_settings.daily_token_limit(d, "intl"), 1000)
             self.assertEqual(wb_settings.daily_token_limit(d, "cn"), 1000)
             self.assertEqual(wb_settings.limit_values(d, "daily_token_limit"),
-                             {"global": 1000, "intl": 1000, "cn": 1000})
+                             {"global": 1000, "intl": 1000, "cn": 1000, "codearts": 1000})
 
     def test_override_wins_for_its_realm_only(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
@@ -33,7 +33,7 @@ class LimitStorageTests(unittest.TestCase):
             self.assertEqual(wb_settings.daily_token_limit(d, "intl"), 1000)
             self.assertEqual(wb_settings.daily_token_limit(d, "cn"), 50)
             self.assertEqual(wb_settings.limit_values(d, "daily_token_limit"),
-                             {"global": 1000, "intl": 1000, "cn": 50})
+                             {"global": 1000, "intl": 1000, "cn": 50, "codearts": 1000})
 
     def test_zero_override_is_distinct_from_inherit(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
@@ -42,7 +42,7 @@ class LimitStorageTests(unittest.TestCase):
             self.assertEqual(wb_settings.reserve_credits(d, "cn"), 0)
             self.assertEqual(wb_settings.reserve_credits(d, "intl"), 10)
             self.assertEqual(wb_settings.limit_values(d, "reserve_credits"),
-                             {"global": 10, "intl": 10, "cn": 0})
+                             {"global": 10, "intl": 10, "cn": 0, "codearts": 10})
 
     def test_clearing_an_override_falls_back_to_the_global(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
@@ -63,7 +63,7 @@ class LimitStorageTests(unittest.TestCase):
             snapshot = wb_settings.limits_snapshot(d)
             self.assertEqual(set(snapshot), set(wb_settings.LIMIT_KEYS))
             for entry in snapshot.values():
-                self.assertEqual(set(entry), {"global", "intl", "cn"})
+                self.assertEqual(set(entry), {"global", "intl", "cn", "codearts"})
 
     def test_junk_and_negatives_collapse(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
@@ -219,14 +219,7 @@ class SettingsSaveTests(unittest.TestCase):
             self.assertEqual(request.reply["reserve_credits"], 5)
             self.assertEqual(
                 request.reply["limits"]["reserve_credits"],
-                {"global": 5, "intl": 2, "cn": None})
-
-    def test_flat_payload_still_sets_the_global(self):
-        with tempfile.TemporaryDirectory(prefix="limits-") as d:
-            request = self._save(d, {"daily_credit_limit": 42})
-            self.assertEqual(request.status, 200)
-            self.assertEqual(wb_settings.daily_credit_limit(d), 42)
-            self.assertEqual(wb_settings.daily_credit_limit(d, "cn"), 42)
+                {"global": 5, "intl": 2, "cn": None, "codearts": None})
 
     def test_blank_override_clears_a_stored_one(self):
         with tempfile.TemporaryDirectory(prefix="limits-") as d:
@@ -247,7 +240,6 @@ class SettingsSaveTests(unittest.TestCase):
                 {"limits": {"reserve_credits": {"intl": "abc"}}},
                 {"limits": {"reserve_credits": {"intl": -1}}},
                 {"limits": {"reserve_credits": {"global": True}}},
-                {"daily_token_limit": "abc"},
             ]
             for payload in cases:
                 request = self._save(d, payload)
@@ -269,7 +261,7 @@ class SettingsSaveTests(unittest.TestCase):
             with mock.patch.object(proxy, "ACCOUNTS_DIR", d):
                 view = proxy.runtime_settings_view()
             self.assertEqual(view["limits"]["daily_token_limit"],
-                             {"global": 7, "intl": 3, "cn": None})
+                             {"global": 7, "intl": 3, "cn": None, "codearts": None})
             # 扁平键留给旧版面板读取，取的是全局值。
             self.assertEqual(view["daily_token_limit"], 7)
 

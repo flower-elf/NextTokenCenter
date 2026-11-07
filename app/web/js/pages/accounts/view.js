@@ -2,17 +2,25 @@
 import { html, live, nothing, repeat } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { getState } from '../../core/store.js';
-import { barColor, fmtCompact, fmtCredit, fmtNumber, realmLabel } from '../../core/format.js';
+import { barColor, fmtCompact, fmtCredit, fmtNumber, spaceMixed } from '../../core/format.js';
+import { channelFeature, channelLabel, channelProvider } from '../../core/channels.js';
 import {
-  badge, busyClick, chip, emptyState, loadErrorInline, loadErrorPage, pageHeader, pager,
-  progressBar, realmBadge, skeletonRows, statCard,
+  badge, busyClick, channelBadge, chip, emptyState, loadErrorInline, loadErrorPage, pageHeader, pager,
+  progressBar, skeletonRows, statCard,
 } from '../../ui/widgets.js';
 import * as logic from './logic.js';
 import * as activity from './activity.js';
-import { openAddAccountDialog } from './dialogs/add.js';
+import { openAccountDialog } from './dialogs/open.js';
 import { openImportDialog } from './dialogs/import.js';
 import { openNoteDialog } from './dialogs/note.js';
+import { openGroupDialog } from './dialogs/group.js';
 import { openModelExcludeDialog } from './dialogs/exclude.js';
+
+// 徽章文字按「 · 」分段，每段不断行；列宽不够时整段换到下一行，不截断文字。
+function badgeParts(text) {
+  const parts = String(text).split(' · ');
+  return parts.map((part, index) => html`${index ? ' · ' : ''}<span class="badge-part">${part}</span>`);
+}
 
 export function accountView(S, h) {
   function accountInfo(account) {
@@ -21,8 +29,12 @@ export function accountView(S, h) {
       <div class="account-cell">
         <div class="grow">
           <div class="row-wrap">
-            <span class="strong">${account.nickname || uid.slice(0, 8)}</span>
-            ${realmBadge(account.realm)}
+            <span class="strong account-name" title=${account.nickname || uid}>${account.nickname || uid.slice(0, 8)}</span>
+            ${channelBadge(account.realm)}
+            ${account.group ? badge('分组 ' + account.group, 'muted', {
+              small: true, title: '分组只用于筛选与批量启停' }) : nothing}
+            ${account.enabled && account.tasksEnabled === false ? badge('定时任务已停', 'warning', {
+              small: true, title: '这个账号不参与定时任务' }) : nothing}
             ${account.apiKey ? badge('API Key', 'muted', {
               small: true, title: account.credentialMask || '静态 API Key' }) : nothing}
             ${(account.disabledModels || []).length ? badge(
@@ -45,17 +57,19 @@ export function accountView(S, h) {
         <div class="card-head">
           <div>
             <h2 class="card-title tone-warning">${icon('TriangleAlert')}网关已停止</h2>
-            <p class="card-sub">一个账号被上游限制（403），网关已停用全部账号，不再发送任何请求，避免把其他账号关联进来。确认上游已解封后点「全部启用」恢复。</p>
+            <p class="card-sub">同一来源的全部账号已被上游限制停用，解封后点「全部启用」恢复。</p>
           </div>
-          <button class="btn btn-primary btn-sm" @click=${busyClick(() => h.setAll(true))}>${icon('CircleCheck')}全部启用</button>
+          <button class="btn btn-primary btn-sm" @click=${busyClick(() => h.resumeProvider())}>${icon('CircleCheck')}全部启用</button>
         </div>
       </div>`;
   }
 
   function activityCards(realm) {
+    const kind = activity.activityKind(realm);
+    if (!kind) return nothing;
     const summary = activity.todaySummary(S.accounts, S.activity, realm);
-    if (realm === 'cn') {
-      const streak = activity.streakSummary(S.accounts);
+    if (kind === 'buddy') {
+      const streak = activity.streakSummary(S.accounts, realm);
       return html`
         <div class="grid-stats">
           ${statCard({
@@ -68,7 +82,17 @@ export function accountView(S, h) {
             value: streak.total ? streak.done + '/' + streak.total : '无账号',
             icon: 'Flame',
             tone: streak.total && streak.done === streak.total ? 'success' : 'warning',
-            hint: '今天已完成活跃上报的账号数；连续天数在任务页查看',
+            hint: '今天已完成活跃上报的账号数，连续天数在任务页查看',
+          })}
+        </div>`;
+    }
+    if (kind === 'codearts') {
+      return html`
+        <div class="grid-stats">
+          ${statCard({
+            label: '今日签到状态',
+            icon: 'CalendarCheck',
+            ...activity.summaryStat(summary, { doneWord: '已签到', pendingWord: '未签到' }),
           })}
         </div>`;
     }
@@ -86,7 +110,8 @@ export function accountView(S, h) {
     const status = activity.activityView(account, S.activity);
     const tone = (item) => (item.kind === 'ok' || item.kind === 'done' ? 'success'
       : item.kind === 'failed' ? 'danger' : 'muted');
-    if (status.realm === 'cn') {
+    if (!status.kind) return nothing;
+    if (status.kind === 'buddy') {
       const gas = status.gas;
       const streak = status.streak;
       return html`
@@ -98,6 +123,13 @@ export function accountView(S, h) {
           small: true,
           title: streak.hint + (streak.at ? ' · ' + streak.at : ''),
         })}`;
+    }
+    if (status.kind === 'codearts') {
+      const checkin = status.checkin;
+      return badge('今日签到 · ' + checkin.text, tone(checkin), {
+        small: true,
+        title: checkin.hint + (checkin.at ? ' · ' + checkin.at : ''),
+      });
     }
     const daily = status.daily;
     return badge('今日活跃 · ' + daily.text, tone(daily), {
@@ -113,7 +145,7 @@ export function accountView(S, h) {
     return html`
       <div class="status-cell">
         ${badge(view.text, view.tone, { title: view.title })}
-        ${pills.map((pill) => badge(pill.text, 'warning', { small: true, title: pill.title }))}
+        ${pills.map((pill) => badge(badgeParts(pill.text), 'warning', { small: true, title: pill.title }))}
         ${activityBadges(account)}
       </div>
       ${error ? html`<div class="cell-sub tone-warning">${error}</div>` : nothing}`;
@@ -135,7 +167,7 @@ export function accountView(S, h) {
         ${barPct === null ? nothing : progressBar(barPct, barColor(barPct))}
         <div class="strong nums">${fmtCredit(valid.remain)}${valid.size > 0 ? html`<span class="muted"> / ${fmtCredit(valid.size)}</span>` : nothing}</div>
         ${age ? html`<div class="cell-sub">${age}</div>` : nothing}
-        ${expiry ? badge(expiry.text, expiry.tone, { small: true, title: expiry.title }) : nothing}
+        ${expiry ? badge(badgeParts(expiry.text), expiry.tone, { small: true, title: expiry.title }) : nothing}
       </div>`;
   }
 
@@ -157,20 +189,22 @@ export function accountView(S, h) {
 
   function slotSelect(account) {
     const view = logic.slotOptions(account, S.slots);
+    const current = view.options.find((option) => option.value === view.selected);
     return html`
-      <select class="select input-sm" .value=${view.selected} title="这个账号的出站线路，直连表示不经过代理槽，旧代理是账号上遗留的单账号代理"
+      <select class="select input-sm" .value=${view.selected} title=${'代理槽：' + (current ? current.label : '直连')}
               @change=${(event) => h.onSlotChange(account, event.target.value)}>
         ${view.options.map((option) => html`<option value=${option.value} .selected=${option.value === view.selected}>${option.label}</option>`)}
       </select>`;
   }
 
   function identitySelect(account) {
-    const view = logic.productOptions(account);
+    const view = logic.identityOptions(account);
+    if (!view.options.length) return html`<span class="cell-sub">—</span>`;
     // 选中项写在 option 上：lit 先设置 select.value 再插入 option，首次渲染时
-    // select 里还没有选项，只靠 .value 会退回第一项，刷新后显示成 WB。
+    // select 里还没有选项，只靠 .value 会退回第一项。
     return html`
       <select class="select input-sm" .value=${view.selected} title=${logic.IDENTITY_TIP}
-              @change=${(event) => h.onProductChange(account, event.target.value)}>
+              @change=${(event) => h.onIdentityChange(account, event.target.value)}>
         ${view.options.map((option) => html`<option value=${option.value} .selected=${option.value === view.selected}>${option.label}</option>`)}
       </select>`;
   }
@@ -194,40 +228,63 @@ export function accountView(S, h) {
       value,
       min: 0,
       max: limits.priorityMax,
-      title: '调用优先级：网关先选数字较小的账号，数字相同的账号按轮询顺序选择。默认 '
-        + limits.priorityDefault + '，允许 0 到 ' + limits.priorityMax + '。',
+      title: '优先级：数字小的账号先接单，允许 0 到 ' + limits.priorityMax + '。',
       onChange: (raw) => h.onPriorityChange(account, raw),
     });
   }
 
-  function concurrencyInput(account) {
+  function weightInput(account) {
     const limits = logic.accountLimits(S.limits);
+    const draft = logic.draftFor(S.draft, logic.uidAttr(account.uid), 'weight');
+    const value = draft === null ? String(logic.weightOf(account)) : draft;
+    return numberCell(account, {
+      field: 'weight',
+      draftField: 'weight',
+      value,
+      min: limits.weightMin,
+      max: limits.weightMax,
+      title: '权重：同级内权重大的账号多接单，允许 ' + limits.weightMin + ' 到 ' + limits.weightMax + '。',
+      onChange: (raw) => h.onWeightChange(account, raw),
+    });
+  }
+
+  function concurrencyInput(account) {
+    const range = logic.concurrencyRange(account, S.limits);
     const draft = logic.draftFor(S.draft, logic.uidAttr(account.uid), 'concurrency');
     const value = draft === null ? String(logic.concurrencyOf(account)) : draft;
-    const busy = logic.activeRequestsOf(account);
+    const rule = range.min === 0 ? '0 表示不限' : '允许 ' + range.min + ' 到 ' + range.max;
     return numberCell(account, {
       field: 'concurrency',
       draftField: 'concurrency',
       value,
-      min: 0,
-      max: limits.concurrencyMax,
-      title: '单账号单模型的并发上限：同一账号每个模型各自计数，0 表示不限。当前正在服务 '
-        + busy + ' 个请求。',
+      min: range.min,
+      max: range.max,
+      title: '并发上限：同一账号同时处理的请求数，' + rule + '。',
       onChange: (raw) => h.onConcurrencyChange(account, raw),
     });
   }
 
   function rowActions(account) {
     const name = account.nickname || String(account.uid || '').slice(0, 8);
+    const checkinKind = channelFeature(account.realm, 'checkin');
     return html`
       <div class="row-actions">
-        <button class="btn btn-ghost btn-icon btn-xs" title="测试：用这个账号向它自己的端点发送一条 hi 请求"
+        <button class="btn btn-ghost btn-icon btn-xs"
+                title="测试：向这个账号发送一条最小请求，并清除本地冷却"
                 @click=${busyClick(() => h.testAccount(account))}>${icon('Zap')}</button>
         ${account.apiKey ? nothing : html`
-          <button class="btn btn-ghost btn-icon btn-xs" title="刷新 Token：向腾讯换取新的访问令牌并保存"
+          <button class="btn btn-ghost btn-icon btn-xs" title="刷新凭据：向上游换取新令牌"
                   @click=${busyClick(() => h.refreshToken(account))}>${icon('KeyRound')}</button>`}
         <button class="btn btn-ghost btn-icon btn-xs" title="模型排除：这个账号不接的模型"
                 @click=${() => openModelExcludeDialog(account, { onDone: () => h.refresh() })}>${icon('CircleSlash')}</button>
+        <button class="btn btn-ghost btn-icon btn-xs" title='分组：只用于筛选与批量启停'
+                @click=${() => openGroupDialog(account, { onDone: () => h.refresh(), limits: S.limits })}>${icon('Folder')}</button>
+        ${checkinKind ? html`
+          <button class="btn btn-ghost btn-icon btn-xs" title=${activity.checkinLabel(checkinKind)}
+                  @click=${busyClick(() => h.checkinAccount(account))}>${icon(checkinKind === 'buddy' ? 'Fuel' : 'CalendarCheck')}</button>` : nothing}
+        <button class="btn btn-ghost btn-icon btn-xs"
+                title=${account.tasksEnabled === false ? '定时任务已停：点一下恢复' : '参与定时任务：点一下停止'}
+                @click=${busyClick(() => h.toggleTasks(account))}>${icon(account.tasksEnabled === false ? 'CalendarOff' : 'CalendarCheck')}</button>
         <button class="btn btn-ghost btn-icon btn-xs"
                 title=${'备注：只保存在本机，最长 ' + logic.accountLimits(S.limits).noteMax + ' 字'}
                 @click=${() => openNoteDialog(account, { limits: S.limits })}>${icon('StickyNote')}</button>
@@ -250,6 +307,7 @@ export function accountView(S, h) {
         <td>${slotSelect(account)}</td>
         <td>${identitySelect(account)}</td>
         <td>${priorityInput(account)}</td>
+        <td>${weightInput(account)}</td>
         <td>${concurrencyInput(account)}</td>
         <td class="right">${usageInfo(account)}</td>
         <td class="actions">${rowActions(account)}</td>
@@ -267,6 +325,7 @@ export function accountView(S, h) {
           ${badge(view.text, view.tone, { title: view.title })}
         </div>
         ${pills.length ? html`<div class="row-wrap">${pills.map((pill) => badge(pill.text, 'warning', { small: true, title: pill.title }))}</div>` : nothing}
+        <div class="row-wrap">${activityBadges(account)}</div>
         ${error ? html`<div class="text-2xs tone-warning">${error}</div>` : nothing}
         <div class="mobile-grid">
           <div class="mobile-field">
@@ -278,7 +337,7 @@ export function accountView(S, h) {
             ${tokenInfo(account, now)}
           </div>
           <div class="mobile-field">
-            <span class="field-label">出口</span>
+            <span class="field-label">代理槽</span>
             ${slotSelect(account)}
           </div>
           <div class="mobile-field">
@@ -288,6 +347,10 @@ export function accountView(S, h) {
           <div class="mobile-field">
             <span class="field-label">优先级</span>
             ${priorityInput(account)}
+          </div>
+          <div class="mobile-field">
+            <span class="field-label">权重</span>
+            ${weightInput(account)}
           </div>
           <div class="mobile-field">
             <span class="field-label">并发上限</span>
@@ -302,12 +365,12 @@ export function accountView(S, h) {
       </div>`;
   }
 
-  function filterCard(counts) {
+  function filterCard(counts, groups) {
     return html`
       <div class="card filter-card">
         <div class="input-search">
           ${icon('Search')}
-          <input class="input" placeholder="搜索昵称 / UID / 文件名 / 备注" data-draft="query" data-uid=""
+          <input class="input" placeholder="搜索昵称 / UID / 文件名 / 备注 / 分组" data-draft="query" data-uid=""
                  .value=${live(logic.draftFor(S.draft, '', 'query') ?? S.query)}
                  @input=${(event) => { S.query = event.target.value; S.page = 1; h.draw(); }}>
         </div>
@@ -319,6 +382,21 @@ export function accountView(S, h) {
             h.draw();
           }, counts[item.id]))}
         </div>
+        ${groups.length ? html`
+          <div class="chips">
+            <span class="chips-label">${icon('Folder')}分组</span>
+            <select class="select input-sm" .value=${S.group} @change=${(event) => {
+              S.group = event.target.value;
+              S.page = 1;
+              h.draw();
+            }}>
+              <option value="">全部分组</option>
+              ${groups.map((group) => html`<option value=${group}>${group}</option>`)}
+            </select>
+            ${S.group ? html`
+              <button class="btn btn-outline btn-xs" @click=${busyClick(() => h.setGroupEnabled(true))}>启用整组</button>
+              <button class="btn btn-outline btn-xs" @click=${busyClick(() => h.setGroupEnabled(false))}>停用整组</button>` : nothing}
+          </div>` : nothing}
         <div class="chips">
           <span class="chips-label">${icon('ArrowUpDown')}排序</span>
           <select class="select input-sm" .value=${S.sort} @change=${(event) => {
@@ -334,26 +412,20 @@ export function accountView(S, h) {
 
   function emptyCard(kind) {
     const realm = getState().viewRealm;
-    if (kind === 'none') {
+    const addAction = html`<button class="btn btn-primary btn-sm"
+        @click=${() => openAccountDialog(realm)}>${icon('UserPlus')}添加账号</button>`;
+    if (kind === 'none' || kind === 'realm') {
       return emptyState({
         icon: 'Users',
-        title: '账号池里还没有账号',
-        desc: '登录一个腾讯账号之后，网关才能把请求转发出去，账号的积分与令牌状态也会显示在这里。',
-        action: html`<button class="btn btn-primary btn-sm" @click=${() => openAddAccountDialog()}>${icon('UserPlus')}添加账号</button>`,
-      });
-    }
-    if (kind === 'realm') {
-      return emptyState({
-        icon: 'Users',
-        title: realmLabel(realm) + '还没有账号',
-        desc: '账号池里没有属于这个版本的账号，其它版本的账号不会显示在这里。可以切换右上角「查看的版本」，或者登录一个该版本的账号。',
-        action: html`<button class="btn btn-primary btn-sm" @click=${() => openAddAccountDialog({ realm })}>${icon('UserPlus')}添加账号</button>`,
+        title: spaceMixed(channelLabel(realm) + '还没有账号'),
+        desc: '添加账号后，网关才能通过这个渠道转发请求。',
+        action: addAction,
       });
     }
     return emptyState({
       icon: 'SearchX',
       title: '没有匹配的账号',
-      desc: '换个关键词，或者把状态筛选切回「全部」，已停用的账号需要在「已停用」里查看。',
+      desc: '换个关键词，或者把状态筛选切回「全部」。',
       action: html`<button class="btn btn-outline btn-sm" @click=${() => {
         S.query = '';
         S.filter = 'all';
@@ -377,9 +449,10 @@ export function accountView(S, h) {
                 <th>状态</th>
                 <th>积分</th>
                 <th>访问令牌有效期</th>
-                <th>出口</th>
+                <th>代理槽</th>
                 <th>身份</th>
                 <th>优先级</th>
+                <th>权重</th>
                 <th>并发上限</th>
                 <th class="right">用量</th>
                 <th class="actions">操作</th>
@@ -398,7 +471,7 @@ export function accountView(S, h) {
         })}
         <div class="card-note">
           ${icon('Info')}
-          <span class="grow">${logic.IDENTITY_TIP}多个账号按会话粘性与轮询使用，某个账号被上游拒绝时自动切到下一个。</span>
+          <span class="grow">${logic.IDENTITY_TIP}</span>
         </div>
       </div>`;
   }
@@ -406,32 +479,36 @@ export function accountView(S, h) {
   function headerActions(realm) {
     const acts = logic.realmActions(realm);
     return html`
-      <button class="btn btn-primary btn-sm" @click=${() => openAddAccountDialog({ realm })}>${icon('UserPlus')}添加账号</button>
-      <button class="btn btn-outline btn-sm" title="直接向腾讯查询各账号当前积分，上游缓存的积分可能滞后数小时"
+      <button class="btn btn-primary btn-sm"
+              @click=${() => openAccountDialog(realm)}>${icon('UserPlus')}添加账号</button>
+      <button class="btn btn-outline btn-sm" title="直接向上游查询各账号当前积分"
               @click=${busyClick(h.refreshCredits)}>${icon('RefreshCw')}刷新积分</button>
       ${acts.checkin ? html`
-        <button class="btn btn-outline btn-sm" title="为每个国内版账号领取当天的 Buddy 加油站积分"
-                @click=${busyClick(h.doCheckin)}>${icon('Fuel')}${activity.BUDDY_LABEL}签到</button>` : nothing}
+        <button class="btn btn-outline btn-sm" title="为当前渠道已启用账号各签到一次"
+                @click=${busyClick(h.doCheckin)}>${icon(acts.checkin === 'buddy' ? 'Fuel' : 'CalendarCheck')}${activity.checkinLabel(acts.checkin)}</button>` : nothing}
       ${acts.dailyChat ? html`
-        <button class="btn btn-outline btn-sm" title="今天还没打卡的已启用国际版账号；已经打过的不再打第二遍"
-                @click=${busyClick(h.doDailyChatPending)}>${icon('CalendarCheck')}未活跃账号一键打卡</button>` : nothing}
-      ${acts.dailyChatWeb ? html`
-        <button class="btn btn-outline btn-sm" title="只建网页端会话，官方每日活跃只认网页端对话；会消耗少量积分"
+        <button class="btn btn-outline btn-sm" title="今天还没打卡的已启用账号"
+                @click=${busyClick(h.doDailyChatPending)}>${icon('CalendarCheck')}未活跃账号一键打卡</button>
+        <button class="btn btn-outline btn-sm" title="只建网页端会话，会消耗少量积分"
                 @click=${h.doDailyChatWeb}>${icon('Globe')}网页通道打卡</button>` : nothing}
       <div class="menu">
         <button class="btn btn-outline btn-sm menu-toggle" aria-haspopup="menu" aria-expanded=${S.menuOpen ? 'true' : 'false'}
                 @click=${() => (S.menuOpen ? h.closeMenu() : h.openMenu())}>${icon('Ellipsis')}更多</button>
         ${S.menuOpen ? html`
           <div class="menu-panel" role="menu">
-            <button class="menu-item" role="menuitem" @click=${busyClick(h.menuAction(h.exportAll))}>${icon('Download')}导出账号</button>
-            <button class="menu-item" role="menuitem" @click=${h.menuAction(() => openImportDialog({ onDone: () => h.refresh() }))}>${icon('Upload')}导入账号</button>
-            <button class="menu-item" role="menuitem" title="为尚未绑定出口的已启用账号依次分配已启用的代理槽，已有绑定的账号不受影响"
-                    @click=${busyClick(h.menuAction(h.assignSlots))}>${icon('Network')}分配代理出口给未绑定账号</button>
+            ${acts.bulkExport ? html`
+              <button class="menu-item" role="menuitem" @click=${busyClick(h.menuAction(h.exportAll))}>${icon('Download')}导出账号</button>` : nothing}
+            ${acts.bulkImport ? html`
+              <button class="menu-item" role="menuitem" @click=${h.menuAction(() => openImportDialog({ onDone: () => h.refresh() }))}>${icon('Upload')}导入账号</button>` : nothing}
+            ${acts.assignSlots ? html`
+              <button class="menu-item" role="menuitem" title="为未绑定代理槽的已启用账号分配槽位，已有绑定保持不变"
+                      @click=${busyClick(h.menuAction(h.assignSlots))}>${icon('Network')}分配代理槽给未绑定账号</button>` : nothing}
             <button class="menu-item" role="menuitem" title="在账号列里显示或隐藏每个账号的 UID 与凭据文件名"
                     @click=${h.menuAction(h.toggleTech)}>${icon(S.showTech ? 'EyeOff' : 'Eye')}${S.showTech ? '隐藏技术信息' : '显示技术信息'}</button>
-            <div class="menu-sep"></div>
-            <button class="menu-item" role="menuitem" @click=${busyClick(h.menuAction(() => h.setAll(true)))}>${icon('CircleCheck')}全部启用</button>
-            <button class="menu-item tone-danger" role="menuitem" @click=${busyClick(h.menuAction(() => h.setAll(false)))}>${icon('Ban')}全部停用</button>
+            ${acts.bulkToggle ? html`
+              <div class="menu-sep"></div>
+              <button class="menu-item" role="menuitem" @click=${busyClick(h.menuAction(() => h.setAll(true)))}>${icon('CircleCheck')}全部启用</button>
+              <button class="menu-item tone-danger" role="menuitem" @click=${busyClick(h.menuAction(() => h.setAll(false)))}>${icon('Ban')}全部停用</button>` : nothing}
           </div>` : nothing}
       </div>`;
   }
@@ -441,26 +518,31 @@ export function accountView(S, h) {
     const now = Date.now();
     const visible = logic.accountsForRealm(S.accounts, realm);
     const counts = logic.groupCounts(visible, now);
-    const selected = logic.selectAccounts(visible, { query: S.query, filter: S.filter, sort: S.sort }, now);
+    const groups = logic.accountGroups(visible);
+    if (S.group && !groups.includes(S.group)) S.group = '';
+    const selected = logic.selectAccounts(visible, {
+      query: S.query, filter: S.filter, sort: S.sort, group: S.group,
+    }, now);
     const page = logic.paginate(selected, S.page);
     S.page = page.page;
     const kind = logic.emptyKind(S.accounts, visible, selected);
     const firstScreen = S.loading && !S.accounts.length;
+    // 停用状态属于某个提供方，只在同一个提供方的渠道上显示这张卡。
+    const standDown = !!S.standDown && S.standDown.active
+      && S.standDown.provider === channelProvider(realm);
     return html`
       <div class="page">
         ${pageHeader({
           path: 'accounts',
           title: '账号管理',
-          desc: realm === 'cn'
-            ? '国内版账号池：访问令牌有效期、积分、Buddy 加油站与连通性'
-            : '国际版账号池：访问令牌有效期、积分、出口线路与连通性',
+          desc: spaceMixed(channelLabel(realm) + '账号池的状态与用量。'),
           actions: headerActions(realm),
         })}
         ${S.error ? loadErrorPage(S.error, h.refresh) : nothing}
         ${!S.error && S.partial ? loadErrorInline(S.partial, h.refresh) : nothing}
-        ${S.standDown && S.standDown.active ? standDownCard() : nothing}
+        ${standDown ? standDownCard() : nothing}
         ${!S.error && visible.length ? activityCards(realm) : nothing}
-        ${!S.error && visible.length ? filterCard(counts) : nothing}
+        ${!S.error && visible.length ? filterCard(counts, groups) : nothing}
         ${firstScreen ? skeletonRows(6) : nothing}
         ${!firstScreen && !S.error ? listCard(page, kind, now) : nothing}
       </div>`;

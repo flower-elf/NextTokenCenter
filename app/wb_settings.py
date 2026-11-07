@@ -10,7 +10,15 @@ import secrets
 import threading
 import time
 
+import wb_channels
 import wb_cost
+
+# 面板不再读取的显示偏好：旧设置文件里的值在下次写入时清掉，不让它们继续占着
+# settings.json。
+RETIRED_SETTINGS_KEYS = (
+    "accounts_collapsed", "accounts_separate_tab", "key_before_hidden",
+    "hidden_pages", "section_max_height", "ui_language",
+)
 
 DEFAULT_PANEL_PASSWORD = "admin"
 PBKDF2_ROUNDS = 120_000
@@ -33,49 +41,12 @@ MAX_PRICING_REFRESH_MINUTES = 24 * 30 * 60
 DEFAULT_CREDITS_REFRESH_HOURS = 12.0
 MAX_CREDITS_REFRESH_HOURS = 24 * 30
 CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
-# 面板窗口高度上限，单位像素：超过该值的看板分区内部滚动、标题行固定，
-# 不把整页撑高。0 表示不限制。默认值略高于日志终端自身的 620px，用户调小
-# 之前终端不受影响。
-SECTION_MAX_HEIGHT_KEY = "section_max_height"
-DEFAULT_SECTION_MAX_HEIGHT = 640
-MAX_SECTION_MAX_HEIGHT = 4000
 # 模型名可否从去掉后缀的基名继承价格，例如 `deepseek-r1-0528-lkeap` 继承
 # `deepseek-r1-0528`。缺失键读作开。
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
 # OpenRouter 价格估算功能的总开关。缺失键读作开：未设置过的安装行为不变，
 # 只有显式 false 才关闭整个功能。
 PRICING_ENABLED_KEY = "pricing_enabled"
-# 面板账号区是否折叠。缺失键或任何非布尔 true 的值都读作展开：新安装、手改
-# 文件或旧客户端留下的值都保持默认视图，只有显式 true 才隐藏账号区。
-ACCOUNTS_COLLAPSED_KEY = "accounts_collapsed"
-# 面板的按 Key 用量表是否折叠 `(切换前)` 行。与上一个开关相同的归一化：
-# 只有显式布尔 true 才隐藏，手改文件或旧客户端不会意外收起该行。
-KEY_BEFORE_HIDDEN_KEY = "key_before_hidden"
-# 面板顶栏隐藏的页面集合，元素为页面键，例如 "tasks"、"logs"。这里不按页面
-# 注册表校验：页面定义在 dashboard 前端，未知键会被面板忽略，因此上游新增或
-# 重命名页面无需改动这里。缺失键、手写字符串或其他畸形值都读作“不隐藏任何
-# 页面”，这是显示偏好的安全方向。
-HIDDEN_PAGES_KEY = "hidden_pages"
-# 页面键即 switchMainTab() 使用的全小写标识。
-PAGE_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
-# 无论请求或文件怎么写都不会隐藏的页面：该开关本身就在这里，隐藏后面板无法
-# 再进入设置。归一化时直接丢弃，因此存储文件也无法保留它，任何 API 客户端都
-# 不会把自己锁在外面。
-PAGE_KEEP_VISIBLE = "settings"
-# 存储列表的上限。面板每页最多提交一项，这里只限制手改文件写入的数量。
-MAX_HIDDEN_PAGES = 32
-# 面板账号区是否独占一个主标签页。缺失键或任何非布尔 true 的值都读作关：未
-# 设置过的安装保持原有的单个“网关与账号”标签，只有显式 true 才拆成
-# 网关 + 账号。与上面几个开关相同的 `is True` 归一化，手改的 "false"、1 或
-# 对象都不会意外拆分导航。
-ACCOUNTS_SEPARATE_TAB_KEY = "accounts_separate_tab"
-
-# 实例级默认界面语言。面板可按浏览器用 localStorage 覆盖，没有覆盖时使用
-# 这里的值。
-UI_LANGUAGE_KEY = "ui_language"
-UI_LANGUAGE_DEFAULT = "zh"
-UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
-
 # 网关是否按间隔自动检查 GitHub 新版本。缺失键读作关，与上面几个开关相反，
 # 因为开启后网关会按自己的计划发送请求。
 UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
@@ -200,6 +171,9 @@ def _write_atomic(accounts_dir, path, tmp, data):
 def save(accounts_dir, data):
     """原子写入，进程崩溃不会留下写了一半的设置文件。临时文件名带上 pid 与线程 id，
     两个写方不会共用同一个临时文件；目录只建一次，os.makedirs 每次都会 stat 整条路径。"""
+    if any(key in data for key in RETIRED_SETTINGS_KEYS):
+        data = {key: value for key, value in data.items()
+                if key not in RETIRED_SETTINGS_KEYS}
     with _lock:
         if accounts_dir not in _SAVED_DIRS:
             os.makedirs(accounts_dir, exist_ok=True)
@@ -315,14 +289,6 @@ def api_key_override(accounts_dir):
     return str(data.get("api_key") or ""), True
 
 
-def set_api_key(accounts_dir, key):
-    with _lock:
-        data = load(accounts_dir)
-        data["api_key"] = key or ""
-        data["api_key_set"] = True
-        save(accounts_dir, data)
-
-
 def ensure_launcher_key(accounts_dir):
     """返回持久化的局域网 Key，首次使用时生成。局域网模式绝不能自带众所周知默认值：网关
     消耗的是账号自己的上游额度，同一网络中的任何人都能把它耗光。返回 key 与是否新建。"""
@@ -338,10 +304,76 @@ def ensure_launcher_key(accounts_dir):
 
 
 # --------------------------------------------------------------- API keys
-# 每个 Key 可绑定一个上游出口域，多个客户端能同时走不同出口，不必共用全局
-# 切换。
+# 每个 Key 可以绑定自己的路由，多个客户端能同时走不同渠道，不必共用面板默认路由。
 
-REALMS = ("", "intl", "cn")
+
+def codearts_config(accounts_dir):
+    """CodeArts 配置的薄包装，避免 wb_settings 与 wb_codearts 的模块级循环。"""
+    import wb_codearts
+    return wb_codearts.load_config(accounts_dir)
+
+
+def set_codearts_config(accounts_dir, patch):
+    import wb_codearts
+    return wb_codearts.save_config(accounts_dir, patch)
+
+
+def codearts_configured(accounts_dir):
+    import wb_codearts
+    return wb_codearts.configured(accounts_dir)
+
+
+MEDIA_DEFAULTS = {
+    "enabled": False,
+    "realm": "cn",
+    "identity": "workbuddy",
+    "image_max_per_minute": 10,
+    "video_max_seconds": 60,
+    "daily_credits_per_key": 0,
+    "video_concurrency": 3,
+}
+MEDIA_REALMS = ("intl", "cn")
+# 媒体端点沿用 WorkBuddy 的出站身份，取值来自渠道登记表，面板与账号页共用一份。
+MEDIA_IDENTITIES = tuple(item["value"] for item in wb_channels.WORKBUDDY_IDENTITIES)
+
+
+def media_config(accounts_dir):
+    """媒体生成的开关与限额；非法值回落默认，不影响网关启动。"""
+    data = load(accounts_dir)
+    raw = data.get("media") if isinstance(data.get("media"), dict) else {}
+    out = dict(MEDIA_DEFAULTS)
+    out["enabled"] = raw.get("enabled") is True
+    realm = str(raw.get("realm") or out["realm"]).strip().lower()
+    out["realm"] = realm if realm in MEDIA_REALMS else MEDIA_DEFAULTS["realm"]
+    identity = str(raw.get("identity") or out["identity"]).strip().lower()
+    out["identity"] = (identity if identity in MEDIA_IDENTITIES
+                       else MEDIA_DEFAULTS["identity"])
+    for key, low, high in (
+            ("image_max_per_minute", 1, 120),
+            ("video_max_seconds", 1, 600),
+            ("daily_credits_per_key", 0, 1000000),
+            ("video_concurrency", 1, 20)):
+        try:
+            value = int(raw.get(key, out[key]))
+        except (TypeError, ValueError):
+            value = out[key]
+        out[key] = max(low, min(high, value))
+    return out
+
+
+def set_media_config(accounts_dir, patch):
+    if not isinstance(patch, dict):
+        raise ValueError("media settings must be an object")
+    with _lock:
+        data = load(accounts_dir)
+        current = media_config(accounts_dir)
+        merged = dict(current)
+        for key in MEDIA_DEFAULTS:
+            if key in patch:
+                merged[key] = patch[key]
+        data["media"] = merged
+        save(accounts_dir, data)
+    return media_config(accounts_dir)
 
 
 def clean_model_patterns(value):
@@ -550,9 +582,13 @@ def _clean_key_entry(entry):
     deleted_at = str(entry.get("deleted_at") or "").strip()
     if not key and not deleted_at:
         return None
-    realm = str(entry.get("realm") or "").strip().lower()
-    if realm not in REALMS:
-        realm = ""
+    raw_route = entry.get("route")
+    if raw_route is None:
+        # 旧版本按 realm 绑定 Key；没有 route 时把它迁成单渠道路由，不能静默
+        # 回落成「跟随面板默认路由」。
+        legacy = str(entry.get("realm") or "").strip().lower()
+        raw_route = [legacy] if legacy in wb_channels.ids() else None
+    route = list(wb_channels.parse_route(raw_route))
     try:
         concurrency = int(entry.get("concurrency_limit") or entry.get("max_concurrency") or 0)
     except (TypeError, ValueError):
@@ -562,7 +598,8 @@ def _clean_key_entry(entry):
         "id": str(entry.get("id") or secrets.token_hex(6)),
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
-        "realm": realm,
+        # 空列表表示跟随面板默认路由
+        "route": route,
         "models": clean_model_patterns(entry.get("models")),
         "concurrency_limit": concurrency,
         "enabled": False if deleted_at else entry.get("enabled", True) is not False,
@@ -632,7 +669,7 @@ def api_keys(accounts_dir, include_deleted=False):
                 "id": "legacy",
                 "name": "默认（跟随面板切换）",
                 "key": legacy,
-                "realm": "",
+                "route": [],
                 "models": [],
                 "enabled": True,
                 "created_at": "",
@@ -652,7 +689,7 @@ def _retired_key_entry(old):
         "id": old["id"],
         "name": old["name"],
         "key": "",
-        "realm": old.get("realm") or "",
+        "route": old.get("route") or [],
         "models": old.get("models") or [],
         "enabled": False,
         "created_at": old.get("created_at") or "",
@@ -743,7 +780,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "id": "launcher",
                 "name": "启动参数",
                 "key": candidate,
-                "realm": "",
+                "route": [],
                 "models": [],
                 "enabled": True,
                 "source": "launcher",
@@ -765,13 +802,14 @@ def set_auth_disabled(accounts_dir, disabled):
 
 
 # ------------------------------------------------------------------ limits
-# 几个守卫形状相同：一个覆盖两个出口域的全局默认值，加一个可选的按域覆盖。
+# 几个守卫形状相同：一个覆盖全部渠道的全局默认值，加一个可选的按渠道覆盖。
 # 覆盖留空即继承全局值，从未设置过的安装行为不变；设置过的安装每个守卫只需
 # 关心一个数字。
 LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
               "daily_credit_limit", "model_daily_token_limit",
               "expiring_window_days")
-LIMIT_REALMS = ("intl", "cn")
+# 账号池守卫对每个渠道各自可覆盖：渠道登记表增加入口时这里自动跟上。
+LIMIT_REALMS = tuple(wb_channels.ids())
 LIMIT_SCOPES = ("global",) + LIMIT_REALMS
 LIMITS_KEY = "limits"
 
@@ -789,7 +827,10 @@ def _default_global(key):
 
 def _empty_limit_entry(key=None):
     """一个守卫：全局默认值加每个出口域的槽位，None 表示继承。"""
-    return {"global": _default_global(key), "intl": None, "cn": None}
+    entry = {"global": _default_global(key)}
+    for realm in LIMIT_REALMS:
+        entry[realm] = None
+    return entry
 
 
 def _coerce_global(value):
@@ -833,19 +874,18 @@ def _normalize_limits(raw):
     仍读回完整形状。"""
     limits = {}
     for key in LIMIT_KEYS:
-        entry = raw.get(key)
-        if not isinstance(entry, dict):
-            entry = {}
-        global_raw = entry.get("global")
+        stored = raw.get(key)
+        if not isinstance(stored, dict):
+            stored = {}
+        global_raw = stored.get("global")
         # 缺失的全局值回落到该守卫自己的默认值，除临期窗口外都是 0；显式 0
         # 是真正的关闭，按关闭保留，保存过的关闭不会静默变回开启。
         global_value = (_default_global(key) if global_raw is None
                         else _coerce_global(global_raw))
-        limits[key] = {
-            "global": global_value,
-            "intl": _coerce_override(entry.get("intl")),
-            "cn": _coerce_override(entry.get("cn")),
-        }
+        entry = {"global": global_value}
+        for realm in LIMIT_REALMS:
+            entry[realm] = _coerce_override(stored.get(realm))
+        limits[key] = entry
     return limits
 
 
@@ -874,7 +914,7 @@ def limits_snapshot(accounts_dir):
 
 
 def limit_value(accounts_dir, key, realm=None):
-    """某个守卫在一个出口域的生效值。realm 为空时返回全局默认值，intl/cn 覆盖存在时优先；
+    """某个守卫在一个渠道的生效值。realm 为空时返回全局默认值，该渠道的覆盖存在时优先；
     未知键读作 0 即关闭，笔误不会卡住请求路径。"""
     entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
     if realm in LIMIT_REALMS:
@@ -907,8 +947,8 @@ def limit_values(accounts_dir, key):
 
 
 def set_limit(accounts_dir, key, scope, value):
-    """保存某个守卫在某个作用域的取值，返回存储的条目。scope 为 global、intl 或 cn；
-    None 或空值把 intl/cn 覆盖清回继承，global 槽位始终存数字。"""
+    """保存某个守卫在某个作用域的取值，返回存储的条目。scope 为 global 或任一渠道 id；
+    None 或空值把渠道覆盖清回继承，global 槽位始终存数字。"""
     if key not in LIMIT_KEYS:
         raise ValueError("unknown limit: %s" % key)
     if scope not in LIMIT_SCOPES:
@@ -1006,37 +1046,6 @@ def set_credits_refresh_hours(accounts_dir, value):
         hours = 0.0
     hours = max(0.0, min(MAX_CREDITS_REFRESH_HOURS, hours))
     return _store(accounts_dir, CREDITS_REFRESH_HOURS_KEY, hours)
-
-
-def section_max_height(accounts_dir):
-    """面板窗口高度上限，单位像素；0 表示不限制。任何非整数都回落到默认值，超过
-    MAX_SECTION_MAX_HEIGHT 的值被夹紧而非拒绝。bool 特意先检查：它是 int 的子类，
-    否则 True 会读成 1px 上限。"""
-    with _lock:
-        raw = load(accounts_dir).get(SECTION_MAX_HEIGHT_KEY)
-    if isinstance(raw, bool):
-        return DEFAULT_SECTION_MAX_HEIGHT
-    try:
-        value = int(raw)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError 单独处理：json.loads 会把 1e400 变成 inf，int(inf)
-        # 会抛它，一行坏数据不该让设置页返回 500。
-        return DEFAULT_SECTION_MAX_HEIGHT
-    if value < 0:
-        return DEFAULT_SECTION_MAX_HEIGHT
-    return min(value, MAX_SECTION_MAX_HEIGHT)
-
-
-def set_section_max_height(accounts_dir, value):
-    if isinstance(value, bool):
-        number = DEFAULT_SECTION_MAX_HEIGHT
-    else:
-        try:
-            number = int(value)
-        except (TypeError, ValueError, OverflowError):
-            number = DEFAULT_SECTION_MAX_HEIGHT
-    number = max(0, min(MAX_SECTION_MAX_HEIGHT, number))
-    return _store(accounts_dir, SECTION_MAX_HEIGHT_KEY, number)
 
 
 def _clamp_refresh_minutes(value):
@@ -1137,30 +1146,6 @@ def cost_estimate(accounts_dir):
 
 def set_cost_estimate(accounts_dir, raw):
     return _store(accounts_dir, COST_ESTIMATE_KEY, wb_cost.clean(raw))
-
-
-def ui_language(accounts_dir):
-    """实例级默认界面语言，取值为 zh、zh-Hant 或 en。"""
-    value = load(accounts_dir).get(UI_LANGUAGE_KEY)
-    if isinstance(value, str) and value in UI_LANGUAGE_VALUES:
-        return value
-    return UI_LANGUAGE_DEFAULT
-
-
-def set_ui_language(accounts_dir, value):
-    if not isinstance(value, str) or value not in UI_LANGUAGE_VALUES:
-        raise ValueError("ui_language must be zh, zh-Hant or en")
-    return _store(accounts_dir, UI_LANGUAGE_KEY, value)
-
-
-def smart_routing(accounts_dir):
-    """没有绑定的对话是否由评分选择放置账号，默认开启。评分选择把新对话交给额度即将到期
-    且当前最空闲的账号；只影响对话的第一次选择，已绑定的对话保持原账号，前缀缓存不受影响。"""
-    return _bool_setting(accounts_dir, "smart_routing", True)
-
-
-def set_smart_routing(accounts_dir, enabled):
-    return _set_flag(accounts_dir, "smart_routing", enabled)
 
 
 def session_affinity(accounts_dir):
@@ -1889,39 +1874,119 @@ def _clean_model_ids(raw):
     return out
 
 
-def disabled_models(accounts_dir):
-    """面板已关闭的模型 id，这些模型的请求不会被服务。"""
-    return _clean_model_ids(load(accounts_dir).get("disabled_models"))
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-def set_disabled_models(accounts_dir, models):
-    """保存已关闭的模型 id，保留每个 id 的首次拼写。"""
-    return _store(accounts_dir, "disabled_models", _clean_model_ids(models))
+def _clean_model_aliases(raw):
+    """归一模型别名表：源 id -> 通告 id。键值去空白，丢弃自指与非字符串条目。"""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for source, target in raw.items():
+        if not isinstance(source, str) or not isinstance(target, str):
+            continue
+        source = source.strip()
+        target = target.strip()
+        if source and target and source.lower() != target.lower():
+            out[source] = target
+    return out
 
 
-def model_served(accounts_dir, model):
-    """面板关闭了该模型 id 时返回 False。"""
+def parse_model_aliases(value):
+    """校验 /settings/save 的 model_aliases，返回 (别名表, 错误)。
+    别名只允许一层：通告 id 不能再是别名的源 id，同一个源 id 只能出现一次。"""
+    if not isinstance(value, dict):
+        return None, "model_aliases must be an object of source id -> announced id"
+    out = {}
+    sources = set()
+    for source, target in value.items():
+        if not isinstance(source, str) or not isinstance(target, str):
+            return None, "model_aliases keys and values must be strings"
+        source = source.strip()
+        target = target.strip()
+        for mid in (source, target):
+            if not MODEL_ID_RE.match(mid):
+                return None, ("model id %r may only contain letters, digits, dot, "
+                              "colon, hyphen and underscore" % mid)
+        if source.lower() == target.lower():
+            return None, "model alias %s points to itself" % source
+        if source.lower() in sources:
+            return None, "model alias source %s is listed twice" % source
+        sources.add(source.lower())
+        out[source] = target
+    for target in out.values():
+        if target.lower() in sources:
+            return None, ("announced id %s is also an alias source; aliases "
+                          "allow one level only" % target)
+    return out, ""
+
+
+def model_aliases(accounts_dir):
+    """模型别名表，键是上游目录里的源 id，值是对客户端通告的 id。"""
+    return _clean_model_aliases(load(accounts_dir).get("model_aliases"))
+
+
+def set_model_aliases(accounts_dir, aliases):
+    return _store(accounts_dir, "model_aliases", _clean_model_aliases(aliases))
+
+
+def _disabled_key(realm):
+    # 关闭名单按提供方分：同一提供方的渠道目录相同，共用一份名单。
+    return wb_channels.provider(realm).disabled_key
+
+
+def disabled_models(accounts_dir, realm=""):
+    """面板在该出口关闭的模型 id，这些模型的请求不会被服务。"""
+    return _clean_model_ids(load(accounts_dir).get(_disabled_key(realm)))
+
+
+def set_disabled_models(accounts_dir, models, realm=""):
+    """保存该出口已关闭的模型 id，保留每个 id 的首次拼写。"""
+    return _store(accounts_dir, _disabled_key(realm), _clean_model_ids(models))
+
+
+def set_model_enabled(accounts_dir, realm, model, enabled):
+    """在该出口开启或关闭一个模型，返回更新后的名单。只改这一项，
+    不会用页面上的局部清单覆盖其他模型的状态。"""
+    want = str(model or "").strip()
+    with _lock:
+        current = disabled_models(accounts_dir, realm)
+        kept = [m for m in current if m.lower() != want.lower()]
+        if not enabled:
+            kept.append(want)
+        return set_disabled_models(accounts_dir, kept, realm)
+
+
+def model_served(accounts_dir, model, realm=""):
+    """面板在该出口关闭了该模型 id 时返回 False。"""
     if not model:
         return True
     want = str(model).strip().lower()
-    return all(str(entry).strip().lower() != want for entry in disabled_models(accounts_dir))
+    return all(str(entry).strip().lower() != want
+               for entry in disabled_models(accounts_dir, realm))
 
 
-def excluded_seen(accounts_dir):
-    """默认排除已经应用过的模型 id。目录里被筛选规则丢掉的模型默认加入停止名单；这份
-    记录保证操作者把它们重新勾选之后，下一次加载不会又关掉。"""
-    return _clean_model_ids(load(accounts_dir).get("excluded_seen"))
+def _excluded_seen_key(realm):
+    # 默认排除的记录跟关闭名单一样按提供方分，同名模型在不同提供方各自只默认关一次。
+    return wb_channels.provider(realm).excluded_seen_key
 
 
-def remember_excluded(accounts_dir, models):
+def excluded_seen(accounts_dir, realm=""):
+    """默认排除已经应用过的模型 id。默认排除的模型加入停止名单；这份记录保证操作者把它们
+    重新勾选之后，下一次加载不会又关掉。"""
+    return _clean_model_ids(load(accounts_dir).get(_excluded_seen_key(realm)))
+
+
+def remember_excluded(accounts_dir, models, realm=""):
     """记下已经应用过默认排除的模型，返回整份记录。"""
+    key = _excluded_seen_key(realm)
     with _lock:
         data = load(accounts_dir)
-        seen = _clean_model_ids(data.get("excluded_seen"))
+        seen = _clean_model_ids(data.get(key))
         for model in _clean_model_ids(models):
             if model not in seen:
                 seen.append(model)
-        data["excluded_seen"] = seen
+        data[key] = seen
         save(accounts_dir, data)
     return seen
 
@@ -1943,55 +2008,6 @@ def set_messages_format(accounts_dir, value):
     if value not in MESSAGES_FORMATS:
         value = DEFAULT_MESSAGES_FORMAT
     return _store(accounts_dir, "messages_format", value)
-
-
-def accounts_collapsed(accounts_dir):
-    """面板账号区是否折叠。只有存储值为布尔 true 时才折叠：手改的 "false"、1、对象或
-    缺失键都读作展开，任何一个都不会意外隐藏账号区。"""
-    return _bool_setting(accounts_dir, ACCOUNTS_COLLAPSED_KEY, False)
-
-
-def set_accounts_collapsed(accounts_dir, collapsed):
-    return _set_flag(accounts_dir, ACCOUNTS_COLLAPSED_KEY, collapsed)
-
-
-def key_before_hidden(accounts_dir):
-    """按 Key 用量表是否折叠 `(切换前)` 行。只有存储值为布尔 true 时才隐藏，归一化与
-    accounts_collapsed 相同：该行是有价值的历史，手改的 "false"、1、对象或缺失键都必须
-    让它保持可见。"""
-    return _bool_setting(accounts_dir, KEY_BEFORE_HIDDEN_KEY, False)
-
-
-def set_key_before_hidden(accounts_dir, hidden):
-    return _set_flag(accounts_dir, KEY_BEFORE_HIDDEN_KEY, hidden)
-
-
-def _clean_page_keys(value):
-    """把存储或提交的页面列表归一化为干净的键列表。不是合法键列表的值直接丢弃而非拒绝，
-    显示偏好的安全方向是“不隐藏任何页面”；重复项与超长列表会被压缩。"""
-    if not isinstance(value, (list, tuple)):
-        return []
-    out = []
-    for item in value:
-        if not isinstance(item, str):
-            continue
-        key = item.strip()
-        if not PAGE_KEY_RE.match(key) or key == PAGE_KEEP_VISIBLE or key in out:
-            continue
-        out.append(key)
-        if len(out) >= MAX_HIDDEN_PAGES:
-            break
-    return out
-
-
-def hidden_pages(accounts_dir):
-    """面板顶栏隐藏的页面，新安装为空。每次读取都归一化，手改文件写入字符串、未知键或
-    重复项时，页面不会被重复隐藏，也不会隐藏面板之后无法恢复的页面。"""
-    return _clean_page_keys(load(accounts_dir).get(HIDDEN_PAGES_KEY))
-
-
-def set_hidden_pages(accounts_dir, pages):
-    return _store(accounts_dir, HIDDEN_PAGES_KEY, _clean_page_keys(pages))
 
 
 #: 定时任务在账号之间随机等待的上下限：下限固定 2 秒，上限可由面板调整。
@@ -2022,6 +2038,9 @@ def set_task_jitter_max(accounts_dir, value):
 
 SCHEDULER_GROUPS = ("checkin", "travel", "keepalive", "cat")
 SCHEDULER_ENABLED_KEY = "scheduler_enabled"
+#: WorkBuddy 的「定时任务」开关：关闭后调度器不再为该提供方跑签到、活跃上报、
+#: 旅行、夜猫与每日活跃对话；令牌保活不受影响。缺失键读作开。
+WORKBUDDY_TASKS_AUTO_KEY = "workbuddy_tasks_auto"
 DEFAULT_SCHEDULER_HOURS = {
     "checkin": [9, 21],
     "travel": [9, 21],
@@ -2037,6 +2056,15 @@ def scheduler_enabled(accounts_dir):
 
 def set_scheduler_enabled(accounts_dir, enabled):
     return _set_flag(accounts_dir, SCHEDULER_ENABLED_KEY, enabled)
+
+
+def workbuddy_tasks_auto(accounts_dir):
+    """WorkBuddy 定时任务开关，默认打开；与 CodeArts 的 credits_auto_claim 同义。"""
+    return _flag(accounts_dir, WORKBUDDY_TASKS_AUTO_KEY, True)
+
+
+def set_workbuddy_tasks_auto(accounts_dir, enabled):
+    return _set_flag(accounts_dir, WORKBUDDY_TASKS_AUTO_KEY, enabled)
 
 
 def _strict_hours(value, group):
@@ -2102,16 +2130,6 @@ def set_scheduler_hours(accounts_dir, hours):
     if not any(cleaned.values()):
         raise ValueError("至少保留一个整点；要关闭调度器请使用调度器总开关")
     return _store(accounts_dir, "scheduler_hours", cleaned)
-
-
-def accounts_separate_tab(accounts_dir):
-    """面板账号区是否独占一个主标签页。只有存储值为布尔 true 时才拆分，归一化与上面的
-    显示开关相同：合并的“网关与账号”标签是默认界面，手改值都不会意外拆分导航。"""
-    return _bool_setting(accounts_dir, ACCOUNTS_SEPARATE_TAB_KEY, False)
-
-
-def set_accounts_separate_tab(accounts_dir, separate):
-    return _set_flag(accounts_dir, ACCOUNTS_SEPARATE_TAB_KEY, separate)
 
 
 def update_check_enabled(accounts_dir):

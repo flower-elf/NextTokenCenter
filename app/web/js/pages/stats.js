@@ -5,12 +5,13 @@ import { html, render, nothing, ref, createRef } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { getJSON } from '../core/api.js';
 import { getState } from '../core/store.js';
-import { fmtNumber, fmtCompact, fmtCredit, fmtNumberDash, fmtPercent, fmtLatency } from '../core/format.js';
+import { fmtNumber, fmtCompact, fmtCredit, fmtNumberDash, fmtPercent, fmtLatency, spaceMixed } from '../core/format.js';
 import { pageHeader, statCard, segmented, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock } from '../ui/widgets.js';
 import { createChartHost } from '../ui/chart.js';
 import {
   rangeLabel, scopeText, trendGranularity, TREND_MODES, trendSeries,
-  accountRows, keyRows, idleKeyNames, matrixOptions, reconcileFilters,
+  accountRows, keyRows, idleKeyNames, matrixOptions, reconcileFilters, creditKnown,
+  creditCollected, monthCreditState, withAccountIndex,
 } from './stats/logic.js';
 import { tripleTokens, accountTable, keyTable, matrixTable } from './stats/tables.js';
 import { createRangeControls } from './stats/range.js';
@@ -28,6 +29,7 @@ export function mount(host) {
   let perf = null;
   let trend = null;
   let month = null;
+  let accounts = null;
   let missing = [];
   let fatal = '';
   let phase = 'loading';
@@ -47,6 +49,7 @@ export function mount(host) {
     else if (key === 'perf') perf = value;
     else if (key === 'trend') trend = value;
     else if (key === 'month') month = value;
+    else if (key === 'accounts') accounts = value.accounts || [];
   }
 
   async function load() {
@@ -62,6 +65,8 @@ export function mount(host) {
         label: '本月积分',
         url: '/usage/month-credit?realm=' + encodeURIComponent(rangeCtl.realm()),
       },
+      // 账号的昵称、区域与余额以统一账号视图为准，补上分析数据里缺失的字段。
+      { key: 'accounts', label: '账号', url: '/accounts?realm=all' },
     ];
     const settled = await Promise.allSettled(jobs.map((job) => getJSON(job.url)));
     if (mine !== seq) return;
@@ -79,7 +84,7 @@ export function mount(host) {
       // 数据变了以后，找不到的筛选项就地清掉，避免筛选出一张永远空白的表。
       // 用量明细这一份没取到时不清理：那一份的失败不代表筛选项已经消失。
       if (usage) {
-        const options = matrixOptions(usage);
+        const options = matrixOptions(withAccountIndex(usage, accounts));
         filters = reconcileFilters(filters, options);
       }
     }
@@ -121,8 +126,13 @@ export function mount(host) {
     const tokenHint = win
       ? html`${tripleTokens(win.prompt_tokens, win.completion_tokens, win.reasoning_tokens)}<br>全部 ${fmtCompact(all.total_tokens || 0)}`
       : '用量总览未读取到';
+    const creditKnownWin = creditKnown(win && win.credit) && creditCollected(win);
+    const creditKnownAll = creditKnown(all && all.credit);
+    const monthState = monthCreditState(month);
     const creditHint = win
-      ? html`全部 ${fmtCredit(all.credit || 0)} 积分<br>平均每次请求 ${fmtCredit((Number(win.credit) || 0) / Math.max(1, Number(win.requests) || 0))} 积分`
+      ? (creditKnownWin
+        ? html`全部 ${creditKnownAll ? fmtCredit(all.credit) : '—'} 积分<br>平均每次请求 ${fmtCredit((Number(win.credit) || 0) / Math.max(1, Number(win.requests) || 0))} 积分`
+        : '积分未采集')
       : '用量总览未读取到';
     const cacheHint = win
       ? html`平均首字延迟 ${win.ttft_ms_avg ? fmtLatency(win.ttft_ms_avg) : '—'} · 生成速度 ${win.speed_avg ? Number(win.speed_avg).toFixed(1) + ' tok/s' : '—'}<br>缓存命中率 ${fmtPercent(all.cache_hit_pct || 0)}`
@@ -131,13 +141,17 @@ export function mount(host) {
       <div class="grid-stats cols-4">
         ${statCard({ label: rangeLabel(rangeCtl.range) + ' 请求数', value: requestValue, icon: 'Activity', hint: requestHint, delay: 0 })}
         ${statCard({ label: rangeLabel(rangeCtl.range) + ' Token 消耗', value: win ? fmtCompact(win.total_tokens || 0) : '—', icon: 'Zap', hint: tokenHint, delay: 0.05 })}
-        ${statCard({ label: rangeLabel(rangeCtl.range) + ' 积分消耗', value: win ? fmtCredit(win.credit || 0) : '—', icon: 'Coins', hint: creditHint, delay: 0.1 })}
+        ${statCard({ label: rangeLabel(rangeCtl.range) + ' 积分消耗', value: win ? (creditKnownWin ? fmtCredit(win.credit) : '—') : '—', icon: 'Coins', hint: creditHint, delay: 0.1 })}
         ${statCard({ label: '缓存命中率', value: win ? fmtPercent(win.cache_hit_pct || 0) : '—', icon: 'Database', tone: 'info', hint: cacheHint, delay: 0.15 })}
       </div>
       ${month
         ? (month.ok === false
           ? html`<div class="text-xs tone-danger">本月消耗积分读取失败</div>`
-          : html`<div class="text-xs muted">本月消耗了积分 ${fmtCredit(month.credit || 0)}</div>`)
+          : html`<div class="text-xs muted">${monthState.known
+            ? html`本月消耗了积分 ${fmtCredit(month.credit)}${monthState.partial
+              ? '，有 ' + fmtNumber(monthState.missing) + ' 次请求未采集扣费'
+              : ''}`
+            : '本月积分未采集'}</div>`)
         : nothing}`;
   }
 
@@ -158,8 +172,8 @@ export function mount(host) {
   }
 
   function view() {
-    const desc = '按时间范围统计请求量、Token 消耗、积分消耗与模型性能。当前统计：'
-      + scopeText(rangeCtl.includeAll, getState().viewRealm) + '。';
+    const desc = spaceMixed('当前范围的请求量、Token 与积分消耗，统计范围：'
+      + scopeText(rangeCtl.includeAll, getState().viewRealm) + '。');
     if (phase === 'loading') {
       return html`
         <div class="page">
@@ -177,13 +191,13 @@ export function mount(host) {
         ${pageHeader({ path: STATS, title: '用量', desc, actions: rangeCtl.actions() })}
         ${rangeCtl.range === 'custom' ? rangeCtl.customCard() : nothing}
         ${missing.length
-          ? loadErrorInline('这些数据没有刷新成功：' + missing.join('、') + '。下面显示的是上一次读取到的结果。', retry)
+          ? loadErrorInline('这些数据没有刷新成功，下面显示的是上次结果：' + missing.join('、') + '。', retry)
           : nothing}
         ${statCards()}
         ${trendCard()}
-        ${accountTable(analytics ? accountRows(analytics) : [], rangeCtl.range)}
+        ${accountTable(analytics ? accountRows(analytics, accounts) : [], rangeCtl.range)}
         ${keyTable(analytics ? keyRows(analytics) : [], analytics ? idleKeyNames(analytics) : [], rangeCtl.range)}
-        ${matrixTable({ usage, perf, filters, range: rangeCtl.range, setFilter })}
+        ${matrixTable({ usage: withAccountIndex(usage, accounts), perf, filters, range: rangeCtl.range, setFilter })}
       </div>`;
   }
 

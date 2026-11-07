@@ -291,9 +291,18 @@ class StreamTimeoutTests(unittest.TestCase):
                 def apply_model_daily_token_limit(self, *args, **kwargs):
                     return 0
 
+                def apply_reserve_credits(self, values=None):
+                    return None
+
+                def apply_expiring_window(self, values=None):
+                    return None
+
                 def apply_remaining_weights(self, weights=None):
                     # 优先调度的权重表也由请求路径推给池；桩只负责接住调用。
                     return weights or {}
+
+                def apply_credit_rates(self, per_day=None):
+                    return None
 
             old_pool, old_urlopen = wb_proxy.POOL, wb_accounts.urlopen
             wb_proxy.POOL = Pool()

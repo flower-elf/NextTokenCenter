@@ -5,8 +5,9 @@ import { icon } from '../core/icons.js';
 import { getJSON } from '../core/api.js';
 import { getState } from '../core/store.js';
 import { refreshSeconds } from '../core/refresh.js';
-import { fmtDateTime, fmtNumber, realmLabel } from '../core/format.js';
-import { badge, busyClick, emptyState, loadErrorInline, loadErrorPage, pageHeader, realmBadge, skeletonStats, statCard } from '../ui/widgets.js';
+import { fmtDateTime, fmtNumber, spaceMixed } from '../core/format.js';
+import { channelLabel } from '../core/channels.js';
+import { badge, busyClick, channelBadge, emptyState, loadErrorInline, loadErrorPage, pageHeader, skeletonStats, statCard } from '../ui/widgets.js';
 import { toast, toastError } from '../ui/toast.js';
 import * as acct from './accounts/actions.js';
 import { accountsForRealm } from './accounts/logic.js';
@@ -77,12 +78,13 @@ export function mount(host) {
 
   async function refreshCredits() {
     try {
-      const result = await acct.refreshCredits(getState().viewRealm);
-      if (result.accounts) S.accounts = result.accounts;
+      const realm = getState().viewRealm;
+      const result = await acct.refreshCredits(realm);
       const failed = (result.results || []).filter((row) => !row.ok);
       if (failed.length) toast.error('部分账号余额没有读取到', failed.length + ' 个账号刷新失败，稍后可以重试。');
-      else toast.success('已刷新' + realmLabel(getState().viewRealm) + '账号的积分');
-      draw();
+      else toast.success(spaceMixed('已刷新' + channelLabel(realm) + '账号的积分'));
+      // 刷新接口只负责更新服务端；页面统一重新读取账号视图，余额与到期时间一起更新。
+      await refresh();
     } catch (err) {
       toastError('刷新积分失败', err);
     }
@@ -171,7 +173,7 @@ export function mount(host) {
       <div class="card card-flush">
         <div class="card-head">
           <div>
-            <h2 class="card-title">${name}${realmBadge(account.realm)}</h2>
+            <h2 class="card-title">${name}${channelBadge(account.realm)}</h2>
             <p class="card-sub">
               ${data.queried
                 ? html`剩余 ${fmtNumber(data.remain)} · 共 ${fmtNumber(data.size)} · 已用 ${fmtNumber(data.used)} · 15 天内到期 ${fmtNumber(expiring)}${data.age ? ' · ' + data.age : ''}`
@@ -198,8 +200,8 @@ export function mount(host) {
               <tbody>${data.groups.map((group) => groupRow(account, group, now))}</tbody>
             </table>
           </div>`
-          : html`<div class="card-body-note">${data.queried
-              ? '上游这次没有返回套餐明细，只有合计余额。'
+          : html`<div class="card-foot">${data.queried
+              ? '上游没有返回可用的积分明细。'
               : '点「刷新」从上游读取这个账号的积分构成。'}</div>`}
       </div>`;
   }
@@ -212,7 +214,7 @@ export function mount(host) {
       <div class="grid-stats cols-4">
         ${statCard({ label: '积分余额', value: fmtNumber(totals.remain), icon: 'Coins', tone: 'success', hint: totals.queried + ' 个账号已查到余额' })}
         ${statCard({ label: '已用积分', value: fmtNumber(totals.used), icon: 'TrendingDown', hint: '按上游返回的累计用量' })}
-        ${statCard({ label: '15 天内到期积分', value: fmtNumber(expiring), icon: 'CalendarClock', tone: expiring ? 'warning' : '', hint: '按套餐剩余额度统计，不含已过期与无到期时间的额度' })}
+        ${statCard({ label: '15 天内到期积分', value: fmtNumber(expiring), icon: 'CalendarClock', tone: expiring ? 'warning' : '', hint: '按套餐剩余额度统计，不含已过期额度' })}
         ${statCard({ label: '最近到期', value: expiry ? fmtNumber(expiry.amount) : '—', icon: 'CalendarClock', tone: expiry ? 'warning' : '',
           hint: expiry ? expiry.name + ' · ' + expiry.account + ' · ' + fmtNumber(expiry.amount) + ' 积分' : '没有带到期时间的额度' })}
       </div>`;
@@ -234,12 +236,12 @@ export function mount(host) {
         ${S.partial ? loadErrorInline(S.partial, refresh) : nothing}
         ${accounts.length ? html`
           ${summaryCards(now)}
-          <div class="col" style="gap:12px">${accounts.map((account) => accountCard(account, now))}</div>`
-          : emptyState({
+          <div class="stack">${accounts.map((account) => accountCard(account, now))}</div>`
+          : html`<div class="card">${emptyState({
               icon: 'Coins',
-              title: '还没有' + realmLabel(realm) + '账号',
+              title: spaceMixed('还没有' + channelLabel(realm) + '账号'),
               desc: '添加账号后，这里会按账号显示积分来源。',
-            })}
+            })}</div>`}
       </div>`;
   }
 
@@ -247,7 +249,7 @@ export function mount(host) {
     return pageHeader({
       path: 'credits',
       title: '积分',
-      desc: realmLabel(realm) + '账号的积分构成：每一笔的来源、已用与剩余，以及到期时间；打开本页时距离上次读取超过面板选项里设置的间隔才会重新读取',
+      desc: spaceMixed(channelLabel(realm) + '账号的积分来源、已用、剩余与到期时间。'),
       actions: html`
         <button class="btn btn-outline btn-sm" @click=${busyClick(refreshCredits)}>
           ${icon('RefreshCw')}刷新全部

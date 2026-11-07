@@ -87,6 +87,7 @@ class MessagesHandler(object):
     _anthropic_rate_limited = proxy.Handler._anthropic_rate_limited
     _messages_stream_response = proxy.Handler._messages_stream_response
     _messages_nonstream_response = proxy.Handler._messages_nonstream_response
+    _route_model = proxy.Handler._route_model
 
     class _WFile(object):
         def __init__(self, sink):
@@ -134,13 +135,13 @@ class MessagesHandler(object):
     def _error(self, code, message, err_type="server_error"):
         return self._json(code, {"error": {"message": message, "type": err_type}})
 
-    def _request_realm(self, explicit=None):
-        return None
+    def _request_route(self):
+        return ("intl",)
 
     def _cross_realm_error(self, model, realm):
         return ""
 
-    def _banned_model_error(self, model):
+    def _banned_model_error(self, model, realm=""):
         return ""
 
     def _key_model_error(self, model):
@@ -148,6 +149,9 @@ class MessagesHandler(object):
 
     def _key_id(self):
         return None
+
+    def _debug_account(self):
+        return ""
 
 
 def frames_of(handler):
@@ -184,7 +188,7 @@ def run_handler(payload, chunks, mode="openai-completions"):
         settings.set_messages_format(directory, mode)
         handler = MessagesHandler(payload)
         with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory,
-                                 open_upstream=lambda body, session_key=None, target_realm=None, lease=None:
+                                 open_upstream=lambda body, session_key=None, target_realm=None, lease=None, only_uid=None:
                                      (FakeUpstream(sse(chunks)), FakeAccount(), None)), \
                 mock.patch.multiple(U, record_usage=lambda *a, **k: None,
                                     record_error=lambda *a, **k: None):
@@ -413,7 +417,8 @@ class EndpointTest(unittest.TestCase):
         payload = base_request()
         handler = MessagesHandler(payload)
 
-        def refuse(body, session_key=None, target_realm=None, lease=None):
+        def refuse(body, session_key=None, target_realm=None, lease=None,
+                   only_uid=None):
             raise proxy.RateLimited("slow down", detail="reset at 12:00", wait=42)
 
         with tempfile.TemporaryDirectory(prefix="wb-messages-dir-") as directory:

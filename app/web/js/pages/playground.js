@@ -2,7 +2,8 @@ import { html, render, nothing, repeat, live, ref, createRef } from '../core/dom
 import { icon } from '../core/icons.js';
 import { getJSON, authHeaders } from '../core/api.js';
 import { getState } from '../core/store.js';
-import { fmtCredit, realmLabel } from '../core/format.js';
+import { fmtCredit, spaceMixed } from '../core/format.js';
+import { channelLabel } from '../core/channels.js';
 import { toast } from '../ui/toast.js';
 import { confirmDialog } from '../ui/dialog.js';
 import { pageHeader, notice, emptyState, loadErrorPage, loadErrorInline, busyClick } from '../ui/widgets.js';
@@ -146,7 +147,7 @@ export function mount(host, ctx) {
   function clearChat() {
     confirmDialog({
       title: '清空对话？',
-      desc: '将删除这一页的全部消息与本次会话的用量统计。测试台不保存历史记录，清空之后不能恢复。',
+      desc: '将删除这一页的消息与用量统计，清空后不能恢复。',
       confirmText: '清空',
       danger: true,
       onConfirm: () => { state.messages = []; },
@@ -196,12 +197,12 @@ export function mount(host, ctx) {
         ${emptyState({
           icon: 'MessageSquare',
           title: '开始调试',
-          desc: '请求会经本网关转给上游账号，回答支持流式输出，每条回答的消耗积分标在气泡下方。',
+          desc: '请求会经本网关转给上游账号，回答支持流式输出。',
         })}
         <div class="pg-footnotes">
-          <div>${icon('Info')}<span>这一页供调试使用：走管理端登录态，不受 API Key 与来源 IP 管控。</span></div>
+          <div>${icon('Info')}<span>这一页供调试使用，不受 API Key 与来源 IP 管控。</span></div>
           <div>${icon('KeyRound')}<span>正式接入请到「密钥」页签发 API Key，交给客户端调用。</span></div>
-          <div>${icon('TriangleAlert')}<span>不支持的思考档位会由上游自动降级；回答可能包含推理内容。</span></div>
+          <div>${icon('TriangleAlert')}<span>不支持的思考档位会由上游自动降级。</span></div>
         </div>
       </div>`;
   }
@@ -223,7 +224,7 @@ export function mount(host, ctx) {
           <label class="pg-field">
             <span class="field-label">账号</span>
             <select class="select" aria-label="调试使用的账号" .value=${live(state.account)}
-                    title="默认由网关按调度规则挑选账号；选定一个账号后，这次调试只用它。"
+                    title="默认由网关挑选账号，选定后这次调试只用它。"
                     @change=${(e) => { state.account = e.target.value; draw(); }}>
               <option value="">全部账号</option>
               ${accountOptions(state.accounts).map((o) => html`<option value=${o.value}>${o.label}</option>`)}
@@ -235,7 +236,7 @@ export function mount(host, ctx) {
                    .value=${live(state.system)} @input=${(e) => { state.system = e.target.value; }}>
           </label>
           ${creditRecorded ? html`
-            <span class="pg-credit" title="本次会话累计消耗的积分，来自上游返回的 usage.credit">
+            <span class="pg-credit" title="本次会话累计消耗的积分">
               ${icon('Coins')}本次会话累计消耗 ${fmtCredit(sessionCredit(state.messages))} 积分
             </span>` : nothing}
         </div>
@@ -257,12 +258,12 @@ export function mount(host, ctx) {
 
   function view() {
     const actions = html`
-      <button class="btn btn-outline btn-sm" title="重新读取这个版本可用的模型与账号" @click=${busyClick(load)}>${icon('RefreshCw')}刷新</button>
+      <button class="btn btn-outline btn-sm" title="重新读取这个渠道可用的模型与账号" @click=${busyClick(load)}>${icon('RefreshCw')}刷新</button>
       <button class="btn btn-outline btn-sm" ?disabled=${!state.messages.length} @click=${clearChat}>${icon('Eraser')}清空对话</button>`;
     const head = pageHeader({
       path: 'playground',
       title: '聊天测试台',
-      desc: `用${realmLabel(realm)}账号调试，请求会真实消耗账号积分`,
+      desc: spaceMixed(`用${channelLabel(realm)}账号调试，请求会真实消耗账号积分`),
       actions,
     });
     if (state.models === null && state.modelsError) {
@@ -271,11 +272,11 @@ export function mount(host, ctx) {
     return html`
       <div class="page pg-page">
         ${head}
-        ${notice('info', html`请求会真实消耗账号积分：调试用的是面板里已经登录的账号，和客户端调用共用同一套账号池；默认由网关按调度规则挑选账号，也可以在「账号」里指定只用某一个。正式接入请在「密钥」页签发 API Key。`)}
+        ${notice('info', html`调试会真实消耗账号积分，正式接入请在「密钥」页签发 API Key。`)}
         ${state.modelsError ? loadErrorInline(state.modelsError, loadModels) : nothing}
         ${state.accountsError ? loadErrorInline(state.accountsError, loadAccounts) : nothing}
         ${state.models !== null && state.models.length === 0
-          ? notice('warn', html`没有可用的模型：请到「模型」页确认网关正在处理哪些模型，然后点「刷新」。`)
+          ? notice('warn', html`没有可用的模型，请到「模型」页确认后刷新。`)
           : nothing}
         <div class="pg-chat scroll-slim" ${ref(chatRef)}>
           ${state.models === null

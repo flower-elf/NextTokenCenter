@@ -16,7 +16,7 @@ class VSCodeIdentityTest(unittest.TestCase):
         headers = wb_identity.build_identity_headers(
             "vscode", "intl", "uid-1", "token-1")
         self.assertEqual(headers["X-IDE-Type"], "VSCode")
-        self.assertEqual(headers["X-IDE-Version"], "1.143.1")
+        self.assertEqual(headers["X-IDE-Version"], "1.145.1")
         self.assertEqual(headers["X-Product-Version"], "4.12.39997873")
         self.assertEqual(headers["X-Agent-Type"], "main")
         self.assertEqual(headers["X-Agent-Intent"], "craft")
@@ -35,7 +35,7 @@ class CliIdentityTest(unittest.TestCase):
         headers = wb_identity.build_identity_headers(
             "cli", "intl", "uid-1", "token-1")
         self.assertEqual(headers["X-IDE-Type"], "CLI")
-        self.assertEqual(headers["X-IDE-Version"], "2.177.1")
+        self.assertEqual(headers["X-IDE-Version"], "2.180.0")
         self.assertEqual(headers["X-Agent-Type"], "main")
         self.assertEqual(headers["X-Agent-Purpose"], "conversation")
         self.assertEqual(headers["X-Agent-Runtime"], "other")

@@ -220,6 +220,8 @@ class ChatPathTests(unittest.TestCase):
                                  "messages": [{"role": "user", "content": "hi"}]},
                                 target_realm="intl")
         self.assertEqual(refresh.call_count, 1, "同一次请求只刷新一次")
+        self.assertTrue(refresh.call_args.kwargs.get("force"),
+                        "401 必须真的向上游换令牌，不能因为本地未到期就跳过")
         self.assertGreaterEqual(len(calls), 2, "刷新成功后应重试同一个账号")
 
     def test_401_with_failed_refresh_rotates_immediately(self):
@@ -474,6 +476,25 @@ class _FakePool(object):
 
     def apply_remaining_weights(self, weights=None):
         """当前 main 的调度接口：这里不需要权重，收下就丢。"""
+        return None
+
+    def apply_credit_rates(self, per_day=None):
+        return None
+
+    def apply_daily_token_limit(self, value=None, usage=None):
+        return value or 0
+
+    def apply_daily_credit_limit(self, value=None, credits=None,
+                                 free_models=None):
+        return value or 0
+
+    def apply_model_daily_token_limit(self, value=None, per_model=None):
+        return value or 0
+
+    def apply_reserve_credits(self, values=None):
+        return None
+
+    def apply_expiring_window(self, values=None):
         return None
 
     def get(self, uid):

@@ -18,10 +18,10 @@ DESKTOP_VERSION_CN = "5.9.3"
 DESKTOP_UA_CN = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 
 # 独立 CodeBuddy CLI 的最新版本，取自 npm 包 @tencent-ai/codebuddy-code。
-DEFAULT_IDE_VERSION = "2.177.1"
+DEFAULT_IDE_VERSION = "2.180.0"
 # CodeBuddy 插件在标准 VS Code 宿主里的身份：X-IDE-Version 取 vscode.version，
 # X-Product-Version 与 UA 次段取插件 package.json 的 version。
-DEFAULT_VSCODE_VERSION = "1.143.1"
+DEFAULT_VSCODE_VERSION = "1.145.1"
 DEFAULT_VSCODE_PLUGIN_VERSION = "4.12.39997873"
 
 PRODUCT_DESKTOP = "workbuddy"
@@ -172,6 +172,45 @@ def login_trace_headers():
         "X-B3-Sampled": "1",
         "b3": "%s-%s-1-" % (trace, span),
     }
+
+
+def refresh_client_headers(product, realm, uid, domain,
+                           enterprise_id="", tenant_id=""):
+    """刷新请求携带的客户端标头；官方客户端的 REST 拦截器给所有请求都加这一套。
+
+    对话标头里的 X-Agent-* 与对话 ID 由模型调用层添加，刷新请求不带。
+    """
+    product = normalize_product(product)
+    headers = {
+        "X-User-Id": str(uid or ""),
+        "X-Domain": str(domain or endpoint_for(realm, product)[1]),
+        "X-Product": "SaaS",
+    }
+    if product == PRODUCT_DESKTOP:
+        headers.update({
+            "X-IDE-Type": "WorkBuddy",
+            "X-IDE-Name": "WorkBuddy",
+            "X-IDE-Version": (DESKTOP_VERSION_CN if realm == "cn"
+                              else DESKTOP_VERSION_INTL),
+        })
+    elif product == PRODUCT_VSCODE:
+        headers.update({
+            "X-IDE-Type": "VSCode",
+            "X-IDE-Name": "VSCode",
+            "X-IDE-Version": DEFAULT_VSCODE_VERSION,
+            "X-Product-Version": DEFAULT_VSCODE_PLUGIN_VERSION,
+            "X-Env-ID": "production",
+        })
+    else:
+        headers.update({
+            "X-IDE-Type": "CLI",
+            "X-IDE-Name": "CLI",
+            "X-IDE-Version": DEFAULT_IDE_VERSION,
+        })
+    if enterprise_id:
+        headers["X-Enterprise-Id"] = str(enterprise_id)
+        headers["X-Tenant-Id"] = str(tenant_id or enterprise_id)
+    return headers
 
 
 def build_identity_headers(product, realm, uid, token,

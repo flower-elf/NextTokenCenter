@@ -46,13 +46,20 @@ assert.deepEqual(known.map((o) => o.value), ['', 'glm-5.3'], '目录里的重复
 assert.equal(logic.testModelSelected(undefined), '', '没给值时用默认');
 assert.equal(logic.testModelSelected('  glm-5.3  '), 'glm-5.3');
 
-assert.equal(logic.testModelStateText('', 'deepseek-v4.1-flash').tone, 'muted', '用默认模型时不该标成自定义');
-assert.ok(logic.testModelStateText('', 'deepseek-v4.1-flash').text.includes('deepseek-v4.1-flash'),
-  '要写出实际会用哪个默认模型');
-assert.equal(logic.testModelStateText('glm-5.3', 'deepseek-v4.1-flash').tone, 'info');
-assert.ok(logic.testModelStateText('glm-5.3', 'deepseek-v4.1-flash').text.includes('glm-5.3'));
-assert.equal(logic.testModelStateText('deepseek-v4.1-flash', 'deepseek-v4.1-flash').tone, 'muted',
-  '存着的值就是默认值时按默认显示');
+// ---- 出站身份：选项来自设置视图，面板不再维护第二份列表
+const identityView = { identity_options: {
+  workbuddy: [{ value: 'workbuddy', label: 'WorkBuddy' }, { value: 'vscode', label: 'VS Code' }],
+  codearts: [{ value: 'ide', label: 'IDE' }, { value: 'cli', label: 'CLI' }],
+} };
+assert.deepEqual(logic.identityOptions(identityView, 'workbuddy'),
+  [{ value: 'workbuddy', label: 'WorkBuddy' }, { value: 'vscode', label: 'VS Code' }]);
+assert.deepEqual(logic.identityOptions(identityView, 'codearts'),
+  [{ value: 'ide', label: 'IDE' }, { value: 'cli', label: 'CLI' }]);
+assert.deepEqual(logic.identityOptions({ identity_options: {
+  workbuddy: [{ label: '缺值' }, null, { value: 'cli' }],
+} }, 'workbuddy'), [{ value: 'cli', label: 'cli' }], '缺值或非对象的条目要丢掉');
+assert.deepEqual(logic.identityOptions({}, 'workbuddy'), [], '视图没有选项时给空列表');
+assert.deepEqual(logic.identityOptions(null, 'codearts'), [], '视图缺失时不能报错');
 
 for (const good of ['glm-5.3', 'gpt-6-astra', 'a', 'A'.repeat(64), 'a_b-c.d']) {
   assert.equal(logic.validateTestModel(good), '', good + ' 应当被接受');
@@ -175,6 +182,13 @@ assert.ok(!open.find((r) => r.label === '用量日志').value.includes('usage.js
   '服务端没给用量目录时不要编一个路径出来');
 assert.equal(open.find((r) => r.label === 'API 地址').value, '/v1', '没有来源地址时也要给出相对路径');
 
+const routed = logic.aboutRows({ routing: {
+  bound_hit: 3, bound_lost: 1, fresh_binding: 2, affinity_entries: 4 } }, '');
+const routingRow = routed.find((r) => r.label === '账号分配');
+assert.ok(routingRow && routingRow.value.includes('原账号接手请求 3 次'),
+  '有会话归属计数时要显示账号分配一行');
+assert.equal(routed.length, 8);
+
 const authTexts = [
   logic.aboutRows({ api_keys: [{ id: 'k', enabled: true, status: 'ok' }] }, '').find((r) => r.label === '接口认证').value,
   logic.aboutRows({ api_keys: [{ id: 'k', enabled: false }] }, '').find((r) => r.label === '接口认证').value,
@@ -191,6 +205,25 @@ assert.deepEqual(logic.parseHours(''), { ok: true, value: [] }, '留空表示这
 assert.equal(logic.parseHours('24').ok, false);
 assert.equal(logic.parseHours('abc').ok, false);
 assert.equal(logic.parseHours('-1').ok, false);
+
+// ---- 账号池守卫：按渠道读取覆盖值，读不到时继承全局值
+const limitView = {
+  limits: {
+    reserve_credits: { global: 100, intl: 20, cn: null, codearts: 50 },
+    daily_token_limit: { global: 0, intl: null, cn: 8000, codearts: null },
+    expiring_window_days: { global: 7, intl: 3, cn: null, codearts: null },
+  },
+};
+assert.equal(logic.limitScopeValue(limitView, 'reserve_credits', 'intl'), 20, '渠道覆盖优先');
+assert.equal(logic.limitScopeValue(limitView, 'reserve_credits', 'cn'), 100, '覆盖为 null 时继承全局值');
+assert.equal(logic.limitScopeValue(limitView, 'reserve_credits', 'codearts'), 50);
+assert.equal(logic.limitScopeValue(limitView, 'daily_token_limit', 'cn'), 8000);
+assert.equal(logic.limitScopeValue(limitView, 'daily_token_limit', 'intl'), 0, '全局的 0 是真正的关闭');
+assert.equal(logic.limitScopeValue(limitView, 'expiring_window_days', 'intl'), 3);
+assert.equal(logic.limitScopeValue({ limits: {} }, 'reserve_credits', 'intl'), undefined,
+  '完全没有配置时交给字段声明的默认值');
+assert.equal(logic.limitScopeValue({ reserve_credits: 9 }, 'reserve_credits', 'intl'), 9, '旧平铺字段仍可读');
+assert.equal(logic.limitScopeValue(null, 'reserve_credits', 'intl'), undefined);
 
 // ---- 费用估算：默认表、脏检查与提交载荷
 const costState = logic.costEstimateState({

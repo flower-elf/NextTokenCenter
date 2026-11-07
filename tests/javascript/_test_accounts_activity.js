@@ -1,5 +1,6 @@
-/* 账号今日活动：Buddy 加油站、成长计划连登、国际版今日活跃的判定与汇总。 */
+/* 账号今日活动：Buddy 加油站、成长计划连登、今日活跃与 CodeArts 签到的判定与汇总。 */
 import assert from 'node:assert/strict';
+import './_channels_fixture.js';
 
 import * as activity from '../../app/web/js/pages/accounts/activity.js';
 import { fmtDate } from '../../app/web/js/core/format.js';
@@ -25,7 +26,10 @@ assert.equal(view.gas.text, '失败');
 assert.equal(view.streak.kind, 'none');
 assert.equal(activity.isDone(view), false);
 
-view = activity.activityView(cn({ lastCheckin: stamp + ' 09:30:00', lastActivityReport: stamp + ' 09:31:00' }), {}, now);
+view = activity.activityView(cn({
+  lastCheckin: { at: Math.floor(now / 1000) - 3600, ok: true, message: '' },
+  lastActivityReport: stamp + ' 09:31:00',
+}), {}, now);
 assert.equal(view.gas.kind, 'done');
 assert.equal(view.gas.text, '已领');
 assert.equal(view.streak.kind, 'done');
@@ -33,7 +37,9 @@ assert.equal(view.streak.text, '已签到');
 assert.equal(activity.isDone(view), true);
 
 const yesterday = new Date(now - 86400 * 1000);
-view = activity.activityView(cn({ lastCheckin: fmtDate(yesterday) + ' 09:30:00' }), {}, now);
+view = activity.activityView(cn({
+  lastCheckin: { at: Math.floor(yesterday.getTime() / 1000), ok: true, message: '' },
+}), {}, now);
 assert.equal(view.gas.kind, 'none', '昨天的记录不算今天');
 assert.equal(view.gas.text, '未领');
 
@@ -58,6 +64,42 @@ assert.equal(view.daily.text, '已完成');
 view = activity.activityView(intl({ lastDailyChat: fmtDate(yesterday) + ' 10:05:00' }), {}, now);
 assert.equal(view.daily.kind, 'none');
 assert.equal(view.daily.text, '未打卡');
+
+// ---- CodeArts：当天签到状态来自统一字段 lastCheckin
+const ca = (over = {}) => Object.assign({ uid: 'ca-1', realm: 'codearts', enabled: true, nickname: '丙' }, over);
+const at = Math.floor(now / 1000);
+assert.equal(activity.activityKind('codearts'), 'codearts');
+assert.equal(activity.activityKind('cn'), 'buddy');
+assert.equal(activity.activityKind('intl'), 'daily');
+assert.equal(activity.activityKind('future'), '');
+
+let caView = activity.activityView(ca({ lastCheckin: { at, ok: true, message: '签到成功', credits: 10 } }), {}, now);
+assert.equal(caView.kind, 'codearts');
+assert.equal(caView.checkin.kind, 'done');
+assert.equal(caView.checkin.hint, '签到成功');
+assert.equal(activity.isDone(caView), true);
+
+caView = activity.activityView(ca({ lastCheckin: { at, ok: false, message: '活动未开始' } }), {}, now);
+assert.equal(caView.checkin.kind, 'failed');
+assert.equal(caView.checkin.hint, '活动未开始');
+assert.equal(activity.isDone(caView), false);
+
+assert.equal(activity.activityView(ca(), {}, now).checkin.kind, 'none', '没有记录按未签到处理');
+assert.equal(activity.activityView(ca({ lastCheckin: { at: at - 86400, ok: true } }), {}, now).checkin.kind, 'none',
+  '昨天的签到不算今天');
+assert.equal(activity.isDone(activity.activityView(ca(), {}, now)), false, '未签到不算完成');
+
+// 汇总：停用账号不计入总数，未签与失败都算待处理
+const caAccounts = [
+  ca({ uid: 'ca-1', lastCheckin: { at, ok: true } }),
+  ca({ uid: 'ca-2', nickname: '丁' }),
+  ca({ uid: 'ca-3', enabled: false }),
+];
+const caSummary = activity.todaySummary(caAccounts, {}, 'codearts', now);
+assert.equal(caSummary.total, 2);
+assert.equal(caSummary.done, 1);
+assert.deepEqual(caSummary.pending.map((a) => a.uid), ['ca-2']);
+assert.equal(activity.summaryStat(caSummary, { doneWord: '已签到', pendingWord: '未签到' }).tone, 'warning');
 
 // ---- 只给还没打卡的账号补跑
 const accounts = [
@@ -94,7 +136,7 @@ assert.deepEqual(activity.summaryStat(allDone, { doneWord: '已打卡', pendingW
 const streak = activity.streakSummary([
   cn({ uid: 'a', lastActivityReport: stamp + ' 09:00:00' }),
   cn({ uid: 'b' }),
-], now);
+], 'cn', now);
 assert.deepEqual(streak, { total: 2, done: 1 });
 
 console.log('账号今日活动断言通过');

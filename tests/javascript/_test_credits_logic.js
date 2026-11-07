@@ -209,4 +209,38 @@ assert.equal(logic.expiringTotal(expiringAccounts, 15, now), 125,
 assert.equal(logic.expiringTotal(expiringAccounts, 0, now), 0, '窗口为 0 时没有临期积分');
 assert.equal(logic.expiringTotal([], 15, now), 0);
 
+// ---- CodeArts 形状：只有合计余额与 creditExpiries 时也要有明细行与到期汇总
+const codearts = account({
+  uid: 'uid-ca', nickname: '云道', realm: 'codearts',
+  credits: { remain: 250, size: 400, used: 150, package: 'CodeArts 套餐', updated_at: sec(now - 60) },
+  creditExpiries: [
+    { at: sec(now + 10 * DAY), amount: 80 },
+    { at: sec(now + 2 * DAY), amount: 120 },
+  ],
+});
+const caView = logic.accountCredits(codearts, now);
+assert.equal(caView.queried, true);
+assert.equal(caView.remain, 250);
+assert.equal(caView.size, 400);
+assert.equal(caView.used, 150);
+assert.equal(caView.groups.length, 1, '没有套餐明细时补一行合计余额');
+assert.equal(caView.groups[0].name, 'CodeArts 套餐');
+assert.equal(caView.groups[0].remain, 250);
+assert.equal(caView.groups[0].size, 400);
+assert.equal(caView.groups[0].count, 1);
+assert.equal(caView.nextExpireAt, (sec(now + 2 * DAY)) * 1000, '到期时间来自 creditExpiries');
+assert.equal(caView.nextExpireAmount, 120);
+assert.equal(logic.expiringTotal([codearts], 15, now), 200, '15 天内到期的两笔都计入');
+assert.equal(logic.expiringTotal([codearts], 5, now), 120, '窗口只覆盖最先到期的一笔');
+assert.equal(logic.nextExpiry([codearts], now).name, 'CodeArts 套餐');
+assert.equal(logic.nextExpiry([codearts], now).account, '云道');
+
+// 后端给了 creditExpiries 时不再重复累加套餐明细
+const bothShapes = account({ credits: { remain: 100, size: 200, packages: [pack({ remain: 100, expireAt: sec(now + 3 * DAY) })] },
+  creditExpiries: [{ at: sec(now + 3 * DAY), amount: 100 }] });
+assert.equal(logic.expiringTotal([bothShapes], 15, now), 100, 'creditExpiries 与套餐只算一份');
+
+// 合计余额完全没有数值时不补空行
+assert.deepEqual(logic.accountCredits(account({ credits: { remain: 0, size: 0, used: 0 } }), now).groups, []);
+
 console.log('credits logic assertions passed');

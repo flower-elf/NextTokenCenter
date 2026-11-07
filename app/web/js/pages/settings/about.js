@@ -28,7 +28,6 @@ export function createAboutTab(page) {
           </div>
           <p class="text-2xs muted" style="margin-top:12px">
             客户端接入：Base URL 填上面的 API 地址，密钥用「密钥」页创建的 Key。
-            OpenAI SDK 读取 OPENAI_BASE_URL 与 OPENAI_API_KEY，Claude Code 读取 ANTHROPIC_BASE_URL 与 ANTHROPIC_AUTH_TOKEN。
           </p>
         </div>`;
     },

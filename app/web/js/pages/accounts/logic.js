@@ -1,12 +1,16 @@
-// 账号页的纯逻辑：可用性分档、筛选、排序、分页、积分与有效期口径；只依赖 core/format.js，可以在 Node 里直接测试。
+// 账号页的纯逻辑：可用性分档、筛选、排序、分页、积分与有效期口径；只依赖 core/format.js 与 core/channels.js，可以在 Node 里直接测试。
 
-import { fmtAgo, fmtClock, fmtNumber, toMillis } from '../../core/format.js';
+import { fmtAgo, fmtClock, fmtNumber, spaceMixed, toMillis } from '../../core/format.js';
+import { channelFeature, channelLabel } from '../../core/channels.js';
 
 const PAGE_SIZE = 20;
 const PRIORITY_DEFAULT = 100;
 const PRIORITY_MAX = 9999;
 //: 单账号单模型的并发上限，与服务端 MAX_ACCOUNT_CONCURRENCY 一致。
 const CONCURRENCY_MAX = 1000;
+//: 备注与分组名的长度上限，与服务端 MAX_ACCOUNT_NOTE、分组规则一致。
+const NOTE_MAX = 200;
+const GROUP_MAX = 64;
 
 export const FILTERS = [
   { id: 'all', label: '全部' },
@@ -24,12 +28,12 @@ export const SORTS = [
 ];
 
 export const PRODUCTS = [
-  { id: 'workbuddy', short: 'WB', label: 'WorkBuddy 独立桌面客户端' },
-  { id: 'vscode', short: 'VSC', label: '官方 VSCode 插件' },
+  { id: 'workbuddy', short: 'WorkBuddy', label: 'WorkBuddy 独立桌面客户端' },
+  { id: 'vscode', short: 'VS Code', label: '官方 VS Code 插件' },
   { id: 'cli', short: 'CLI', label: '官方 CodeBuddy CLI' },
 ];
 
-export const IDENTITY_TIP = '出站身份：WB 是 WorkBuddy 独立桌面客户端，VSC 是官方 VSCode 插件，CLI 是官方 CodeBuddy CLI。三者对应不同的出站指纹与配额通道。';
+export const IDENTITY_TIP = '出站身份：这个账号用哪种身份访问上游，身份对应不同的出站指纹。';
 
 /** 秒级时间戳归一化：非法或非正数按 0 处理。 */
 function seconds(value) {
@@ -53,13 +57,23 @@ export function activeModelCooldowns(account, now = Date.now()) {
     .sort((x, y) => x.at - y.at || (x.model < y.model ? -1 : 1));
 }
 
-/** 冷却徽章文案：模型名加本地恢复时刻。 */
+/** 冷却徽章：账号级冷却写明恢复时刻，模型级冷却逐个列出。 */
 export function cooldownPills(account, now = Date.now()) {
-  return activeModelCooldowns(account, now).map((item) => ({
+  const pills = [];
+  const left = Number(account && account.cooldownFor);
+  if (account && account.inCooldown && Number.isFinite(left) && left > 0) {
+    pills.push({
+      model: '',
+      account: true,
+      text: '账号 · ' + fmtClock(now + left * 1000) + ' 恢复',
+      title: '整个账号在冷却结束前不参与调度。',
+    });
+  }
+  return pills.concat(activeModelCooldowns(account, now).map((item) => ({
     model: item.model,
     text: item.model + ' · ' + fmtClock(item.at) + ' 恢复',
-    title: '只有这个模型暂时受限，账号仍可服务其它模型。恢复时刻按本机时区显示。',
-  }));
+    title: '这个模型暂时受限，账号仍可服务其它模型。',
+  })));
 }
 
 /** 行内错误提示。模型限流另有专门的徽章，不再重复显示这条原文。 */
@@ -100,11 +114,11 @@ function availabilityGroup(tier) {
 
 const TIER_NOTES = {
   disabled: '停用期间不参与任何调度，启用后自动恢复。',
-  expired: '令牌已经过期，先点「刷新 Token」；若刷新失败，需要重新添加这个账号。',
+  expired: '令牌已经过期，先点「刷新 Token」再试。',
   cooling: '账号被上游拒绝后进入冷却，冷却结束前不会被选中。',
   reserve: '剩余积分低于保留阈值，暂停接单以免把积分用完。',
   error: '这个账号最近一次调用失败，原因写在表格里。',
-  modelCooled: '账号本身仍可用，只是个别模型暂时受限，恢复后自动重新参与调度。',
+  modelCooled: '账号仍可用，个别模型暂时受限。',
   usable: '',
 };
 
@@ -127,7 +141,7 @@ export function availabilityBadge(account, now = Date.now()) {
   if (tier === 'dailyLimit') {
     title = '今日已用 ' + fmtNumber((account && account.dailyTokensToday) || 0)
       + ' / ' + fmtNumber((account && account.dailyTokenLimit) || 0)
-      + ' token，暂停接单，本地时间 0 点恢复。';
+      + ' token，本地时间 0 点恢复。';
   }
   return { tier, group: availabilityGroup(tier), text: spec.text, tone: spec.tone, title };
 }
@@ -136,8 +150,18 @@ export function availabilityBadge(account, now = Date.now()) {
 export function matchQuery(account, query) {
   const q = String(query || '').trim().toLowerCase();
   if (!q) return true;
-  return [account.nickname, account.uid, account.file, account.note]
+  return [account.nickname, account.uid, account.file, account.note, account.group]
     .some((value) => String(value || '').toLowerCase().includes(q));
+}
+
+/** 非空分组名，排序后供筛选与批量操作。 */
+export function accountGroups(list) {
+  const names = new Set();
+  for (const account of list || []) {
+    const group = String((account && account.group) || '').trim();
+    if (group) names.add(group);
+  }
+  return [...names].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
 }
 
 /** 各分组的账号数，用于筛选芯片上的计数。 */
@@ -167,6 +191,12 @@ export function priorityOf(account) {
   return Number.isInteger(value) ? value : PRIORITY_DEFAULT;
 }
 
+/** 调度权重；缺失或非法时按 1 参与排序。 */
+export function weightOf(account) {
+  const value = Number(account && account.weight);
+  return Number.isInteger(value) && value > 0 ? value : 1;
+}
+
 /** 并发上限；没设过或旧账号当作 0（不限）。 */
 export function concurrencyOf(account) {
   const value = Number(account && account.concurrencyLimit);
@@ -191,20 +221,46 @@ export function accountLimits(source) {
     concurrencyMax: number('concurrencyMax', CONCURRENCY_MAX),
     weightMin: number('weightMin', 1),
     weightMax: number('weightMax', 100),
-    noteMax: number('noteMax', 100),
+    noteMax: number('noteMax', NOTE_MAX),
+    groupMax: number('groupMax', GROUP_MAX),
     apiKeyPrefixes: Array.isArray(raw.apiKeyPrefixes) && raw.apiKeyPrefixes.length
       ? raw.apiKeyPrefixes : ['ck_', 'pt_'],
   };
 }
 
-/** 并发上限校验：0 或空表示不限，其余必须是正整数；与服务端 normalise_concurrency_limit 同一口径。 */
-export function parseConcurrencyInput(raw, limits) {
-  const max = accountLimits(limits).concurrencyMax;
+/** 账号的并发上限范围：账号自带范围时以它为准，CodeArts 为 1 到 3；否则 0 表示不限，上限取服务端下发值。 */
+export function concurrencyRange(account, limits) {
+  const min = Number(account && account.concurrencyMin);
+  const max = Number(account && account.concurrencyMax);
+  if (Number.isInteger(min) && Number.isInteger(max) && min >= 0 && max >= min) {
+    return { min, max };
+  }
+  return { min: 0, max: accountLimits(limits).concurrencyMax };
+}
+
+/** 并发上限校验：范围下限为 0 时空值和 0 表示不限，其余必须是范围内的整数；与服务端校验同一口径。 */
+export function parseConcurrencyInput(raw, limits, account) {
+  const { min, max } = concurrencyRange(account, limits);
   const text = String(raw == null ? '' : raw).trim();
-  if (text === '') return { ok: true, value: 0 };
-  const value = Number(text);
-  if (!Number.isInteger(value) || value < 0 || value > max) {
-    return { ok: false, message: '并发上限需要 0 到 ' + max + ' 之间的整数，填写 0 表示不限，本次没有发送请求' };
+  if (text === '' && min === 0) return { ok: true, value: 0 };
+  const value = text === '' ? Number.NaN : Number(text);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    const hint = min === 0 ? '，填写 0 表示不限' : '';
+    return { ok: false, message: '并发上限需要 ' + min + ' 到 ' + max + ' 之间的整数' + hint + '，本次没有发送请求' };
+  }
+  return { ok: true, value };
+}
+
+/** 权重输入框的校验：调度权重必须是范围内的整数。 */
+export function parseWeightInput(raw, limits) {
+  const spec = accountLimits(limits);
+  const text = String(raw == null ? '' : raw).trim();
+  const value = text === '' ? Number.NaN : Number(text);
+  if (!Number.isInteger(value) || value < spec.weightMin || value > spec.weightMax) {
+    return {
+      ok: false,
+      message: '权重需要 ' + spec.weightMin + ' 到 ' + spec.weightMax + ' 之间的整数，本次没有发送请求',
+    };
   }
   return { ok: true, value };
 }
@@ -227,13 +283,14 @@ export function sortAccounts(list, sort = 'default') {
 }
 
 /** 搜索、分组筛选与排序的组合入口。 */
-export function selectAccounts(list, { query = '', filter = 'all', sort = 'default' } = {}, now = Date.now()) {
+export function selectAccounts(list, { query = '', filter = 'all', sort = 'default', group = '' } = {}, now = Date.now()) {
   const kept = (list || []).filter((account) => matchQuery(account, query)
+    && (!group || String(account.group || '') === group)
     && (filter === 'all' || availabilityGroup(availabilityTier(account, now)) === filter));
   return sortAccounts(kept, sort);
 }
 
-/** 按当前查看的版本挑出账号。缺少版本字段的旧账号归入正在查看的版本。 */
+/** 按当前查看的渠道挑出账号。缺少渠道字段的旧账号归入正在查看的渠道。 */
 export function accountsForRealm(list, realm) {
   return (list || []).filter((account) => !account.realm || account.realm === realm);
 }
@@ -248,19 +305,26 @@ export function paginate(items, page, pageSize = PAGE_SIZE) {
   return { page: current, pages, total, items: (items || []).slice(start, start + pageSize) };
 }
 
-/** 空态类型：整个池子没有账号、别的版本有账号而当前版本没有、筛选后为空。 */
+/** 空态类型：整个池子没有账号、别的渠道有账号而当前渠道没有、筛选后为空。 */
 export function emptyKind(allAccounts, visibleAccounts, filteredAccounts) {
   if ((filteredAccounts || []).length) return '';
   if (!(visibleAccounts || []).length) return (allAccounts || []).length ? 'realm' : 'none';
   return 'filtered';
 }
 
-/** 每个版本的头部动作：签到只对国内版出现，两种打卡只对国际版出现。 */
+/**
+ * 每个渠道的头部动作，来自渠道登记表：
+ * checkin 是签到种类（空串表示没有签到），dailyChat 控制两种打卡；
+ * 导入、导出、分配代理槽与批量启停对每个账号来源都可用。
+ */
 export function realmActions(realm) {
   return {
-    checkin: realm === 'cn',
-    dailyChat: realm === 'intl',
-    dailyChatWeb: realm === 'intl',
+    checkin: channelFeature(realm, 'checkin') || '',
+    dailyChat: !!channelFeature(realm, 'dailyChat'),
+    bulkExport: true,
+    bulkImport: true,
+    assignSlots: true,
+    bulkToggle: true,
   };
 }
 
@@ -269,7 +333,7 @@ export function creditAgeText(credits, now = Date.now()) {
   const ms = toMillis(credits && credits.updated_at);
   if (ms === null) return '';
   if ((now - ms) / 1000 < 60) return '刚刚更新';
-  return '更新于' + fmtAgo(ms, now);
+  return spaceMixed('更新于' + fmtAgo(ms, now));
 }
 
 /** 套餐到期倒计时文案。 */
@@ -301,13 +365,17 @@ function creditExpiries(account) {
     .sort((x, y) => x.at - y.at);
 }
 
-/** 最近一笔到期的角标：额度加倒计时，说明里列出全部套餐。 */
+const EXPIRY_TIP_LINES = 3;
+
+/** 最近一笔到期的角标：额度加倒计时，说明里只列最早到期的几笔，其余合并成一行。 */
 export function creditExpiryChip(account, now = Date.now()) {
   const list = creditExpiries(account);
   if (!list.length) return null;
   const first = list[0];
   const msLeft = first.at - now;
-  const lines = list.map((item) => item.name + ' ' + fmtNumber(item.amount) + ' 积分 ' + expiryCountdown(item.at - now));
+  const lines = list.slice(0, EXPIRY_TIP_LINES)
+    .map((item) => item.name + ' ' + fmtNumber(item.amount) + ' 积分 ' + expiryCountdown(item.at - now));
+  if (list.length > EXPIRY_TIP_LINES) lines.push('另有 ' + (list.length - EXPIRY_TIP_LINES) + ' 笔，详见积分页');
   const total = list.reduce((sum, item) => sum + item.amount, 0);
   return {
     text: fmtNumber(first.amount) + ' 积分 · ' + expiryCountdown(msLeft),
@@ -392,7 +460,7 @@ export function uidAttr(uid) {
   return String(uid || '').replace(/[^\w.@-]/g, '');
 }
 
-/** 出口下拉的选项与当前取值。账号上还有旧的单账号代理时优先展示它。 */
+/** 代理槽下拉的选项与当前取值。账号上还有旧的单账号代理时优先展示它。 */
 export function slotOptions(account, slots) {
   const current = String((account && account.proxySlot) || '');
   const legacy = !current && account && account.proxy ? String(account.proxy) : '';
@@ -416,16 +484,23 @@ export function slotOptions(account, slots) {
   return { options, selected, legacy };
 }
 
-/** 身份下拉的选项与当前取值。 */
-export function productOptions(account) {
-  const current = String((account && account.product) || 'workbuddy');
-  return {
-    selected: PRODUCTS.some((item) => item.id === current) ? current : 'workbuddy',
-    options: PRODUCTS.map((item) => ({ value: item.id, label: item.short + ' · ' + item.label })),
-  };
+/** 身份下拉的选项与当前取值，直接来自统一账号视图。 */
+export function identityOptions(account) {
+  const options = Array.isArray(account && account.identityOptions)
+    ? account.identityOptions
+      .filter((item) => item && item.value)
+      .map((item) => ({ value: String(item.value), label: String(item.label || item.value) }))
+    : [];
+  return { selected: String((account && account.identity) || ''), options };
 }
 
 /** 身份切换确认弹窗里的称呼。 */
+export function identityLabel(account, id) {
+  const hit = identityOptions(account).options.find((item) => item.value === String(id));
+  return hit ? hit.label : String(id);
+}
+
+/** 登录客户端的称呼，添加账号弹窗用来解释这次授权使用的身份。 */
 export function productLabel(id) {
   const hit = PRODUCTS.find((item) => item.id === id);
   return hit ? hit.label : String(id);
@@ -491,10 +566,10 @@ export function mergeCredits(accounts, results) {
   });
 }
 
-/** 出口分配计划：只为已启用且未绑定出口的账号轮流分配已启用的槽位，已有绑定的保持不变。 */
+/** 代理槽分配计划：只为已启用且未绑定代理槽的账号轮流分配已启用的槽位，已有绑定的保持不变。 */
 export function autoAssignPlan(accounts, slots) {
   const unbound = (accounts || []).filter((account) => account.enabled && !account.proxySlot);
-  if (!unbound.length) return { rows: [], instead: '所有已启用账号都已绑定代理出口，本次没有改动' };
+  if (!unbound.length) return { rows: [], instead: '所有已启用账号都已绑定代理槽，本次没有改动' };
   const usable = (slots || []).filter((slot) => slot.enabled !== false && slot.id);
   if (!usable.length) return { rows: [], instead: '没有已启用的代理槽，请先在「设置 → 代理槽」添加并保存' };
   return {
@@ -508,6 +583,6 @@ export function autoAssignPlan(accounts, slots) {
 }
 
 /** 停用确认弹窗的说明文案，写清影响范围。 */
-export function disableAllText() {
-  return '会把账号池里全部账号一起停用，包含国内版与国际版。停用后网关不会再把请求发给它们，签到与保活也会跳过；随时可以再点「全部启用」恢复。';
+export function disableAllText(realm) {
+  return spaceMixed('会停用「' + channelLabel(realm) + '」的全部账号，签到、保活与积分刷新也会跳过。');
 }

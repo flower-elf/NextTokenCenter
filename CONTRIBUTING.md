@@ -32,17 +32,17 @@
 | 全部测试 | 运行 `python tests/run_all.py`，CI 使用 `--jobs 4` 并行运行。JS 套件需要 `node`，缺少时会跳过并提示 |
 | 干净检出 | 测试跑完后运行 `python scripts/check_clean_checkout.py`，套件不能在仓库里留下文件 |
 | 套件数量 | 新增或删除套件后，同步 README 里“N 个套件：X 个 Python 套件 + Y 个 JavaScript 套件”这句话 |
-| 依赖 | 只使用 Python 标准库，兼容 Python 3.9。CI 在 Ubuntu 和 Windows 上运行 3.9 与 3.12 |
+| 依赖 | 第三方依赖由 `requirements.txt` 固定（`cryptography`、`brotli`、`zstandard`），最低支持 Python 3.12。CI 在 Ubuntu 和 Windows 上都运行 3.12，跑测试前先安装 requirements |
 | 写作规范 | 遵守 project-rule.md，`tests/_test_doc_style.py` 通过 |
-| 文本格式 | 文本文件使用 LF 换行；可执行脚本保持 755 权限，`wrt/` 下的打包文件尤其如此 |
+| 文本格式 | 文本文件使用 LF 换行；可执行脚本保持 755 权限 |
 | 隐私 | 不提交密钥、令牌、个人信息和本机绝对路径 |
 | 默认行为 | 会改变默认行为的改动要提供开关，并且默认关闭，老安装的行为保持不变 |
-| 版本号 | 修改版本号时，`server_version`、打包脚本和 tag 三处保持一致 |
+| 版本号 | 修改版本号时，`server_version` 与 tag 保持一致 |
 | 变更记录 | 用户可见的改动写在 PR 描述和 GitHub Release 说明里。README 只描述当前功能，不记录版本历史 |
 
 ## 三、PR 标题与正文
 
-PR 标题使用 `<type>(<scope>): 中文摘要` 格式。type 取 `feat`、`fix`、`perf`、`test`、`docs`、`refactor` 或 `wrt`。
+PR 标题使用 `<type>(<scope>): 中文摘要` 格式。type 取 `feat`、`fix`、`perf`、`test`、`docs` 或 `refactor`。
 
 PR 正文至少写清下面五件事：
 
@@ -54,7 +54,7 @@ PR 正文至少写清下面五件事：
 
 ## 四、CI 与合并
 
-- **通过标准**：`ubuntu 3.9`、`ubuntu 3.12` 和 `windows 3.12` 三个环境全部通过。`tag matches source version` 只在打标签时运行，PR 上显示 skipped 属于正常情况。
+- **通过标准**：`ubuntu 3.12` 和 `windows 3.12` 两个环境全部通过。`tag matches source version` 只在打标签时运行，PR 上显示 skipped 属于正常情况。
 - **解决冲突**：在分支上解决冲突，保留两边的改动，然后推送分支让 CI 重新运行。
 - **回滚检查**：它核对 GitHub 预先计算的合并结果，base 新增的代码行不能消失。检查失败时，把分支变基到最新 main；维护者也可以核对后加 `revert-confirmed` 标签。
 - **合并之后**：main 的 CI 必须保持通过。main 出错时，优先用确定的方式撤销，再修复问题。

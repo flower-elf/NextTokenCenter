@@ -16,7 +16,7 @@ export function openModelExcludeDialog(account, { onDone } = {}) {
 
   const ctl = openDialog({
     title: '模型排除',
-    desc: '「' + name + '」不会接这些模型的请求，其他账号不受影响。取消勾选即排除，全部勾选表示不排除任何模型。',
+    desc: '「' + name + '」不会接未勾选模型的请求。',
     width: 560,
     body: () => html`
       ${error ? notice('warn', error) : nothing}

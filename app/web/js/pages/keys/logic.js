@@ -1,5 +1,6 @@
 // 密钥页的纯逻辑：状态判定、表单校验、请求体组装与客户端接入片段；界面状态与请求在 keys.js / keys/dialogs.js。
-import { fmtNumber, fmtCredit, fmtDate, fmtAgo, fmtUntil } from '../../core/format.js';
+import { fmtNumber, fmtCredit, fmtDate, fmtAgo, fmtUntil, spaceMixed } from '../../core/format.js';
+import { channelLabel, routeConflicts, routeText } from '../../core/channels.js';
 
 const KEY_STATUSES = ['ok', 'disabled', 'expired', 'quota_exceeded'];
 
@@ -24,11 +25,7 @@ export const STATUS_HINT = {
   quota_exceeded: 'Token 或积分用量达到配额，调用会收到 429',
 };
 
-export const REALM_CHOICES = [
-  { value: '', label: '跟随面板默认出口', short: '跟随面板默认出口' },
-  { value: 'intl', label: '国际版', short: '国际版' },
-  { value: 'cn', label: '国内版', short: '国内版' },
-];
+const FOLLOW_PANEL = '跟随面板默认路由';
 
 export const EXPIRY_MODES_NEW = [
   { value: 'never', label: '永不过期' },
@@ -83,9 +80,9 @@ export function statusText(row, nowMs) {
   return STATUS_TEXT[deriveKeyStatus(row, nowMs)];
 }
 
-export function realmBindingText(realm) {
-  const hit = REALM_CHOICES.find((c) => c.value === realm);
-  return hit ? hit.short : REALM_CHOICES[0].short;
+/** 渠道路由的显示文字：列出参与调度的渠道名称，空路由表示跟随面板默认路由。 */
+export function routeBindingText(route) {
+  return routeText(route, FOLLOW_PANEL);
 }
 
 /** 列表里显示的掩码；服务端只回掩码，明文要用 /settings/reveal 单独读取。 */
@@ -170,7 +167,7 @@ export function summarizeKeys(rows, nowMs = Date.now()) {
  */
 export function authSummary(view) {
   if (view && view.auth_required === false) {
-    return { kind: 'none', text: '当前不校验 Key：/v1 接口允许匿名调用，任何客户端都能直接使用网关。' };
+    return { kind: 'none', text: '当前不校验 Key，/v1 接口允许匿名调用。' };
   }
   const rows = (view && view.api_keys) || [];
   // 服务端只要有一把「启用」的密钥就要求带 Key，过期或超配额的那些同样把门。
@@ -179,8 +176,8 @@ export function authSummary(view) {
   if (enabled) return { kind: 'panel', text: `已启用 ${enabled} 个密钥，接口会进行鉴权。` };
   if (rows.length) {
     return view && view.api_key_set
-      ? { kind: 'locked', text: '密钥列表里的密钥都已停用，但接口仍要求携带密钥：启动参数里的 Key 已不再被接受，需要启用列表里的某一把。' }
-      : { kind: 'open', text: '密钥列表里的密钥都已停用，/v1 接口当前不校验 Key。' };
+      ? { kind: 'locked', text: '密钥都已停用，但接口仍要求携带密钥，需要启用其中一把。' }
+      : { kind: 'open', text: '密钥都已停用，/v1 接口当前不校验 Key。' };
   }
   if (view && view.api_key_set && view.api_key_set_by_panel === false) {
     return { kind: 'startup', text: `认证由启动参数里的 Key 把关：${view.api_key_masked || ''}` };
@@ -198,8 +195,8 @@ export function startupKeyRow(view) {
     name: '启动参数 Key',
     masked: view.api_key_masked || '已配置',
     note: (view.api_keys || []).length
-      ? '来自启动参数；密钥列表里已经有密钥，接口只认列表里的那些，这把 Key 已不再生效。'
-      : '来自启动参数，面板不能修改；设置端口时传入，重启网关后生效。',
+      ? '来自启动参数，列表里已有密钥，这把 Key 不再生效。'
+      : '来自启动参数，面板不能修改，重启网关后生效。',
   };
 }
 
@@ -310,7 +307,8 @@ export function formFromRow(row, nowMs = Date.now()) {
     enabled: !(row && row.enabled === false),
     keyValue: '',
     masked: (row && row.masked) || '',
-    realm: (row && row.realm) || '',
+    route: Array.isArray(row && row.route) ? row.route.slice() : [],
+    follow: !(Array.isArray(row && row.route) && row.route.length),
     patterns: modelPatterns(row),
     patternsKnown: !!(row && Array.isArray(row.models)),
     patternsTouched: false,
@@ -329,13 +327,24 @@ const MAX_EXPIRY_DAYS = 3650;
 
 /**
  * 表单校验：返回错误文案，空串表示通过。
- * 口径与服务端一致：密钥内容至少 4 个字符，有效期天数与配额是非负整数。
+ * 口径与服务端一致：密钥内容至少 4 个字符，有效期天数与配额是非负整数，
+ * 渠道路由里只能出现可用渠道，同一账号来源最多一个。
  */
-export function validateKeyForm(form) {
+export function validateKeyForm(form, realms = []) {
   const value = String(form.keyValue || '').trim();
   if (!form.editing && !value) return '请填写密钥内容，或点击「随机生成」生成一个。';
   if (value && value.length < 4) return '密钥内容至少 4 个字符。';
-  if (!['', 'intl', 'cn'].includes(form.realm || '')) return '出口绑定的取值不合法。';
+  const route = Array.isArray(form.route) ? form.route : [];
+  for (const id of route) {
+    if (!realms.includes(id)) return '渠道路由里的渠道不存在：' + id;
+  }
+  if (new Set(route).size !== route.length) return '渠道路由里有重复的渠道。';
+  for (const id of route) {
+    const other = routeConflicts(route, id)[0];
+    if (other) {
+      return spaceMixed('“' + channelLabel(id) + '”与“' + channelLabel(other) + '”属于同一账号来源，路由里只能保留其中一个。');
+    }
+  }
   if (form.expiryMode === 'days') {
     const days = Number(form.expiryDays);
     if (!Number.isInteger(days) || days < 1) return '有效期天数必须是大于等于 1 的整数。';
@@ -363,7 +372,7 @@ export function buildKeyEntry(form, nowMs = Date.now()) {
     id: form.id || '',
     name: String(form.name || '').trim() || '未命名',
     key: String(form.keyValue || '').trim(),
-    realm: form.realm || '',
+    route: Array.isArray(form.route) ? form.route.slice() : [],
     enabled: form.enabled !== false,
   };
   // 服务端旧版本不回 models 字段：只有确实改过或本来就拿到过才提交，避免把已存的模型限制清空。
@@ -378,14 +387,14 @@ export function buildKeyEntry(form, nowMs = Date.now()) {
 }
 
 /**
- * 服务端返回的行 → 提交载荷：旧字段照旧提交，新字段存在时才带，
- * 避免后端还没实现新字段时把已有值覆盖成空。
+ * 服务端返回的行 → 提交载荷：原有字段照旧提交，扩展字段存在时才带，
+ * 避免后端对应字段缺失时把已有值覆盖成空。空路由表示跟随面板默认路由。
  */
 export function keyRowPayload(row) {
   const payload = {
     id: (row && row.id) || '',
     name: (row && row.name) || '',
-    realm: (row && row.realm) || '',
+    route: Array.isArray(row && row.route) ? row.route.slice() : [],
     enabled: !(row && row.enabled === false),
     key: String((row && row.key) || '').trim(),
   };

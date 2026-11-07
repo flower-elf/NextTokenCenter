@@ -1,5 +1,6 @@
-import { html, nothing, classMap } from '../core/dom.js';
+import { html, nothing, classMap, ref } from '../core/dom.js';
 import { icon } from '../core/icons.js';
+import { channel, channelTitle } from '../core/channels.js';
 import { sectionOf } from '../core/routes.js';
 import { hrefFor } from '../core/router.js';
 import { copyWithToast } from './copy.js';
@@ -11,7 +12,7 @@ export function pageHeader({ path, title, desc, actions = nothing }) {
   const section = path ? sectionOf(path) : [];
   return html`
     <div class="page-head">
-      <div class="col" style="gap:10px">
+      <div class="col page-head-main">
         <div>
           <h1 class="page-title">${title}</h1>
           ${desc ? html`<p class="page-desc">${desc}</p>` : nothing}
@@ -25,7 +26,7 @@ export function pageHeader({ path, title, desc, actions = nothing }) {
 /** 胶囊式二级导航（链接）。items: [{ id, label, icon, href }] */
 export function sectionTabs(items, activeId) {
   return html`
-    <nav class="seg" aria-label="页内导航">
+    <nav class="seg" aria-label="页内导航" ${ref((nav) => revealActiveTab(nav, activeId))}>
       ${items.map((item) => html`
         <a class=${classMap({ 'seg-item': true, active: item.id === activeId })} href=${item.href}
            aria-current=${item.id === activeId ? 'page' : 'false'}>
@@ -34,15 +35,31 @@ export function sectionTabs(items, activeId) {
     </nav>`;
 }
 
+// 标签条在窄屏上横向滚动：挂载时把当前标签滚到中间，打开深层标签不会看不见选中项。
+// ref 回调在子节点提交前触发，放到微任务里再查当前标签；WeakMap 记住每个标签条已经
+// 滚动过的标签，定时重绘时不会跟用户抢滚动位置。
+const revealedTabs = new WeakMap();
+
+function revealActiveTab(nav, activeId) {
+  if (!nav) return;
+  queueMicrotask(() => {
+    if (revealedTabs.get(nav) === activeId) return;
+    const active = nav.querySelector('.seg-item.active');
+    if (!active) return;
+    revealedTabs.set(nav, activeId);
+    active.scrollIntoView({ block: 'nearest', inline: 'center' });
+  });
+}
+
 /** 胶囊式分段选择（按钮）。items: [{ id, label, count? }]；onSelect(id)。 */
 export function segmented(items, activeId, onSelect, extraClass = '') {
   return html`
-    <div class="seg ${extraClass}" role="tablist">
+    <div class="seg ${extraClass}" role="tablist" ${ref((el) => revealActiveTab(el, activeId))}>
       ${items.map((item) => html`
         <button type="button" role="tab" class=${classMap({ 'seg-item': true, active: item.id === activeId })}
                 aria-selected=${item.id === activeId ? 'true' : 'false'} @click=${() => onSelect(item.id)}>
           ${item.icon ? icon(item.icon) : nothing}${item.label}
-          ${item.count !== undefined ? html`<span class="nums" style="opacity:.7">${item.count}</span>` : nothing}
+          ${item.count !== undefined ? html`<span class="nums count">${item.count}</span>` : nothing}
         </button>`)}
     </div>`;
 }
@@ -56,14 +73,14 @@ export function chip(label, active, onClick, count) {
 }
 
 /** 统计卡。tone：success / warning / danger / info / violet，缺省为中性。 */
-export function statCard({ label, value, icon: iconName, tone = '', hint = nothing, hintTone = '', delay = 0, compact = false }) {
+export function statCard({ label, value, icon: iconName, tone = '', hint = nothing, hintTone = '', delay = 0 }) {
   return html`
-    <div class="stat ${compact ? 'stat-compact' : ''}" style="animation-delay:${delay}s">
+    <div class="stat" style="animation-delay:${delay}s">
       <div class="stat-top">
         <span class="stat-label">${label}</span>
         ${iconName ? html`<span class="stat-icon ${tone ? 'tone-' + tone : ''}">${icon(iconName)}</span>` : nothing}
       </div>
-      <div class="stat-value ${compact ? 'stat-value-compact' : ''} ${tone ? 'tone-' + tone : ''}">${value}</div>
+      <div class="stat-value ${tone ? 'tone-' + tone : ''}">${value}</div>
       ${hint !== nothing && hint !== '' && hint !== undefined ? html`<div class="stat-hint ${hintTone ? 'tone-' + hintTone : ''}">${hint}</div>` : nothing}
     </div>`;
 }
@@ -121,8 +138,10 @@ export function badge(text, tone = 'muted', { title = '', small = false, iconNam
   return html`<span class="badge ${small ? 'badge-sm' : ''} tone-${tone}" title=${title || nothing}>${iconName ? icon(iconName) : nothing}${text}</span>`;
 }
 
-export function realmBadge(realm) {
-  return realm === 'cn' ? badge('国内版', 'warning', { small: true }) : badge('国际版', 'sky', { small: true });
+/** 渠道徽章：名称与色调来自渠道登记表。 */
+export function channelBadge(id) {
+  const meta = channel(id);
+  return badge(meta.label, meta.tone, { small: true, title: channelTitle(id) });
 }
 
 /** 开关。onChange(checked)。 */

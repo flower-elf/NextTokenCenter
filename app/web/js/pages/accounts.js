@@ -2,7 +2,8 @@
 // 筛选、排序、分页与可用性分档在 accounts/logic.js，这里只负责把它们接起来。
 import { render } from '../core/dom.js';
 import { getState } from '../core/store.js';
-import { realmLabel } from '../core/format.js';
+import { channelLabel, channelProvider } from '../core/channels.js';
+import { spaceMixed } from '../core/format.js';
 import { confirmDialog } from '../ui/dialog.js';
 import { toast, toastError } from '../ui/toast.js';
 import * as logic from './accounts/logic.js';
@@ -23,6 +24,7 @@ export function mount(host) {
     limits: null,
     query: '',
     filter: 'all',
+    group: '',
     sort: 'default',
     page: 1,
     loading: true,
@@ -154,6 +156,7 @@ export function mount(host) {
       loadSeq += 1;
       S.accounts = payload.accounts;
     }
+    if (payload && payload.stand_down) S.standDown = payload.stand_down;
   }
 
   function applyAndDraw(result) {
@@ -167,15 +170,19 @@ export function mount(host) {
     const realm = getState().viewRealm;
     try {
       const result = await acct.refreshCredits(realm);
-      applyAccountPayload(result);
-      draw();
-      toast.success('已刷新' + realmLabel(realm) + ' ' + ((result.results || []).length) + ' 个账号的积分');
+      if (result && result.accounts) {
+        applyAccountPayload(result);
+        draw();
+      } else {
+        await refresh();
+      }
+      toast.success(spaceMixed('已刷新' + channelLabel(realm) + ' ' + ((result.results || []).length) + ' 个账号的积分'));
     } catch (err) {
       toastError('刷新积分失败', err);
     }
   }
 
-  const doCheckin = () => flows.runCheckin({ apply: applyAndDraw });
+  const doCheckin = () => flows.runCheckin({ realm: getState().viewRealm, apply: applyAndDraw });
 
   const doDailyChatPending = () => flows.runDailyChatPending({
     accounts: S.accounts,
@@ -207,7 +214,8 @@ export function mount(host) {
   }
 
   async function assignSlots() {
-    const plan = logic.autoAssignPlan(S.accounts, S.slots);
+    const realm = getState().viewRealm;
+    const plan = logic.autoAssignPlan(logic.accountsForRealm(S.accounts, realm), S.slots);
     if (!plan.rows.length) {
       toast.warn(plan.instead);
       return;
@@ -218,30 +226,56 @@ export function mount(host) {
         await acct.setProxySlot(row.uid, row.slotId);
         done += 1;
       } catch (err) {
-        toastError('分配代理出口失败', err);
+        toastError('分配代理槽失败', err);
         break;
       }
     }
     await refresh();
-    if (done) toast.success('已为 ' + done + ' 个未绑定账号分配代理出口');
+    if (done) toast.success('已为 ' + done + ' 个未绑定账号分配代理槽');
   }
 
   async function setAll(enabled) {
+    const realm = getState().viewRealm;
     if (!enabled) {
       const go = await confirmDialog({
         title: '停用全部账号？',
-        desc: logic.disableAllText(),
+        desc: logic.disableAllText(realm),
         confirmText: '全部停用',
         danger: true,
       });
       if (!go) return;
     }
     try {
-      await acct.setAllEnabled(enabled);
+      const result = await acct.setAllEnabled(enabled, { realm });
+      applyAccountPayload(result);
       toast.success(enabled ? '已启用全部账号' : '已停用全部账号');
       await refresh();
     } catch (err) {
       toastError('批量操作失败', err);
+    }
+  }
+
+  /** 恢复被上游限制停用的整个账号来源；WorkBuddy 有多个渠道，逐渠道启用。 */
+  async function resumeProvider() {
+    const provider = S.standDown && S.standDown.provider;
+    if (!provider) {
+      toast.warn('没有读到停止原因对应的账号来源，刷新页面后再试');
+      return;
+    }
+    const realms = getState().realms.filter((id) => channelProvider(id) === provider);
+    if (!realms.length) {
+      toast.warn('没有找到同一账号来源的渠道，刷新页面后再试');
+      return;
+    }
+    try {
+      for (const realm of realms) {
+        const result = await acct.setAllEnabled(true, { realm });
+        applyAccountPayload(result);
+      }
+      toast.success('已启用全部账号');
+      await refresh();
+    } catch (err) {
+      toastError('恢复失败', err);
     }
   }
 
@@ -255,17 +289,57 @@ export function mount(host) {
     }
   }
 
+  async function toggleTasks(account) {
+    const next = !account.tasksEnabled;
+    try {
+      await acct.setTasksEnabled(account.uid, next);
+      toast.success(next ? '已让账号参与定时任务' : '已停止账号的定时任务',
+        account.nickname || String(account.uid || '').slice(0, 8));
+      await refresh();
+    } catch (err) {
+      toastError('任务开关更新失败', err);
+    }
+  }
+
+  async function checkinAccount(account) {
+    try {
+      const result = await acct.checkin(account.uid);
+      const one = (result && result.results && result.results[0]) || result || {};
+      if (one.ok === false) {
+        toast.warn('签到未成功', one.message || one.error || '上游没有返回原因');
+      } else {
+        toast.success('签到完成', one.message || '');
+      }
+      await refresh();
+    } catch (err) {
+      toastError('签到失败', err);
+    }
+  }
+
+  async function setGroupEnabled(enabled) {
+    if (!S.group) return;
+    try {
+      const result = await acct.setAllEnabled(enabled, { realm: getState().viewRealm, group: S.group });
+      applyAccountPayload(result);
+      toast.success((enabled ? '已启用分组「' : '已停用分组「') + S.group + '」');
+      await refresh();
+    } catch (err) {
+      toastError('分组操作失败', err);
+    }
+  }
+
   async function removeAccount(account) {
     const name = account.nickname || String(account.uid || '').slice(0, 8);
     const go = await confirmDialog({
       title: '删除账号「' + name + '」？',
-      desc: '删除会移除本机保存的这份凭证，这个账号之后不再参与任何请求，需要重新添加或重新导入才能恢复。如果只是想暂时不用它，点「停用」更稳妥。',
+      desc: '删除会移除本机保存的凭证，账号不再参与请求，需要重新添加才能恢复。',
       confirmText: '删除账号',
       danger: true,
       onConfirm: async () => {
         const result = await acct.deleteAccount(account.uid);
         applyAccountPayload(result);
-        draw();
+        if (result && result.accounts) draw();
+        else await refresh();
       },
     });
     if (go) toast.success('已删除账号 ' + name);
@@ -288,9 +362,9 @@ export function mount(host) {
   async function refreshToken(account) {
     try {
       const result = await acct.refreshAccountToken(account.uid);
-      const one = (result.results || [])[0];
-      if (one && one.ok) toast.success('账号凭证刷新成功');
-      else toast.warn('刷新失败', (one && one.error) || '上游没有返回结果');
+      const one = (result && result.results && result.results[0]) || result || {};
+      if (one.ok) toast.success('账号凭证刷新成功');
+      else toast.warn('刷新失败', one.error || '上游没有返回结果');
       await refresh();
     } catch (err) {
       toastError('刷新失败', err);
@@ -302,20 +376,21 @@ export function mount(host) {
     if (slotId === '__legacy__') return;
     try {
       await acct.setProxySlot(account.uid, slotId);
-      toast.success(slotId ? '出口已更新' : '出口已改为直连');
+      toast.success(slotId ? '代理槽已更新' : '已改为直连');
       await refresh();
     } catch (err) {
-      toastError('出口更新失败', err);
+      toastError('代理槽更新失败', err);
       draw();
     }
   }
 
-  async function onProductChange(account, productId) {
-    const current = logic.productOptions(account).selected;
-    if (productId === current) return;
+  async function onIdentityChange(account, identity) {
+    const current = logic.identityOptions(account).selected;
+    if (identity === current) return;
+    const label = logic.identityLabel(account, identity);
     const go = await confirmDialog({
       title: '切换出站身份？',
-      desc: '把这个账号的出站身份切换为「' + logic.productLabel(productId) + '」。三种身份对应不同的出站指纹、配额通道与限流口径，切换需要在途请求结束后才生效。',
+      desc: '把这个账号的出站身份切换为「' + label + '」，切换后在途请求结束后生效。',
       confirmText: '切换身份',
     });
     if (!go) {
@@ -323,8 +398,8 @@ export function mount(host) {
       return;
     }
     try {
-      await acct.setProduct(account.uid, productId);
-      toast.success('已切换为 ' + logic.productLabel(productId));
+      await acct.setIdentity(account.uid, identity);
+      toast.success('已切换为 ' + label);
       await refresh();
     } catch (err) {
       toastError('切换失败', err);
@@ -365,9 +440,28 @@ export function mount(host) {
     }
   }
 
+  function onWeightChange(account, raw) {
+    onNumberChange(raw, {
+      parse: (value) => logic.parseWeightInput(value, S.limits),
+      current: logic.weightOf(account),
+      commit: (value) => setWeight(account.uid, value),
+    });
+  }
+
+  async function setWeight(uid, weight) {
+    try {
+      await acct.setWeight(uid, weight);
+      toast.success('权重已更新为 ' + weight);
+      await refresh();
+    } catch (err) {
+      toastError('权重更新失败', err);
+      draw();
+    }
+  }
+
   function onConcurrencyChange(account, raw) {
     onNumberChange(raw, {
-      parse: (value) => logic.parseConcurrencyInput(value, S.limits),
+      parse: (value) => logic.parseConcurrencyInput(value, S.limits, account),
       current: logic.concurrencyOf(account),
       commit: (value) => setConcurrencyLimit(account.uid, value),
     });
@@ -426,14 +520,19 @@ export function mount(host) {
     draw,
     refresh,
     setAll,
+    resumeProvider,
     onSlotChange,
-    onProductChange,
+    onIdentityChange,
     onPriorityChange,
+    onWeightChange,
     onConcurrencyChange,
     testAccount,
     refreshToken,
     exportOne,
     toggleAccount,
+    toggleTasks,
+    checkinAccount,
+    setGroupEnabled,
     removeAccount,
     refreshCredits,
     doCheckin,

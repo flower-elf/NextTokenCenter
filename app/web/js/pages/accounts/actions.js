@@ -9,6 +9,7 @@ export function notifyAccountsChanged() {
   window.dispatchEvent(new CustomEvent(ACCOUNTS_CHANGED));
 }
 
+/** 每个提供方的账号都由同一个接口返回；realm=all 表示不按渠道过滤。 */
 export function loadAccounts() {
   return getJSON('/accounts?realm=all');
 }
@@ -21,7 +22,7 @@ export function loadProxySlots() {
   return getJSON('/proxy/slots');
 }
 
-/** 某个版本的可用模型，账号的排除名单从这里选。 */
+/** 某个渠道的可用模型，账号的排除名单从这里选。 */
 export function loadRealmModels(realm) {
   return getJSON('/v1/models?realm=' + encodeURIComponent(realm));
 }
@@ -35,16 +36,24 @@ export function loadActivityToday() {
   return getJSON('/activity/history?range=today&limit=200');
 }
 
+/** 刷新积分：传 realm 只查一个渠道，不传查全部。 */
 export function refreshCredits(realm) {
   return postJSON('/accounts/credits', realm ? { realm } : {});
 }
 
+/** 查询一个账号的积分，结果写回账号列表。 */
 export function fetchCredits(uid) {
   return postJSON('/accounts/credits', { uid });
 }
 
+/** 签到：传 uid 只签一个账号，不传按各提供方的规则处理全部账号。 */
 export function checkin(uid) {
   return postJSON('/accounts/checkin', uid ? { uid } : {});
+}
+
+/** 给一个渠道的全部账号签到，不影响别的渠道。 */
+export function checkinRealm(realm) {
+  return postJSON('/accounts/checkin', realm ? { realm } : {});
 }
 
 /** 只给名单里的账号打卡：今天已经打过的不再打第二遍。 */
@@ -60,8 +69,25 @@ export function setEnabled(uid, enabled) {
   return postJSON('/accounts/set', { uid, enabled });
 }
 
+export function setTasksEnabled(uid, tasksEnabled) {
+  return postJSON('/accounts/set', { uid, tasksEnabled });
+}
+
+export function saveGroup(uid, group) {
+  return postJSON('/accounts/set', { uid, group });
+}
+
 export function setPriority(uid, priority) {
   return postJSON('/accounts/set', { uid, priority });
+}
+
+export function setWeight(uid, weight) {
+  return postJSON('/accounts/set', { uid, weight });
+}
+
+/** 出站身份；取值来自账号视图的 identityOptions。 */
+export function setIdentity(uid, identity) {
+  return postJSON('/accounts/set', { uid, identity });
 }
 
 export function setConcurrencyLimit(uid, concurrencyLimit) {
@@ -76,12 +102,12 @@ export function setProxySlot(uid, proxySlot) {
   return postJSON('/accounts/set', { uid, proxySlot });
 }
 
-export function setProduct(uid, product) {
-  return postJSON('/accounts/product', { uid, product });
-}
-
-export function setAllEnabled(enabled) {
-  return postJSON('/accounts/set-all', { enabled });
+/** 批量启停：传 realm 只改这个渠道，传 group 只改这个分组。 */
+export function setAllEnabled(enabled, { realm = '', group = '' } = {}) {
+  const payload = { enabled };
+  if (realm) payload.realm = realm;
+  if (group) payload.group = group;
+  return postJSON('/accounts/set-all', payload);
 }
 
 export function testAccount(uid) {
@@ -119,8 +145,8 @@ export function importDesktopCredential(path, realm) {
   return postJSON('/accounts/import/desktop', { path, realm });
 }
 
-export function startLogin(realm, product) {
-  return postJSON('/accounts/login/start', { product, realm });
+export function startLogin(realm, product, proxySlot = '') {
+  return postJSON('/accounts/login/start', { product, realm, proxySlot });
 }
 
 export function pollLogin(state) {
@@ -139,5 +165,5 @@ function stamp() {
 export function exportAccounts(uid = '') {
   const query = uid ? '?uid=' + encodeURIComponent(uid) : '';
   const label = uid ? uid.slice(0, 8) + '-' : '';
-  return downloadFile('/accounts/export' + query, 'workbuddy-accounts-' + label + stamp() + '.json');
+  return downloadFile('/accounts/export' + query, 'accounts-' + label + stamp() + '.json');
 }

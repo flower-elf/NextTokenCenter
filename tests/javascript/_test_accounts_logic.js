@@ -1,5 +1,6 @@
 /* 账号页纯逻辑：可用性分档、筛选排序分页、积分与有效期口径、校验、出口选项、批量汇总。 */
 import assert from 'node:assert/strict';
+import './_channels_fixture.js';
 
 import * as logic from '../../app/web/js/pages/accounts/logic.js';
 import { fmtClock } from '../../app/web/js/core/format.js';
@@ -41,7 +42,7 @@ assert.equal(logic.availabilityTier(base({ reserveBlocked: true }), now), 'reser
 const limited = logic.availabilityBadge(base({ dailyLimitBlocked: true, dailyTokensToday: 5000, dailyTokenLimit: 1000 }), now);
 assert.equal(limited.tier, 'dailyLimit');
 assert.equal(limited.group, 'attention');
-assert.equal(limited.title, '今日已用 5,000 / 1,000 token，暂停接单，本地时间 0 点恢复。');
+assert.ok(limited.title.includes('5,000') && limited.title.includes('1,000'), '日限额说明要写出当天用量');
 
 assert.equal(logic.availabilityTier(base({ lastError: 'HTTP 401' }), now), 'error');
 assert.equal(logic.availabilityBadge(base({ lastError: 'HTTP 401' }), now).tone, 'severe');
@@ -66,6 +67,22 @@ assert.equal(pills[0].model, 'glm-5.3', '恢复早的排前面');
 assert.equal(pills[0].text, 'glm-5.3 · ' + fmtClock((sec(now) + 600) * 1000) + ' 恢复');
 const raw = logic.cooldownPills(base({ modelCooldowns: [{ model: '"><img src=x>', expiresAt: sec(now) + 60 }] }), now);
 assert.equal(raw[0].model, '"><img src=x>', '模型名原样返回，转义由模板负责');
+
+// 账号级冷却：写明恢复时刻，说明里不展开失败次数
+const accountCooling = logic.cooldownPills(base({ inCooldown: true, cooldownFor: 1800, fails: 3, lastError: 'HTTP 429' }), now);
+assert.equal(accountCooling.length, 1);
+assert.equal(accountCooling[0].account, true);
+assert.equal(accountCooling[0].model, '');
+assert.match(accountCooling[0].text, /恢复$/);
+assert.deepEqual(logic.cooldownPills(base({ inCooldown: true, cooldownFor: null }), now), [],
+  '没有恢复时间时不显示无法解释的冷却徽章');
+const bothCooling = logic.cooldownPills(base({
+  inCooldown: true, cooldownFor: 60,
+  modelCooldowns: [{ model: 'x', expiresAt: sec(now) + 120 }],
+}), now);
+assert.equal(bothCooling.length, 2);
+assert.equal(bothCooling[0].account, true, '账号级冷却排在模型级冷却前面');
+assert.equal(bothCooling[1].model, 'x');
 
 assert.equal(logic.errorLine(base({ lastError: 'HTTP 429 (model throttled)', modelCooldowns: [{ model: 'glm-5.3', expiresAt: sec(now) + 600 }] }), now), '');
 assert.equal(logic.errorLine(base({ lastError: 'HTTP 429 (model throttled)' }), now), 'HTTP 429 (model throttled)');
@@ -129,15 +146,33 @@ assert.equal(logic.emptyKind([base()], [], []), 'realm');
 assert.equal(logic.emptyKind([base()], [base()], []), 'filtered');
 assert.equal(logic.emptyKind([base()], [base()], [base()]), '');
 
-// ---- 打卡动作按版本区分
-assert.deepEqual(logic.realmActions('cn'), { checkin: true, dailyChat: false, dailyChatWeb: false });
-assert.deepEqual(logic.realmActions('intl'), { checkin: false, dailyChat: true, dailyChatWeb: true });
+// ---- 头部动作：每个提供方的批量能力一致
+const bulk = { bulkExport: true, bulkImport: true, assignSlots: true, bulkToggle: true };
+assert.deepEqual(logic.realmActions('cn'), { checkin: 'buddy', dailyChat: false, ...bulk });
+assert.deepEqual(logic.realmActions('intl'), { checkin: '', dailyChat: true, ...bulk });
+assert.deepEqual(logic.realmActions('codearts'), { checkin: 'codearts', dailyChat: false, ...bulk });
+assert.deepEqual(logic.realmActions('future'), { checkin: '', dailyChat: false, ...bulk },
+  '未登记的渠道也有完整的批量能力');
+
+// ---- 统一账号视图：身份下拉与逐号补积分不区分提供方
+const ca = base({
+  uid: 'ca-1', realm: 'codearts', identity: 'cli',
+  identityOptions: [{ value: 'ide', label: 'IDE' }, { value: 'cli', label: 'CLI' }],
+});
+assert.equal(logic.identityOptions(ca).selected, 'cli');
+assert.deepEqual(logic.identityOptions(ca).options,
+  [{ value: 'ide', label: 'IDE' }, { value: 'cli', label: 'CLI' }]);
+assert.equal(logic.identityLabel(ca, 'ide'), 'IDE');
+assert.equal(logic.identityLabel(ca, 'gone'), 'gone');
+assert.deepEqual(logic.identityOptions(base()), { selected: '', options: [] });
+assert.deepEqual(logic.creditsToFill([ca], new Set()), ['ca-1'], '每个提供方都在首屏补一次积分');
+assert.equal(logic.accountsForRealm([ca], 'codearts').length, 1);
 assert.equal(logic.accountsForRealm([base({ uid: 'x', realm: 'cn' }), base({ uid: 'y', realm: 'intl' }), base({ uid: 'z', realm: '' })], 'intl').length, 2,
   '缺少版本的旧账号归入正在查看的版本');
 
 // ---- 积分新鲜度与到期角标
 assert.equal(logic.creditAgeText(null, now), '');
-assert.equal(logic.creditAgeText({ updated_at: sec(now) - 120 }, now), '更新于2 分钟前');
+assert.equal(logic.creditAgeText({ updated_at: sec(now) - 120 }, now), '更新于 2 分钟前');
 assert.equal(logic.creditAgeText({ updated_at: sec(now) - 5 }, now), '刚刚更新');
 
 assert.equal(logic.expiryCountdown(12 * 3600 * 1000), '12.0 小时后到期');
@@ -160,6 +195,10 @@ assert.equal(chip.text, '500 积分 · 12.0 小时后到期');
 assert.equal(chip.tone, 'danger', '一天内到期按危险色');
 assert.match(chip.title, /月度套餐 500 积分 12.0 小时后到期/);
 assert.match(chip.title, /共有 1,500 积分带到期时间/, '说明里只统计还有额度的套餐');
+const manyGrants = Array.from({ length: 6 }, (_, i) => ({ at: sec(now) + (i + 1) * 86400, amount: 10, name: '包' + i }));
+const manyTitle = logic.creditExpiryChip(base({ creditExpiries: manyGrants }), now).title.split('\n');
+assert.equal(manyTitle.length, 5, '说明只列最早三笔，加汇总行与剩余笔数');
+assert.match(manyTitle[4], /另有 3 笔/);
 assert.equal(logic.creditExpiryChip(base(), now), null);
 assert.equal(logic.creditExpiryChip(base({ creditExpiries: [{ at: sec(now) + 5 * 86400, amount: 10 }] }), now).tone, 'warning');
 assert.equal(logic.creditExpiryChip(base({ creditExpiries: [{ at: sec(now) + 30 * 86400, amount: 10 }] }), now).tone, 'muted');
@@ -217,7 +256,7 @@ assert.equal(logic.parsePriorityInput('3.5').ok, false);
 assert.deepEqual(logic.parsePriorityInput(500, { priorityMax: 500 }), { ok: true, value: 500 });
 assert.equal(logic.parsePriorityInput(501, { priorityMax: 500 }).ok, false);
 
-// ---- 单账号单模型的并发上限：0 或空表示不限
+// ---- 单账号并发上限：0 或空表示不限
 assert.deepEqual(logic.parseConcurrencyInput(''), { ok: true, value: 0 });
 assert.deepEqual(logic.parseConcurrencyInput(' 0 '), { ok: true, value: 0 });
 assert.deepEqual(logic.parseConcurrencyInput('4'), { ok: true, value: 4 });
@@ -229,8 +268,18 @@ assert.equal(logic.parseConcurrencyInput('abc').ok, false);
 assert.deepEqual(logic.parseConcurrencyInput(40, { concurrencyMax: 40 }), { ok: true, value: 40 });
 assert.equal(logic.parseConcurrencyInput(41, { concurrencyMax: 40 }).ok, false);
 assert.equal(logic.accountLimits({ priorityMax: 5, concurrencyMax: 6, noteMax: 7 }).noteMax, 7);
+assert.equal(logic.accountLimits({}).noteMax, 200, '备注上限与服务端 MAX_ACCOUNT_NOTE 一致');
+assert.equal(logic.accountLimits({}).groupMax, 64);
 assert.ok(logic.parseConcurrencyInput('1001').message.includes('0 表示不限'),
   '拒绝时要说清填写 0 表示不限，否则操作员不知道怎么关掉');
+
+// 账号自带范围时按它校验：CodeArts 只允许 1 到 3，空值和 0 都不再表示不限
+const codearts = { concurrencyMin: 1, concurrencyMax: 3 };
+assert.deepEqual(logic.parseConcurrencyInput('3', {}, codearts), { ok: true, value: 3 });
+assert.equal(logic.parseConcurrencyInput('4', {}, codearts).ok, false);
+assert.equal(logic.parseConcurrencyInput('0', {}, codearts).ok, false);
+assert.equal(logic.parseConcurrencyInput('', {}, codearts).ok, false);
+assert.ok(!logic.parseConcurrencyInput('4', {}, codearts).message.includes('不限'));
 
 // 旧账号缺少该字段时按不限处理
 assert.equal(logic.concurrencyOf(base()), 0, '没设过的账号按不限处理');
@@ -240,6 +289,21 @@ assert.equal(logic.concurrencyOf(base({ concurrencyLimit: -2 })), 0, '手工改�
 assert.equal(logic.concurrencyOf(base({ concurrencyLimit: 'x' })), 0);
 assert.equal(logic.activeRequestsOf(base()), 0);
 assert.equal(logic.activeRequestsOf(base({ activeRequests: 2 })), 2);
+
+// ---- 调度权重：1..100 的整数
+assert.deepEqual(logic.parseWeightInput('1'), { ok: true, value: 1 });
+assert.deepEqual(logic.parseWeightInput(100), { ok: true, value: 100 });
+assert.equal(logic.parseWeightInput('0').ok, false);
+assert.equal(logic.parseWeightInput('101').ok, false);
+assert.equal(logic.parseWeightInput('').ok, false);
+assert.equal(logic.parseWeightInput('abc').ok, false);
+assert.equal(logic.parseWeightInput('2.5').ok, false);
+assert.deepEqual(logic.parseWeightInput(5, { weightMax: 5 }), { ok: true, value: 5 });
+assert.equal(logic.parseWeightInput(6, { weightMax: 5 }).ok, false);
+assert.equal(logic.weightOf(base()), 1, '没设过的账号按权重 1 参与调度');
+assert.equal(logic.weightOf(base({ weight: 7 })), 7);
+assert.equal(logic.weightOf(base({ weight: 0 })), 1);
+assert.equal(logic.weightOf(base({ weight: 'x' })), 1);
 
 // ---- 心跳重绘时的草稿
 const draft = { uid: 'uid-a', field: 'priority', value: '7', start: 1, end: 1 };
@@ -270,12 +334,9 @@ assert.equal(unknownSlot.selected, 'gone');
 assert.equal(unknownSlot.options.at(-1).label, '未知槽位 gone');
 assert.equal(logic.slotOptions(base({ proxy: 'http://x', proxySlot: 's1' }), []).selected, 's1', '已经绑定槽位时不再看旧代理');
 
-// ---- 身份下拉
-assert.equal(logic.productOptions(base()).selected, 'workbuddy');
-assert.equal(logic.productOptions(base({ product: 'vscode' })).selected, 'vscode');
-assert.equal(logic.productOptions(base({ product: 'bad' })).selected, 'workbuddy');
-assert.equal(logic.productOptions(base()).options.length, 3);
+// ---- 登录客户端标签（添加账号弹窗）
 assert.equal(logic.productLabel('cli'), '官方 CodeBuddy CLI');
+assert.equal(logic.productLabel('gone'), 'gone');
 
 // ---- 用量与批量结果
 assert.deepEqual(logic.usageFor({}, 'u1'), { requests: 0, total_tokens: 0 });

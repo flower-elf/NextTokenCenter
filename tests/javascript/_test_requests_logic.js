@@ -1,6 +1,7 @@
 /* 请求日志页纯逻辑：筛选状态、查询串、状态分档、详情字段。
  * node tests/javascript/_test_requests_logic.js */
 import assert from 'node:assert/strict';
+import './_channels_fixture.js';
 
 const logic = await import('../../app/web/js/pages/requests/logic.js');
 
@@ -59,9 +60,6 @@ const state = (filters = {}, extra = {}) => ({
   assert.equal(combo.get('ip'), '10.0.');
   assert.equal(combo.get('page'), '3');
   assert.equal(combo.get('limit'), '50');
-
-  const bogus = params(logic.buildRecentQuery(state({ realm: 'eu' }), NOW));
-  assert.equal(bogus.get('realm'), 'all', '取值不在登记表里时退回全部');
 }
 
 // ---- 筛选变化与页码
@@ -72,6 +70,22 @@ const state = (filters = {}, extra = {}) => ({
   assert.equal(changed.filters.status, 'fail');
   assert.equal(started.page, 7, '原状态不被就地修改');
   assert.equal(logic.withFilter(started, 'realm', 'cn').page, 1, '同值也不能把页码停在旧页');
+
+  // 渠道变化时，账号筛选只保留新渠道里的账号
+  const accounts = [
+    { uid: 'uid-intl-a', nickname: '甲', realm: 'intl' },
+    { uid: 'uid-cn-a', nickname: '乙', realm: 'cn' },
+    { uid: 'uid-ca-a', nickname: '丙', realm: 'codearts' },
+  ];
+  assert.deepEqual(logic.accountOptions(accounts, 'cn').map((o) => o.id), ['', 'uid-cn-a']);
+  assert.deepEqual(logic.accountOptions(accounts, 'all').map((o) => o.id), ['', 'uid-intl-a', 'uid-cn-a', 'uid-ca-a']);
+  const onIntl = state({ realm: 'intl', account: 'uid-intl-a' });
+  assert.equal(logic.withFilter(onIntl, 'realm', 'cn', accounts).filters.account, '',
+    '切到别的渠道时清掉不属于该渠道的账号筛选');
+  assert.equal(logic.withFilter(onIntl, 'realm', 'all', accounts).filters.account, 'uid-intl-a',
+    '切到「全部」时原来的账号仍然可选');
+  assert.equal(logic.withFilter(onIntl, 'status', 'ok', accounts).filters.account, 'uid-intl-a',
+    '其它筛选变化不动账号筛选');
 
   assert.equal(logic.withLimit(started, 100).limit, 100);
   assert.equal(logic.withLimit(started, 100).page, 1);
@@ -93,13 +107,15 @@ const state = (filters = {}, extra = {}) => ({
   assert.equal(logic.isFiltered(logic.changeFilter(logic.defaultFilters(), 'status', 'ok')), true);
 }
 
-// ---- 初始筛选的版本跟随右上角「查看的版本」
+// ---- 初始筛选的渠道跟随右上角「查看的渠道」，只认网关当前可用的渠道
 {
+  const realms = ['intl', 'cn', 'codearts'];
   assert.equal(logic.defaultFilters().realm, 'all');
-  assert.equal(logic.defaultFilters('cn').realm, 'cn');
-  assert.equal(logic.defaultFilters('intl').realm, 'intl');
-  assert.equal(logic.defaultFilters('eu').realm, 'all', '未知版本回到全部');
-  const base = logic.defaultFilters('cn');
+  assert.equal(logic.defaultFilters('cn', realms).realm, 'cn');
+  assert.equal(logic.defaultFilters('codearts', realms).realm, 'codearts');
+  assert.equal(logic.defaultFilters('codearts', ['intl', 'cn']).realm, 'all', '不可用的渠道回到全部');
+  assert.deepEqual(logic.realmOptions(realms).map((o) => o.id), ['all', ...realms]);
+  const base = logic.defaultFilters('cn', realms);
   assert.equal(logic.isFiltered(base, base), false, '跟随版本的默认条件不算已筛选');
   assert.equal(logic.isFiltered({ ...base, model: 'glm' }, base), true);
   assert.equal(params(logic.buildRecentQuery({ filters: base, page: 1 }, NOW)).get('realm'), 'cn');
@@ -180,6 +196,7 @@ const state = (filters = {}, extra = {}) => ({
   assert.equal(logic.creditText({ credit: 1.23456 }).text, '1.23');
   assert.equal(logic.creditText({ credit: 0.42 }).text, '0.4200', '不足 1 积分保留四位小数');
   assert.equal(logic.creditText({}).text, '—');
+  assert.equal(logic.creditText({ credit: null }).missing, true, '缺省与显式 null 都是未采集');
   assert.equal(logic.creditText({}).title, '上游未返回该项');
   assert.equal(logic.creditText({ credit: 'x' }).missing, true);
 }

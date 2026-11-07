@@ -8,25 +8,26 @@ import { readStore, writeStore } from '../core/storage.js';
 import { fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtNumber } from '../core/format.js';
 import {
   pageHeader, emptyState, loadErrorPage, loadErrorInline, badge, copyButton,
-  busyClick, pager, skeletonBlock, skeletonRows, realmBadge,
+  busyClick, pager, skeletonBlock, skeletonRows, channelBadge,
 } from '../ui/widgets.js';
 import { openDialog } from '../ui/dialog.js';
 import {
-  PAGE_SIZES, LIMIT_STORE_KEY, RANGE_OPTIONS, REALM_OPTIONS, STATUS_OPTIONS,
+  PAGE_SIZES, LIMIT_STORE_KEY, RANGE_OPTIONS, STATUS_OPTIONS, realmOptions, accountOptions,
   defaultFilters, normalizeLimit, isFiltered, withFilter, withLimit, withPage, pruneFilters,
   buildRecentQuery, statusInfo, keyLabel, accountLabel, rowTimestamp, cacheHint,
-  creditText, effortLabel, pageList, requestDetail,
+  creditText, effortLabel, modelTitle, pageList, requestDetail,
 } from './requests/logic.js';
+import { loadAccounts } from './accounts/actions.js';
 
 export const autoRefresh = true;
 
-const PAGE_DESC = '反向代理网关的每一次调用记录，含状态、首字延迟与 Token 计量。';
+const PAGE_DESC = '网关每一次调用记录，含状态、延迟与 Token 计量。';
 
 export function mount(host) {
   const viewRealm = getState().viewRealm;
   let state = {
-    filters: defaultFilters(viewRealm),
-    baseFilters: defaultFilters(viewRealm),
+    filters: defaultFilters(viewRealm, getState().realms),
+    baseFilters: defaultFilters(viewRealm, getState().realms),
     page: 1,
     limit: normalizeLimit(readStore(LIMIT_STORE_KEY)),
     rows: [],
@@ -59,16 +60,16 @@ export function mount(host) {
 
   async function loadOptions() {
     try {
-      const [settings, accounts] = await Promise.all([getJSON('/settings'), getJSON('/accounts?realm=all')]);
+      const [settings, accounts] = await Promise.all([getJSON('/settings'), loadAccounts()]);
       state.keys = Array.isArray(settings.api_keys) ? settings.api_keys : [];
-      state.accounts = Array.isArray(accounts.accounts) ? accounts.accounts : [];
+      state.accounts = accounts.accounts || [];
       state.optionsError = '';
       state.filters = pruneFilters(state.filters, {
         keyIds: ['', 'panel', ...state.keys.map((k) => k.id)],
-        accountIds: ['', ...state.accounts.map((a) => a.uid)],
+        accountIds: accountOptions(state.accounts, state.filters.realm).map((option) => option.id),
       });
     } catch (err) {
-      state.optionsError = '密钥与账号列表没有读取成功，筛选项里暂时看不到它们。' + (err.message ? ' ' + err.message : '');
+      state.optionsError = '密钥与账号列表没有读取成功，筛选项暂时为空：' + (err.message || '未知原因');
     }
   }
 
@@ -87,7 +88,7 @@ export function mount(host) {
       state.error = '';
       state.loaded = true;
     } catch (err) {
-      state.error = '请求记录没有读取成功。' + (err.message ? ' ' + err.message : '');
+      state.error = '请求记录没有读取成功：' + (err.message || '未知原因');
     } finally {
       loading = false;
     }
@@ -105,7 +106,7 @@ export function mount(host) {
 
   function setFilter(name, value) {
     if (state.filters[name] === value) return;
-    state = withFilter(state, name, value);
+    state = withFilter(state, name, value, state.accounts);
     loadRows();
   }
 
@@ -173,14 +174,11 @@ export function mount(host) {
       ...state.keys.map((k) => ({ id: k.id, label: k.name || k.id })),
       { id: 'panel', label: '面板测试台' },
     ];
-    const accountOptions = [
-      { id: '', label: '全部账号' },
-      ...state.accounts.map((a) => ({ id: a.uid, label: a.nickname || a.uid.slice(0, 8) })),
-    ];
+    const accountOpts = accountOptions(state.accounts, state.filters.realm);
     return html`
       <div class="card req-filters">
         ${selectField('时间范围', 'range', RANGE_OPTIONS, state.filters.range)}
-        ${selectField('版本', 'realm', REALM_OPTIONS, state.filters.realm)}
+        ${selectField('渠道', 'realm', realmOptions(getState().realms), state.filters.realm)}
         ${selectField('密钥', 'key', keyOptions, state.filters.key)}
         ${selectField('状态', 'status', STATUS_OPTIONS, state.filters.status)}
         <label class="field">
@@ -189,7 +187,7 @@ export function mount(host) {
                  placeholder="模型名的一部分，例如 deepseek"
                  @input=${(event) => onTextInput('model', event.target.value)}>
         </label>
-        ${selectField('账号', 'account', accountOptions, state.filters.account)}
+        ${selectField('账号', 'account', accountOpts, state.filters.account)}
         <label class="field">
           <span class="field-label">来源 IP</span>
           <input class="input" type="search" data-name="ip" .value=${state.filters.ip}
@@ -250,7 +248,7 @@ export function mount(host) {
             <table class="table table-compact">
               <thead>
                 <tr>
-                  <th>时间</th><th>版本</th><th>密钥</th><th>IP</th><th>账号</th><th>模型</th><th>状态</th>
+                  <th>时间</th><th>渠道</th><th>密钥</th><th>IP</th><th>账号</th><th>模型</th><th>状态</th>
                   <th class="right">首字</th><th class="right">总耗时</th>
                   <th class="right">Token</th><th class="right">积分</th>
                 </tr>
@@ -259,11 +257,11 @@ export function mount(host) {
                 ${rows.map((row) => html`
                   <tr class="clickable" @click=${() => openDetail(row, keys, accounts)}>
                     <td class="nums">${fmtDateTimeMarked(rowTimestamp(row))}</td>
-                    <td>${row.realm ? realmBadge(row.realm) : html`<span class="muted">—</span>`}</td>
+                    <td>${row.realm ? channelBadge(row.realm) : html`<span class="muted">—</span>`}</td>
                     <td class="truncate" title=${row.key_id || ''}>${keyLabel(row, keys)}</td>
                     <td class="cell-mono">${row.ip || '未采集'}</td>
                     <td class="truncate" title=${row.account || ''}>${accountLabel(row.account, accounts)}</td>
-                    <td class="truncate" title=${row.model || ''}><span class="cell-mono">${row.model || '—'}</span>${effortChip(row)}</td>
+                    <td class="truncate" title=${modelTitle(row)}><span class="cell-mono">${row.model || '—'}</span>${effortChip(row)}</td>
                     <td>${statusCell(row)}</td>
                     <td class="right nums">${fmtLatency(row.ttft_ms)}</td>
                     <td class="right nums">${fmtLatency(row.elapsed_ms)}</td>
@@ -277,7 +275,7 @@ export function mount(host) {
             ${rows.map((row) => html`
               <div class="mobile-item" @click=${() => openDetail(row, keys, accounts)}>
                 <div class="row-between">
-                  <span class="row text-xs strong nums">${fmtDateTimeMarked(rowTimestamp(row))}${row.realm ? realmBadge(row.realm) : nothing}</span>
+                  <span class="row text-xs strong nums">${fmtDateTimeMarked(rowTimestamp(row))}${row.realm ? channelBadge(row.realm) : nothing}</span>
                   ${statusCell(row)}
                 </div>
                 <div class="row-between text-2xs muted">
@@ -286,13 +284,13 @@ export function mount(host) {
                 </div>
                 <div class="row-between">
                   <span class="text-xs truncate">${accountLabel(row.account, accounts)}</span>
-                  <span class="text-2xs truncate"><span class="cell-mono">${row.model || '—'}</span>${effortChip(row)}</span>
+                  <span class="text-2xs truncate" title=${modelTitle(row)}><span class="cell-mono">${row.model || '—'}</span>${effortChip(row)}</span>
                 </div>
                 <div class="row-wrap text-2xs muted nums">
                   <span>首字 ${fmtLatency(row.ttft_ms)}</span>
                   <span>总耗时 ${fmtLatency(row.elapsed_ms)}</span>
                   <span>${fmtNumber(row.total_tokens)} Token</span>
-                  ${creditText(row).missing ? nothing : html`<span>${creditText(row).text} 积分</span>`}
+                  <span>积分 ${creditText(row).text}</span>
                 </div>
               </div>`)}
           </div>` : emptyState(state.total === 0 && !isFiltered(state.filters, state.baseFilters) ? {

@@ -6,6 +6,4 @@
 *.exe binary
 *.dll binary
 *.zip binary
-*.ipk binary
-*.apk binary
 *.tar.gz binary

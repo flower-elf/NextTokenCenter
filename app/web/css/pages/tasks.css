@@ -1,7 +1,7 @@
 /* 任务页：调度器日志与成长任务执行日志。 */
 
 .log-box {
-  max-height: 190px; overflow-y: auto; border-radius: 14px; padding: 10px 12px;
+  max-height: 190px; overflow-y: auto; border-radius: var(--radius-nested); padding: 10px 12px;
   background: color-mix(in oklab, var(--background) 60%, transparent);
   font-family: var(--font-mono); font-size: 11px; line-height: 18px;
 }

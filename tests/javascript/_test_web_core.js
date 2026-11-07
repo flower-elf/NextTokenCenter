@@ -1,4 +1,4 @@
-/* 看板公共模块：存储容错、请求错误处理、查看版本与默认出口的分离、格式化边界、命令面板匹配、路由解析。 */
+/* 看板公共模块：存储容错、请求错误处理、查看渠道与默认路由的分离、格式化边界、命令面板匹配、路由解析。 */
 import assert from 'node:assert/strict';
 
 const storageBlocked = {
@@ -178,28 +178,44 @@ api.setApiKey('sk-good');
 assert.equal(api.authHeaders().Authorization, 'Bearer sk-good');
 api.setApiKey('');
 
-// ---- 查看的版本与网关默认出口相互独立
-let exit = 'intl';
-server = () => ({ status: 200, body: { current: exit, ok: true } });
+// ---- 查看的版本与网关默认路由相互独立
+const CHANNELS = [
+  { id: 'intl', label: '国际版', host: 'www.workbuddy.ai', icon: 'Globe', tone: 'sky', provider: 'workbuddy', features: {} },
+  { id: 'cn', label: '国内版', host: 'www.workbuddy.cn', icon: 'House', tone: 'warning', provider: 'workbuddy', features: {} },
+  { id: 'codearts', label: 'CodeArts', host: '', icon: 'Cloud', tone: 'violet', provider: 'codearts', features: {} },
+];
+let route = ['intl', 'codearts'];
+const realmBody = () => ({ route, options: ['intl', 'cn', 'codearts'], channels: CHANNELS, ok: true });
+server = () => ({ status: 200, body: realmBody() });
 globalThis.location = new URL('http://panel.local/');
 await store.initRealms();
-assert.equal(store.getState().viewRealm, 'intl', '启动时查看的版本跟随默认出口');
-exit = 'cn';
+assert.deepEqual(store.getState().activeRoute, ['intl', 'codearts'], '启动时读到网关默认路由');
+assert.equal(store.getState().viewRealm, 'intl', '查看的版本取默认路由的第一项');
+route = ['cn'];
 globalThis.location = new URL('http://panel.local/?view=intl');
 await store.initRealms();
 assert.equal(store.getState().viewRealm, 'intl', '地址栏 ?view= 优先');
-assert.equal(store.getState().activeRealm, 'cn');
+assert.deepEqual(store.getState().activeRoute, ['cn']);
 store.setViewRealm('cn');
-exit = 'intl';
+route = ['codearts', 'cn'];
 const seen = [];
 const off = store.subscribe((reason) => seen.push(reason));
-await store.refreshActiveRealm();
-assert.equal(store.getState().activeRealm, 'intl', '默认出口被刷新');
-assert.equal(store.getState().viewRealm, 'cn', '刷新默认出口不得改动查看的版本');
-assert.deepEqual(seen, ['activeRealm']);
+await store.refreshActiveRoute();
+assert.deepEqual(store.getState().activeRoute, ['codearts', 'cn'], '默认路由被刷新');
+assert.equal(store.getState().viewRealm, 'cn', '刷新默认路由不得改动查看的版本');
+assert.deepEqual(seen, ['activeRoute']);
 off();
 assert.equal(globalThis.location.searchParams.get('view'), 'cn', '手动切换的版本写进地址栏，刷新页面后保持');
 assert.throws(() => store.setViewRealm('eu'));
+route = ['cn', 'codearts'];
+assert.deepEqual(await store.switchActiveRoute(['cn', 'codearts']), ['cn', 'codearts']);
+assert.deepEqual(store.getState().activeRoute, ['cn', 'codearts'], '保存后采用服务端返回的路由');
+assert.deepEqual(JSON.parse(requests.at(-1).init.body), { route: ['cn', 'codearts'] });
+route = [];
+globalThis.location = new URL('http://panel.local/');
+await store.initRealms();
+assert.deepEqual(store.getState().activeRoute, [], '路由可以为空');
+assert.equal(store.getState().viewRealm, 'intl', '默认路由为空时查看第一个可选渠道');
 
 // ---- 格式化边界
 assert.equal(format.fmtCredit(0), '0');
@@ -214,6 +230,18 @@ assert.equal(format.fmtRemain(0), '已过期');
 assert.equal(format.fmtRemain(59), '1 分钟');
 assert.equal(format.fmtRemain(3600), '1.0 小时');
 assert.equal(format.fmtRemain(86400 * 2.5), '2.5 天');
+assert.equal(format.spaceMixed('CodeArts账号'), 'CodeArts 账号', '中文与字母之间补空格');
+assert.equal(format.spaceMixed('账号CodeArts'), '账号 CodeArts', '字母与中文之间补空格');
+assert.equal(format.spaceMixed('已刷新CodeArts账号的积分'), '已刷新 CodeArts 账号的积分');
+assert.equal(format.spaceMixed('仅CodeArts'), '仅 CodeArts');
+assert.equal(format.spaceMixed('第3个'), '第 3 个', '数字与中文之间同样补空格');
+assert.equal(format.spaceMixed('v1.2版本'), 'v1.2 版本');
+assert.equal(format.spaceMixed('CodeArts 账号'), 'CodeArts 账号', '已有空格不重复添加');
+assert.equal(format.spaceMixed('「CodeArts」'), '「CodeArts」', '全角标点边界保持原样');
+assert.equal(format.spaceMixed('CodeArts-账号'), 'CodeArts-账号', '半角标点边界保持原样');
+assert.equal(format.spaceMixed('全部渠道合并'), '全部渠道合并');
+assert.equal(format.spaceMixed(''), '');
+assert.equal(format.spaceMixed(null), '');
 const now = new Date(2026, 9, 1, 0, 30).getTime();
 assert.equal(format.fmtDateTimeMarked(new Date(2026, 8, 30, 23, 59, 1).getTime(), now), '昨天 23:59:01', '跨月的前一天也是昨天');
 assert.equal(format.fmtDateTimeMarked(new Date(2026, 8, 29, 8, 0, 0).getTime(), now), '09-29 08:00:00');
@@ -244,9 +272,12 @@ assert.ok(entries.some((e) => e.path === 'settings' && e.sub === 'proxy'), '设�
 assert.equal(palette.searchPalette(entries, '账号')[0].path, 'accounts');
 assert.equal(palette.searchPalette(entries, '日志')[0].path, 'requests', '包含「日志」的页面里，登记顺序在前的排前面');
 const both = palette.searchPalette(entries, '代理 设置');
-assert.equal(both.length, 1);
-assert.equal(both[0].sub, 'proxy');
+assert.ok(both.length >= 1 && both[0].sub === 'proxy', '「代理 设置」把代理槽放在最前');
+assert.ok(both.every((e) => e.path === 'settings'), '两个词都要命中的是设置页标签');
 assert.deepEqual(palette.searchPalette(entries, '不存在的页面'), []);
+assert.equal(palette.searchPalette(entries, '加密')[0].sub, 'codearts', '搜索「加密」要能找到 CodeArts 的请求加密');
+assert.equal(palette.searchPalette(entries, '国际版')[0].sub, 'workbuddy', '渠道名要能找到 WorkBuddy 设置');
+assert.equal(palette.searchPalette(entries, '并发')[0].path, 'accounts', '账号页的并发设置能被搜到');
 
 // ---- 路由解析
 assert.deepEqual(router.parseHash('#/settings/proxy'), { path: 'settings', sub: 'proxy' });

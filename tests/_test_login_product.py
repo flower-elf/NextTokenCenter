@@ -27,6 +27,7 @@ _TMP_ENV = isolated_data_dirs("wb-login-product-")
 import wb_accounts  # noqa: E402
 import wb_identity  # noqa: E402
 import wb_proxy as P  # noqa: E402
+import wb_settings  # noqa: E402
 
 CASES = (
     ("cn", "workbuddy", "workbuddy"),
@@ -50,10 +51,12 @@ class FakeUpstream(object):
         self.uid = uid
         self.urls = []
         self.headers = []
+        self.proxies = []
 
     def __call__(self, url, **kwargs):
         self.urls.append(url)
         self.headers.append(dict(kwargs.get("headers") or {}))
+        self.proxies.append(kwargs.get("proxy") or "")
         if "/auth/state" in url:
             return {"code": 0, "data": {"state": "st-1", "authUrl": "https://login.example/x"}}
         return {"code": 0, "data": {"accessToken": fake_token(self.uid),
@@ -113,6 +116,47 @@ class LoginProductTests(unittest.TestCase):
                                  wb_identity.endpoint_for(realm, product)[1])
                 auth_urls = [u for u in upstream.urls if "/auth/" in u]
                 self.assertTrue(all(u.startswith(endpoint) for u in auth_urls), auth_urls)
+
+    def test_login_can_use_a_proxy_slot(self):
+        directory = os.path.join(os.environ["ACCOUNTS_DIR"], "slot-login")
+        os.makedirs(directory, exist_ok=True)
+        slot_url = "http://user:pass@127.0.0.1:18080"
+        wb_settings.set_proxy_slots(directory, [{"id": "slot-1", "url": slot_url}])
+        pool = wb_accounts.AccountPool(directory)
+        upstream = FakeUpstream("uid-slot")
+        with mock.patch.object(wb_accounts, "http_json", upstream), \
+             mock.patch.object(wb_accounts, "urlopen", fake_profile):
+            started = pool.start_login(realm="cn", product="cli", proxy_slot="slot-1")
+            result = pool.poll_login(started["state"])
+        self.assertEqual(started["proxySlot"], "slot-1")
+        self.assertEqual(started["proxy"], "127.0.0.1:18080")
+        self.assertTrue(all(proxy == slot_url for proxy in upstream.proxies),
+                        upstream.proxies)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["account"]["proxySlot"], "slot-1")
+        reloaded = {a.uid: a for a in wb_accounts.AccountPool(directory).load()}
+        self.assertEqual(reloaded["uid-slot"].proxy_slot, "slot-1")
+
+    def test_login_auto_slot_picks_an_unbound_slot(self):
+        directory = os.path.join(os.environ["ACCOUNTS_DIR"], "slot-auto")
+        os.makedirs(directory, exist_ok=True)
+        slot_url = "http://127.0.0.1:18081"
+        wb_settings.set_proxy_slots(directory, [{"id": "slot-1", "url": slot_url}])
+        pool = wb_accounts.AccountPool(directory)
+        upstream = FakeUpstream("uid-auto")
+        with mock.patch.object(wb_accounts, "http_json", upstream), \
+             mock.patch.object(wb_accounts, "urlopen", fake_profile):
+            started = pool.start_login(realm="cn", product="cli", proxy_slot="auto")
+        self.assertEqual(started["proxySlot"], "slot-1")
+        self.assertTrue(all(proxy == slot_url for proxy in upstream.proxies),
+                        upstream.proxies)
+
+    def test_login_rejects_an_unknown_slot(self):
+        directory = os.path.join(os.environ["ACCOUNTS_DIR"], "slot-missing")
+        os.makedirs(directory, exist_ok=True)
+        pool = wb_accounts.AccountPool(directory)
+        with self.assertRaises(ValueError):
+            pool.start_login(realm="cn", product="cli", proxy_slot="slot-missing")
 
     def test_login_headers_follow_the_chosen_client(self):
         for realm, product, _platform in CASES:

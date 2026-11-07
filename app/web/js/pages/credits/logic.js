@@ -69,6 +69,29 @@ function hasCreditExpiry(item) {
   return !item.noExpiry && item.packageCode !== 'enterprise';
 }
 
+/**
+ * 账号带到期时间的积分条目，毫秒时刻、按到期升序。
+ * 优先用后端按渠道统一算好的 creditExpiries，读不到时从套餐的 expireAt 推导。
+ */
+export function accountExpiryEntries(account) {
+  const direct = Array.isArray(account && account.creditExpiries) ? account.creditExpiries : null;
+  if (direct && direct.length) {
+    return direct
+      .map((item) => ({
+        at: millis(item && item.at),
+        amount: numberOrZero(item && item.amount),
+        name: String((item && item.name) || ''),
+      }))
+      .filter((item) => item.at > 0 && item.amount > 0)
+      .sort((x, y) => x.at - y.at);
+  }
+  return packagesOf(account)
+    .filter(hasCreditExpiry)
+    .map((item) => ({ at: item.expireAt, amount: item.remain, name: item.name }))
+    .filter((item) => item.at > 0 && item.amount > 0)
+    .sort((x, y) => x.at - y.at);
+}
+
 /** 按来源归并套餐：同一来源的多笔到账合成一行，便于看该来源一共给了多少、剩下多少。 */
 export function groupPackages(packages, now = Date.now()) {
   const groups = new Map();
@@ -130,23 +153,31 @@ export function accountCredits(account, now = Date.now()) {
   const remain = credits ? numberOrZero(credits.remain) : 0;
   const used = credits ? numberOrZero(credits.used) : 0;
   const size = credits ? numberOrZero(credits.size) : 0;
-  let nextExpireAt = 0;
-  let nextExpireAmount = 0;
-  for (const item of packages) {
-    if (item.remain <= 0 || item.expireAt <= now) continue;
-    if (!hasCreditExpiry(item)) continue;
-    if (!nextExpireAt || item.expireAt < nextExpireAt) {
-      nextExpireAt = item.expireAt;
-      nextExpireAmount = item.remain;
-    }
+  const expiries = accountExpiryEntries(account);
+  const next = expiries.find((item) => item.at > now) || null;
+  // 上游只给合计余额时（例如 CodeArts）也列一行，页面不至于只有汇总卡没有明细。
+  if (!groups.length && credits && (size || remain || used)) {
+    groups.push({
+      key: '@total',
+      name: String(credits.package || '').trim() || '合计余额',
+      subProduct: '',
+      count: 1,
+      size,
+      remain,
+      used,
+      nextExpireAt: next ? next.at : 0,
+      lastExpireAt: 0,
+      state: remain > 0 ? 'active' : 'used',
+      packages: [],
+    });
   }
   return {
     queried: Boolean(credits),
     remain, used, size,
     sizeText: fmtNumber(size),
     groups,
-    nextExpireAt,
-    nextExpireAmount,
+    nextExpireAt: next ? next.at : 0,
+    nextExpireAmount: next ? next.amount : 0,
     age: creditAgeText(credits, now),
   };
 }
@@ -164,16 +195,15 @@ export function pageTotals(accounts) {
   return totals;
 }
 
-/** 指定天数内到期的剩余积分合计：只算还有额度、带到期时间且尚未过期的套餐。 */
+/** 指定天数内到期的剩余积分合计：只算还有额度、带到期时间且尚未过期的条目。 */
 export function expiringTotal(accounts, days = 15, now = Date.now()) {
   const cutoff = now + days * 86400000;
   let total = 0;
   for (const account of accounts || []) {
-    for (const item of packagesOf(account)) {
-      if (item.remain <= 0 || !item.expireAt) continue;
-      if (!hasCreditExpiry(item)) continue;
-      if (item.expireAt <= now || item.expireAt > cutoff) continue;
-      total += item.remain;
+    for (const item of accountExpiryEntries(account)) {
+      if (item.amount <= 0 || !item.at) continue;
+      if (item.at <= now || item.at > cutoff) continue;
+      total += item.amount;
     }
   }
   return total;
@@ -183,14 +213,13 @@ export function expiringTotal(accounts, days = 15, now = Date.now()) {
 export function nextExpiry(accounts, now = Date.now()) {
   let hit = null;
   for (const account of accounts || []) {
-    for (const item of packagesOf(account)) {
-      if (item.remain <= 0 || item.expireAt <= now) continue;
-      if (!hasCreditExpiry(item)) continue;
-      if (hit && item.expireAt >= hit.at) continue;
+    for (const item of accountExpiryEntries(account)) {
+      if (item.amount <= 0 || item.at <= now) continue;
+      if (hit && item.at >= hit.at) continue;
       hit = {
-        at: item.expireAt,
-        amount: item.remain,
-        name: item.name,
+        at: item.at,
+        amount: item.amount,
+        name: item.name || (account.credits && account.credits.package) || '积分',
         account: (account && (account.nickname || account.uid)) || '账号',
       };
     }

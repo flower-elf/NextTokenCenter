@@ -1,5 +1,5 @@
 # WorkBuddy Multi-Account Reverse Proxy Gateway
-FROM python:3.11-alpine
+FROM python:3.12-alpine
 
 ENV PYTHONUNBUFFERED=1     HOST=0.0.0.0     PORT=8788     API_KEY=     TZ=Asia/Shanghai
 
@@ -7,7 +7,11 @@ WORKDIR /app
 
 RUN apk add --no-cache tzdata ca-certificates &&     cp /usr/share/zoneinfo/${TZ} /etc/localtime &&     echo "${TZ}" > /etc/timezone
 
-# Copy app files; no pip dependencies needed
+# 依赖层放在源码之前：改 app/ 不会让 pip 重装。alpine 用 musllinux wheel，
+# cryptography、brotli、zstandard 都有对应版本，构建不需要编译工具链。
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+
 COPY app/ ./app/
 
 RUN mkdir -p /app/accounts /app/usage

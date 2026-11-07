@@ -20,7 +20,7 @@ export function messagesFormatOptions(stored, fallback) {
 }
 
 /**
- * 接口测试模型下拉：首项是「默认」，随后是该出口目录里的模型。
+ * 接口测试模型下拉：首项是「默认」，随后是该渠道目录里的模型。
  * 服务端存着的模型如果已经不在目录里，补一条并标注「当前设置」，免得保存时被悄悄换掉。
  */
 export function testModelOptions(ids, stored) {
@@ -43,13 +43,17 @@ export function testModelSelected(stored) {
   return String(stored == null ? '' : stored).trim();
 }
 
-/** 下拉旁的状态说明：使用默认模型还是自定义模型（存着的值与默认相同时也算默认）。 */
-export function testModelStateText(stored, fallback) {
-  const keep = String(stored == null ? '' : stored).trim();
-  const effective = String(fallback == null ? '' : fallback).trim();
-  if (keep && keep !== effective) return { text: '当前 ' + keep, tone: 'info' };
-  const shown = effective || keep;
-  return { text: shown ? '默认 ' + shown : '默认', tone: 'muted' };
+/**
+ * 某个提供方的出站身份选项，来自设置视图的 identity_options。
+ * 服务端与账号页共用同一份定义，面板不再维护第二份列表。
+ */
+export function identityOptions(view, provider) {
+  const lists = (view && view.identity_options) || {};
+  const items = lists[provider];
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item && item.value)
+    .map((item) => ({ value: String(item.value), label: String(item.label || item.value) }));
 }
 
 /** 与服务端 parse_test_model 同一口径：字母或数字开头，只含字母数字点连字符下划线。 */
@@ -104,6 +108,21 @@ export function parseHours(text, { label = '时段' } = {}) {
 
 export function hoursText(hours) {
   return (hours || []).map((hour) => String(hour)).join(', ');
+}
+
+/**
+ * 某个账号池守卫在一个渠道的生效值：优先读该渠道的覆盖值，
+ * 其次是全局默认值。没有配置时返回 undefined，让字段声明里的 default 生效。
+ */
+export function limitScopeValue(view, key, realm) {
+  const entry = ((view && view.limits) || {})[key];
+  if (entry && typeof entry === 'object') {
+    const scoped = entry[realm];
+    if (scoped !== null && scoped !== undefined) return scoped;
+    if (entry.global !== null && entry.global !== undefined) return entry.global;
+  }
+  const flat = view ? view[key] : undefined;
+  return flat === null || flat === undefined ? undefined : flat;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +300,7 @@ export function slotsDirty(slots, baseline) {
   return JSON.stringify(shape(slots)) !== JSON.stringify(shape(baseline));
 }
 
-/** 把探测到并勾选的出口加入列表；已有相同地址的不再重复添加。 */
+/** 把探测到并勾选的代理加入列表；已有相同地址的不再重复添加。 */
 export function importCandidates(slots, candidates, pickedUrls) {
   const out = (slots || []).slice();
   const known = new Set(out.map((s) => String(s.url || '').trim()));
@@ -341,7 +360,7 @@ export function aboutRows(view, origin) {
     { label: 'API 地址', value: String(origin || '').replace(/\/+$/, '') + '/v1', mono: true, copy: true },
   ];
   const routing = data.routing;
-  if (routing && routing.smart_routing !== undefined) {
+  if (routing && routing.bound_hit !== undefined) {
     const count = (value) => Number(value) || 0;
     rows.push({
       label: '账号分配',

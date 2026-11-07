@@ -50,7 +50,21 @@ class Request(object):
 
 class FakePool(object):
     def __init__(self, total, ready):
-        self.accounts = [object()] * total
+        class _Account(object):
+            realm = "intl"
+            enabled = True
+            active_requests = 0
+
+            def __init__(self, index):
+                self.index = index
+
+            def servable(self):
+                return self.index < ready
+
+            def has_request_capacity(self, model=None):
+                return self.index < ready
+
+        self.accounts = [_Account(i) for i in range(total)]
         self._ready = ready
 
     def count_ready(self, realm=None, model=None):
@@ -111,6 +125,9 @@ class PanelStatusTests(unittest.TestCase):
                 status, info = proxy.Handler._get_panel_status(Request(authenticated=True))
         self.assertEqual(status, 200)
         self.assertEqual((info["accounts"], info["accounts_ready"]), (4, 2))
+        self.assertEqual(info["by_provider"]["workbuddy"],
+                         {"total": 4, "ready": 2})
+        self.assertIn("codearts", info["by_provider"])
         self.assertIn("api_key_set", info)
 
 
@@ -192,6 +209,37 @@ class ListenPortTests(unittest.TestCase):
                 self.assertEqual(proxy._LISTEN_PORT, 8806)
             finally:
                 proxy._LISTEN_PORT = saved
+
+
+class UnresponsivePortTests(unittest.TestCase):
+    def test_occupied_unresponsive_port_is_rejected(self):
+        import socket
+        import threading
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        accepted = []
+
+        def accept_once():
+            try:
+                conn, _ = server.accept()
+                accepted.append(conn)
+            except OSError:
+                pass
+
+        threading.Thread(target=accept_once, daemon=True).start()
+        fake = SimpleNamespace(port_owner_hint=lambda p: "owner hint",
+                               launcher_hint=lambda p: "launcher hint")
+        args = SimpleNamespace(host="127.0.0.1", port=port)
+        try:
+            with self.assertRaises(SystemExit):
+                B._probe_running_instance(fake, args)
+        finally:
+            server.close()
+            for conn in accepted:
+                conn.close()
 
 
 if __name__ == "__main__":

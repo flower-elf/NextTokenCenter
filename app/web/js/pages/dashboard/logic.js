@@ -1,9 +1,10 @@
-// 仪表盘的纯计算：账号筛选、可用性分档、积分与到期汇总、健康快照与出口密钥计数；只依赖 core/format.js 与账号页的积分函数。
+// 仪表盘的纯计算：账号筛选、可用性分档、积分与到期汇总、健康快照与路由密钥计数；只依赖 core/format.js 与账号页的积分函数。
 
 import { barColor, compareText, fmtNumber, fmtCredit, fmtDate } from '../../core/format.js';
 import { creditBarPct, validCredits } from '../accounts/logic.js';
+import { creditCollected } from '../stats/logic.js';
 
-/** 账号所属版本：存量账号没有 realm 字段时按国际版处理，与后端默认一致。 */
+/** 账号所属渠道：存量账号没有 realm 字段时按国际版处理，与后端默认一致。 */
 export function realmOf(account) {
   return account && account.realm ? account.realm : 'intl';
 }
@@ -193,13 +194,17 @@ export function creditTone(account, now = Date.now()) {
   return { text: fmtCredit(remain), total, tone: '' };
 }
 
-/** 默认出口当前生效的密钥数：绑定该出口的启用密钥 + 未绑定版本的启用密钥。 */
-export function keyEffect(keys, activeRealm) {
+/**
+ * 默认路由当前生效的密钥数：跟随面板的启用密钥按面板路由挑渠道，改路由立刻影响它们；
+ * 自带路由的启用密钥按自己的路由在渠道之间调度，不受面板路由影响。停用的密钥两类都不算。
+ */
+export function keyEffect(keys) {
   const list = keys || [];
   const on = (k) => k && k.enabled !== false;
-  const bound = list.filter((k) => on(k) && k.realm === activeRealm).length;
-  const follow = list.filter((k) => on(k) && !k.realm).length;
-  return { bound, follow, total: bound + follow };
+  const ownRoute = (k) => Array.isArray(k.route) && k.route.length > 0;
+  const following = list.filter((k) => on(k) && !ownRoute(k)).length;
+  const routed = list.filter((k) => on(k) && ownRoute(k)).length;
+  return { following, routed, total: following + routed };
 }
 
 /** 趋势窗口的合计：请求次数、失败次数与 Token 消耗。 */
@@ -211,9 +216,11 @@ export function trendSummary(buckets) {
 
 export function usageHints(usage) {
   const errors = Number(usage && usage.errors) || 0;
+  const known = usage && usage.credit !== null && usage.credit !== undefined
+    && usage.credit !== '' && creditCollected(usage);
   const credit = Number(usage && usage.credit) || 0;
   return {
     requestHint: errors > 0 ? '失败 ' + fmtNumber(errors) + ' 次' : '全部成功',
-    tokenHint: '消耗 ' + fmtCredit(credit) + ' 积分',
+    tokenHint: known ? '消耗 ' + fmtCredit(credit) + ' 积分' : '积分未采集',
   };
 }

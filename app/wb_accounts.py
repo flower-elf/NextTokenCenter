@@ -3,6 +3,7 @@ import base64
 import collections
 import json
 import os
+import random
 import ssl
 import sys
 import threading
@@ -18,6 +19,7 @@ import wb_atrest
 import wb_host
 import wb_identity
 import wb_settings
+import wb_tiers
 import wb_upstream_pool
 import wb_webagent
 
@@ -234,6 +236,18 @@ def login_headers(realm, product, method="POST"):
         headers["X-Custom-Channel-Id"] = "unknown"
     return headers
 
+def _proxy_host_port(url):
+    """代理 URL 的 host:port，去掉用户名密码；坏 URL 返回空串。"""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        host = parts.hostname or ""
+        if not host:
+            return ""
+        return ("%s:%s" % (host, parts.port)) if parts.port else host
+    except Exception:
+        return ""
+
+
 def _jwt_claims(token):
     try:
         segment = str(token).split(".")[1]
@@ -268,6 +282,24 @@ def normalize_epoch(value):
     if number > 1e11:
         number /= 1000.0
     return int(number)
+
+
+def _auth_expiry(data, token, now):
+    """刷新响应里的到期时刻：优先 expiresAt，其次 expiresIn 秒数，最后读令牌的 exp。
+
+    官方客户端按同样的顺序补齐 expiresAt；上游常常只回 expiresIn，令牌不是 JWT 时
+    少读这一层会让面板一直显示旧的有效期。
+    """
+    exp = normalize_epoch(data.get("expiresAt"))
+    if not exp:
+        try:
+            seconds = float(data.get("expiresIn") or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds > 0:
+            exp = int(now + seconds)
+    return exp or jwt_exp(token)
+
 
 #: token / 域名里能认出区域的字样。国内版有三套出口域名（copilot.tencent.com、
 #: codebuddy.cn、workbuddy.cn），三个都得认，少认一个会把国内账号判成国际版。
@@ -485,14 +517,16 @@ def _access_token_value(raw):
 DEFAULT_ACCOUNT_PRIORITY = 100
 #: 账号文件可手改，超出范围的优先级夹回边界值，选择顺序不受影响。
 MAX_ACCOUNT_PRIORITY = 9999
-#: 单账号单模型的并发上限：同一账号的每个模型各自计数，0 表示不限。
+#: 单账号的并发上限：所有模型合计的在途请求数，0 表示不限。
 MAX_ACCOUNT_CONCURRENCY = 1000
 #: 手动调度权重上限，面板与服务端共用这个值。
 MAX_ACCOUNT_WEIGHT = 100
+#: 账号分组名的最长字数，面板与服务端共用同一个上限。
+MAX_ACCOUNT_GROUP = 64
 #: 评分分配按最近一小时被选中的次数判断账号忙不忙，由 mark_pick() 记下。
 LOAD_WINDOW_SECONDS = 3600
-#: 账号备注的最长字数，面板与导入行共用同一个上限。
-MAX_ACCOUNT_NOTE = 100
+#: 账号备注的最长字数，面板与导入行共用同一个上限；两个提供方都读这里。
+MAX_ACCOUNT_NOTE = 200
 
 #: 套餐周期时刻取上游同款布局与时区：腾讯下发不带时区标记的 UTC+8 墙钟字符串，
 #: 按本机时区解析会在非 UTC+8 的机器上整体错开数小时（界面上看不出来）。
@@ -500,6 +534,19 @@ PACKAGE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 PACKAGE_TIME_TZ = timezone(timedelta(hours=8))
 #: 令牌剩余寿命低于这个值（秒）就认为需要刷新，ready() 与 refresh() 用同一个阈值。
 TOKEN_REFRESH_MARGIN = 120
+#: 官方客户端两次主动刷新的间隔：约 24 小时，随机抖动让多账号错开。
+CREDENTIAL_REFRESH_INTERVAL = 24 * 3600.0
+CREDENTIAL_REFRESH_LEAD = 300.0
+CREDENTIAL_REFRESH_JITTER = 600.0
+#: 访问令牌剩余不足这个值时，间隔缩短到几分钟，避免真正到期后再去换。
+CREDENTIAL_REFRESH_NEAR_EXPIRY = 24 * 3600.0
+CREDENTIAL_REFRESH_URGENT_DELAY = 300.0
+CREDENTIAL_REFRESH_URGENT_JITTER = 60.0
+#: 官方客户端在 30 秒冷却内不重复请求上游；手动刷新与 401 重试共用这个冷却。
+REFRESH_ATTEMPT_COOLDOWN = 30.0
+#: 主动刷新失败后的退避区间：从 5 分钟翻倍到 6 小时，成功即清零。
+CREDENTIAL_RETRY_MIN = 300.0
+CREDENTIAL_RETRY_MAX = 6 * 3600.0
 
 
 def _normalise_priority(value):
@@ -616,7 +663,8 @@ class Account(object):
         self.proxy_legacy = str(data.get("proxy") or "").strip()
         self.proxy = self.proxy_legacy
         self.enabled = data.get("enabled", True)
-        # 数字最小的先被选中，相同保持轮询顺序；默认 100。会话粘性优先于优先级。
+        # 数字最小的整层先被选中，层内由手动权重与智能分配决定；默认 100。会话粘性
+        # 优先于优先级。
         self.priority = _normalise_priority(data.get("priority"))
         # 面板备注随凭证文件走，重新登录与桌面端导入不会带上它，AccountPool.add()
         # 因此把它列进 KEEP_ON_REPLACE_FIELDS。
@@ -627,6 +675,15 @@ class Account(object):
             self.weight = max(1, min(MAX_ACCOUNT_WEIGHT, int(data.get("weight") or 1)))
         except (TypeError, ValueError):
             self.weight = 1
+        # 任务参与独立于派单：账号可以对 API 停用，但仍跑签到、成长、旅行与每日活跃。
+        # 旧凭证没有这个字段时跟随 enabled，停用账号保持全停。
+        raw_tasks_enabled = data.get("tasksEnabled")
+        self.tasks_enabled = (bool(raw_tasks_enabled)
+                              if raw_tasks_enabled is not None
+                              else bool(self.enabled))
+        # 人工分组标签：只用于筛选与批量操作，不参与路由。
+        raw_group = data.get("group")
+        self.group = (raw_group if isinstance(raw_group, str) else "").strip()[:64]
         # 该账号人工禁用的模型名单：随凭证文件持久化，与自动节流互不干扰。
         raw_deny = data.get("disabledModels")
         self.disabled_models = normalise_disabled_models(raw_deny)
@@ -716,6 +773,10 @@ class Account(object):
         # 串行化 Token 刷新与凭证文件写入，避免新 Token 被旧快照覆盖。
         self._refresh_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # 最近一次成功的刷新与最近一次尝试的时刻（epoch 秒）：冷却与主动刷新节奏都
+        # 只存运行期，重启后从令牌的签发时间接着算。
+        self.last_refresh_at = 0.0
+        self.last_refresh_attempt_at = 0.0
         # 串行化 fetch_credits()，避免并发查询重复消耗计费调用。
         self._credits_lock = threading.Lock()
         # 面板会快照这份状态，请求线程同时在更新它。与 _refresh_lock 分开持锁：那把
@@ -750,6 +811,8 @@ class Account(object):
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
             "enabled": self.enabled,
+            "tasksEnabled": bool(self.tasks_enabled),
+            "group": self.group,
             "priority": self.priority,
             "note": self.note,
             "concurrencyLimit": self.concurrency_limit,
@@ -875,11 +938,15 @@ class Account(object):
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
             "domain": self.domain,
             "realm": self.realm,
+            "provider": "workbuddy",
             "platform": self.platform,
             "product": self.product,
+            "identity": self.product,
             "loginProduct": self.login_product,
             "enterpriseId": self.enterprise_id,
             "enabled": bool(self.enabled),
+            "tasksEnabled": bool(self.tasks_enabled),
+            "group": self.group,
             "priority": int(self.priority),
             "note": self.note,
             "concurrencyLimit": int(self.concurrency_limit),
@@ -938,6 +1005,9 @@ class Account(object):
             "canReportActivity": self.has_personal_program(),
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": session_id(self.uid),
+            # WorkBuddy 没有按账号的模型目录：None 表示这个账号可以服务全部启用模型。
+            "models": None,
+            "freeModels": [],
         }
 
     def credential_mask(self):
@@ -1122,6 +1192,11 @@ class Account(object):
 
     def model_is_free(self, model):
         return bool(model) and model in (self.free_models or ())
+
+    def paid_user(self):
+        """上游计费摘要判定为付费（PRO）账号时返回 True；未知按免费处理。"""
+        credits = self.credits if isinstance(self.credits, dict) else {}
+        return bool(credits.get("is_paid_user"))
 
     def credit_limit_reached(self):
         """今日已统计的积分消耗达到每日限额时返回 True。这是账号级事实，与请求哪个
@@ -1360,6 +1435,9 @@ class Account(object):
         # 模型不该因为账号恰好恢复了就漏进来。
         if self.model_disabled(model):
             return False
+        # PRO ONLY 模型只派给付费账号；tier 表没拿到时不拦截，避免误伤付费号。
+        if model and wb_tiers.requires_pro(model, self.realm) and not self.paid_user():
+            return False
         if self.throttle_wait(model=model) > 0:
             return False
         # 停在保留线之下：这里接一单会把余额推到 0，触发上游的提醒短信。
@@ -1391,15 +1469,47 @@ class Account(object):
     def auth_headers(self):
         return wb_identity.auth_headers(self.access_token, self.is_api_key)
 
-    def headers(self, purpose="chat", model=""):
+    def headers(self, purpose="chat", model="", media_identity=None):
         """组出这一轮的出站标头：chat 用途走 wb_identity，billing 用途维持轻量标头；
-        model 非空时带 X-Model-ID。
+        media 用途复用 chat 身份并补媒体端点特有的头；model 非空时带 X-Model-ID。
 
         官方对话请求不带 X-Session-ID（只用于反馈上报），chat 也不发，避免恒定派生
         值成为网关特征；billing 带按账号派生的 X-Session-ID，一个进程冒充几十台设备，
         不能让全部账号共用同一关联键（见 wb_fingerprint.session_id）。
         """
         cfg = get_realm_config(self.realm)
+
+        if purpose == "media":
+            product = wb_identity.normalize_product(media_identity or self.product)
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            headers.update(wb_identity.build_identity_headers(
+                product=product,
+                realm=self.realm,
+                uid=self.uid,
+                token=self.access_token,
+                enterprise_id=self.enterprise_id,
+                tenant_id=self.enterprise_id,
+            ))
+            headers["Accept"] = "application/json, text/plain, */*"
+            if self.enterprise_id:
+                headers["X-Enterprise-Id"] = self.enterprise_id
+                headers["X-Tenant-Id"] = self.enterprise_id
+            else:
+                headers["X-No-Enterprise-Id"] = "1"
+            if self.realm == "cn":
+                headers["X-Product"] = "SaaS"
+            if self.is_api_key:
+                headers["X-API-Key"] = self.access_token
+            device_token = (self._device_token()
+                            if self.realm == "cn" and product != wb_identity.PRODUCT_CLI
+                            else "")
+            if device_token:
+                headers["X-Device-Token"] = device_token
+            return headers
 
         if purpose != "chat":
             headers = {
@@ -1498,7 +1608,7 @@ class Account(object):
     def refresh(self, force=False):
         # 按账号串行化刷新，进锁后再查一次：上游会轮换 refresh token，并发
         # 刷新会让后一次把前一次已消费的 token 发出去。
-        # force=True 给面板的「刷新凭证」用：即使令牌还未过期也请求一次上游。
+        # force=True 给面板的「刷新凭证」与 401 重试用：即使令牌还未过期也请求一次上游。
         with self._refresh_lock:
             return self._refresh_locked(force=force)
 
@@ -1507,12 +1617,18 @@ class Account(object):
             # 静态 Key 无法 refresh。返回 False 但不置 token_expired：这类
             # 凭证按定义长期有效，标成过期会把正常账号移出账号池。
             return False
-        # 进锁后令牌可能已经被前一个持锁线程换新：再刷一次既浪费又把还没
-        # 用过的 refresh token 轮换掉，直接当作刷新成功。
+        now = time.time()
+        # 进锁后令牌可能已经被前一个持锁线程换新：再刷一次既浪费又白白轮换 refresh
+        # token，直接当作刷新成功。401 重试要换掉被拒的令牌，不能走这条捷径。
         if not force:
             exp = self.expires_at or jwt_exp(self.access_token)
-            if exp and exp - time.time() > TOKEN_REFRESH_MARGIN:
+            if exp and exp - now > TOKEN_REFRESH_MARGIN:
                 return True
+        # 官方客户端在 30 秒冷却内不重复请求：刚成功过就当成功，刚失败过就继续报失败。
+        if self.last_refresh_attempt_at and \
+                now - self.last_refresh_attempt_at < REFRESH_ATTEMPT_COOLDOWN:
+            return bool(self.last_refresh_at and
+                        now - self.last_refresh_at < REFRESH_ATTEMPT_COOLDOWN)
         if not self.refresh_token:
             self._set_last_error("no refresh token; sign in again")
             return False
@@ -1530,14 +1646,19 @@ class Account(object):
                 self.realm, self.login_product),
             "X-Refresh-Token": self.refresh_token,
             "X-Auth-Refresh-Source": "plugin",
-            "X-Domain": domain,
         }
+        headers.update(wb_identity.refresh_client_headers(
+            self.login_product, self.realm, self.uid, domain,
+            enterprise_id=self.enterprise_id, tenant_id=self.enterprise_id))
+        headers.update(self.auth_headers())
         headers.update(wb_identity.login_trace_headers())
+        self.last_refresh_attempt_at = now
         try:
             payload = http_json(url, data=b"{}", method="POST", headers=headers, timeout=30,
                                 proxy=self.proxy)
         except Exception as exc:
-            self._set_last_error("refresh failed: %s" % exc)
+            self._set_last_error("refresh via %s failed: %s"
+                                 % (self.login_product, exc))
             return False
         data = (payload.get("data") or {})
         data = data.get("data") or data
@@ -1547,7 +1668,16 @@ class Account(object):
             return False
         self.access_token = token
         self.refresh_token = data.get("refreshToken") or self.refresh_token
-        self.expires_at = jwt_exp(token) or self.expires_at
+        self.expires_at = _auth_expiry(data, token, now) or self.expires_at
+        # 面板的有效期进度以「到期 - 签发」为满格；刷新后不更新签发时刻，进度会一直
+        # 停在旧令牌的区间上。响应不带签发时间时用新令牌的 iat，再不行用当前时刻。
+        self.issued_at = (normalize_epoch(data.get("issuedAt"))
+                          or jwt_iat(token) or int(now))
+        # 官方客户端整体采用响应里的 auth；域名会随会话迁移，跟着更新。
+        new_domain = str(data.get("domain") or "").strip()
+        if new_domain:
+            self.domain = new_domain
+        self.last_refresh_at = now
         with self._throttle_lock:
             self.last_error = ""
             self.cooldown_until = 0
@@ -2481,9 +2611,10 @@ self.balance_until - now, self.breaker_until - now, self.degrade_until - now)
                 self.cooldown_until = 0
                 self.balance_until = 0.0
 
-    # -- 单账号单模型的并发名额 ---------------------------------------------
+    # -- 单账号的并发名额（所有模型合计） --------------------------------
 
     def _capacity_key(self, model):
+        # 在途请求仍按模型分开记，面板能看出每个模型各占多少；上限按账号合计判断。
         return str(model or "")
 
     def active_for_model(self, model):
@@ -2496,20 +2627,20 @@ self.balance_until - now, self.breaker_until - now, self.degrade_until - now)
             return sum(self._in_flight.values())
 
     def has_request_capacity(self, model=None):
-        """这个账号在这个模型上还有空名额吗（上限为 0 时永远有）。"""
+        """这个账号还有空名额吗（上限为 0 时永远有）。名额按账号的全部模型合计。"""
         with self._concurrency_lock:
             if self.concurrency_limit <= 0:
                 return True
-            return self._in_flight.get(self._capacity_key(model), 0) < self.concurrency_limit
+            return sum(self._in_flight.values()) < self.concurrency_limit
 
     def acquire_request(self, model=None):
-        """原子地占一个名额；已经满了返回 False。"""
+        """原子地占一个名额；账号的在途总数已经满了返回 False。"""
         key = self._capacity_key(model)
         with self._concurrency_lock:
-            used = self._in_flight.get(key, 0)
-            if self.concurrency_limit > 0 and used >= self.concurrency_limit:
+            if self.concurrency_limit > 0 and \
+                    sum(self._in_flight.values()) >= self.concurrency_limit:
                 return False
-            self._in_flight[key] = used + 1
+            self._in_flight[key] = self._in_flight.get(key, 0) + 1
             return True
 
     def release_request(self, model=None):
@@ -2530,7 +2661,7 @@ def _claim(account, model, claim):
 
 
 def normalise_concurrency_limit(value):
-    """返回（限额、错误）。上限按「账号 + 模型」统计在途请求；0 表示不限。
+    """返回（限额、错误）。上限按账号的全部模型合计在途请求；0 表示不限。
     """
     if isinstance(value, bool) or value is None or (
             isinstance(value, float) and not value.is_integer()):
@@ -2565,10 +2696,20 @@ def parse_account_set(payload):
     changes = {}
     if "proxySlot" in payload:
         changes["proxySlot"] = payload.get("proxySlot")
-    if "proxy" in payload:
-        changes["proxy"] = payload.get("proxy")
+    if "identity" in payload:
+        identity = payload.get("identity")
+        if not isinstance(identity, str) or not identity.strip():
+            return None, "identity must be a non-empty string"
+        changes["identity"] = identity.strip()
     if "enabled" in payload:
         changes["enabled"] = bool(payload.get("enabled"))
+    if "tasksEnabled" in payload:
+        changes["tasksEnabled"] = bool(payload.get("tasksEnabled"))
+    if "group" in payload:
+        raw_group = payload.get("group")
+        if raw_group is not None and not isinstance(raw_group, str):
+            return None, "group must be a string"
+        changes["group"] = str(raw_group or "").strip()[:MAX_ACCOUNT_GROUP]
     if "weight" in payload:
         try:
             weight = int(payload.get("weight"))
@@ -2593,9 +2734,9 @@ def parse_account_set(payload):
     if "disabledModels" in payload:
         changes["disabledModels"] = payload.get("disabledModels")
     if not changes:
-        return None, ("nothing to update: pass 'enabled', 'proxy', 'proxySlot', "
-                      "'weight', 'priority', 'concurrencyLimit', 'note' or "
-                      "'disabledModels'")
+        return None, ("nothing to update: pass 'enabled', 'tasksEnabled', 'group', "
+                      "'identity', 'proxySlot', 'weight', 'priority', "
+                      "'concurrencyLimit', 'note' or 'disabledModels'")
     return changes, ""
 
 
@@ -2783,9 +2924,9 @@ class SessionAffinity(object):
 
 #: 会话归属的打点：bound_hit = 绑定命中且该账号接单；bound_lost = 有绑定但那个
 #: 账号不能接单；fresh_binding = 会话键第一次出现；no_key = 客户端没给会话标识；
-#: smart_pick / cursor_pick 记录两种选号方式各被用过多少次。
+#: smart_pick = 智能分配选中的次数。
 ROUTING_COUNTERS = ("bound_hit", "bound_lost", "fresh_binding", "no_key",
-                    "smart_pick", "cursor_pick")
+                    "smart_pick")
 
 #: 智能分配里「剩余接近耗尽」的倾斜量：权重每高一档，评分向前挪这么多。
 #: 满档（权重 4）相当于 15 个百分点，能压过轻微的忙闲差，压不过明显欠账。
@@ -2800,6 +2941,8 @@ KEEP_ON_REPLACE_FIELDS = (
     ("loginProduct", "login_product"),
     ("priority", "priority"),
     ("note", "note"),
+    ("group", "group"),
+    ("tasksEnabled", "tasks_enabled"),
     ("concurrencyLimit", "concurrency_limit"),
     ("weight", "weight"),
     ("disabledModels", "disabled_models"),
@@ -2837,9 +2980,12 @@ class CreditsRefresher(threading.Thread):
     TTL——这是有意的取舍：派发偏好以天计，几小时的偏差比省下的调用划算。
     """
 
-    def __init__(self, pool, interval_seconds=1800):
+    def __init__(self, pool, interval_seconds=1800, extra_provider=None):
         super().__init__(daemon=True, name="credits-refresher")
         self.pool = pool
+        # CodeArts 的余额快照也走同一个线程与同一个间隔设置；两者各自最多每 tick
+        # 刷新一个账号，上游计费调用数不变。
+        self.extra_provider = extra_provider
         self.interval_seconds = max(60.0, float(interval_seconds))
         self.last_run = None
         self.last_uid = None
@@ -2888,6 +3034,8 @@ class CreditsRefresher(threading.Thread):
         for account in accounts:
             if not account.enabled or not account.access_token:
                 continue
+            if not getattr(account, "tasks_enabled", True):
+                continue
             if self._parked.get(account.uid, 0) > now:
                 continue
             credits = account.credits
@@ -2902,6 +3050,31 @@ class CreditsRefresher(threading.Thread):
                 chosen, chosen_age = account, age
         return chosen
 
+    def _codearts_stalest(self, ttl_seconds, now=None):
+        """CodeArts 里余额最陈旧且已过 TTL 的账号视图；没有则返回 None。"""
+        if self.extra_provider is None:
+            return None
+        now = time.time() if now is None else now
+        chosen = None
+        chosen_age = None
+        for view in self.extra_provider.views():
+            if not view.get("enabled") or not view.get("tasksEnabled", True):
+                continue
+            uid = view.get("uid") or ""
+            if not uid or self._parked.get(uid, 0) > now:
+                continue
+            credits = view.get("credits")
+            updated = credits.get("updated_at") if isinstance(credits, dict) else None
+            if isinstance(updated, (int, float)):
+                age = now - updated
+            else:
+                age = float("inf")
+            if age < ttl_seconds:
+                continue
+            if chosen_age is None or age > chosen_age:
+                chosen, chosen_age = view, age
+        return chosen
+
     def refresh_once(self, now=None):
         """刷新一个陈旧账号；返回它的 uid，没有到期的返回 None。"""
         ttl = self.ttl_seconds()
@@ -2910,6 +3083,9 @@ class CreditsRefresher(threading.Thread):
         with self._lock:
             account = self.stalest_account(ttl, now=now)
             if account is None:
+                view = self._codearts_stalest(ttl, now=now)
+                if view is not None:
+                    return self._refresh_codearts(view, now=now)
                 return None
             try:
                 result = account.fetch_credits()
@@ -2929,6 +3105,27 @@ class CreditsRefresher(threading.Thread):
             self.log("已刷新 %s 的积分（%s）"
                      % (account.uid[:8], (account.credits or {}).get("updated_iso")))
             return account.uid
+
+    def _refresh_codearts(self, view, now=None):
+        uid = view.get("uid") or ""
+        now = time.time() if now is None else now
+        try:
+            rows = self.extra_provider.refresh_credits([uid])
+        except Exception as exc:
+            rows = [{"uid": uid, "ok": False, "error": str(exc)}]
+        row = next((item for item in rows if item.get("uid") == uid), None) or \
+            {"ok": False, "error": "no result"}
+        if not row.get("ok"):
+            self._parked[uid] = now + self._failed_cooldown
+            self.last_error = str(row.get("error") or "unknown error")
+            self.log("刷新 %s 的 CodeArts 积分失败，暂缓六小时: %s"
+                     % (uid[:8], self.last_error))
+            return None
+        self.last_run = now
+        self.last_uid = uid
+        self.last_error = None
+        self.log("已刷新 %s 的 CodeArts 积分" % uid[:8])
+        return uid
 
     def run(self):
         while not self._stop_event.is_set():
@@ -2953,6 +3150,196 @@ class CreditsRefresher(threading.Thread):
         }
 
 
+class CredentialRefresher(threading.Thread):
+    """按官方客户端的节奏在后台续期账号凭据。
+
+    客户端在登录后开始计时：距上次刷新约 24 小时换一次令牌，访问令牌剩余不足一天时
+    缩短到约 5 分钟。每次刷新都会换发新的 refreshToken，长期挂着的会话因此不会因为
+    在别的客户端里过期而失效。网关常驻，用同一节奏在请求路径之外续期。
+    """
+
+    def __init__(self, pool, interval_seconds=60, rng=None, log=None,
+                 extra_provider=None):
+        super().__init__(daemon=True, name="credential-refresher")
+        self.pool = pool
+        # CodeArts 的临时凭据同样在后台续期；STS 有效期短，剩不足一小时就换，
+        # 但每个账号两次刷新之间至少隔半小时，避免每个 tick 都打上游。
+        self.extra_provider = extra_provider
+        self._codearts_refreshed = {}
+        self.interval_seconds = max(15.0, float(interval_seconds))
+        self.rng = rng or random.random
+        self._log = log
+        self.last_run = None
+        self.last_uid = None
+        self.last_error = None
+        self.logs = []
+        self._stop_event = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._parked = {}
+        self._failures = {}
+        # 每个账号这一轮的随机抖动只抽一次：每分钟重抽会让所有账号在区间开头就到期，
+        # 抖动失去错开的作用。刷新成功后重抽下一轮。
+        self._jitter = {}
+
+    def log(self, msg):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.logs.append("[%s] %s" % (stamp, msg))
+        if len(self.logs) > 40:
+            self.logs = self.logs[-40:]
+        if self._log:
+            self._log(msg)
+
+    def stop(self):
+        self._stop_event.set()
+        self._wake.set()
+
+    def wake(self):
+        self._wake.set()
+
+    def last_refresh_time(self, account):
+        """上一次成功换到新令牌的时刻：优先本次进程的刷新，其次令牌签发时间。"""
+        return max(account.last_refresh_at or 0.0,
+                   account.issued_at or 0.0,
+                   float(jwt_iat(account.access_token) or 0),
+                   account.added_at or 0.0)
+
+    def delay_seconds(self, account, now=None):
+        """到下一次主动刷新还要等多久。官方客户端的 24 小时节奏带随机抖动，
+        临近到期时改成几分钟一次。"""
+        now = time.time() if now is None else now
+        exp = account.expires_at or jwt_exp(account.access_token)
+        if exp and exp - CREDENTIAL_REFRESH_NEAR_EXPIRY <= now:
+            return (CREDENTIAL_REFRESH_URGENT_DELAY
+                    + self._roll(account) * CREDENTIAL_REFRESH_URGENT_JITTER)
+        return (CREDENTIAL_REFRESH_INTERVAL - CREDENTIAL_REFRESH_LEAD
+                + self._roll(account) * CREDENTIAL_REFRESH_JITTER)
+
+    def _roll(self, account):
+        return self._jitter.setdefault(account.uid, self.rng())
+
+    def due(self, account, now=None):
+        now = time.time() if now is None else now
+        if not account.enabled or account.is_api_key or not account.refresh_token:
+            return False
+        if not getattr(account, "tasks_enabled", True):
+            return False
+        if self._parked.get(account.uid, 0) > now:
+            return False
+        return now >= self.last_refresh_time(account) + self.delay_seconds(account, now)
+
+    def next_account(self, now=None):
+        now = time.time() if now is None else now
+        with self.pool._lock:
+            accounts = list(self.pool.accounts)
+        for account in accounts:
+            if self.due(account, now):
+                return account
+        return None
+
+    def next_codearts(self, now=None):
+        """CodeArts 里需要续期的账号视图；无则返回 None。"""
+        if self.extra_provider is None:
+            return None
+        now = time.time() if now is None else now
+        for view in self.extra_provider.views():
+            if not view.get("enabled") or not view.get("tasksEnabled", True):
+                continue
+            uid = view.get("uid") or ""
+            if not uid or self._parked.get(uid, 0) > now:
+                continue
+            exp = view.get("expiresAt")
+            if not isinstance(exp, (int, float)) or exp <= 0:
+                continue
+            if exp - now > 3600:
+                continue
+            if now - self._codearts_refreshed.get(uid, 0.0) < 1800.0:
+                continue
+            return view
+        return None
+
+    def refresh_codearts(self, view, now=None):
+        uid = view.get("uid") or ""
+        now = time.time() if now is None else now
+        try:
+            result = self.extra_provider.refresh_credential(uid) or {}
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        self._codearts_refreshed[uid] = now
+        if result.get("ok"):
+            self._parked.pop(uid, None)
+            self.last_run = now
+            self.last_uid = uid
+            self.last_error = None
+            self.log("已刷新 %s 的 CodeArts 凭据" % uid[:8])
+            return uid
+        self._parked[uid] = now + CREDENTIAL_RETRY_MIN
+        self.last_error = str(result.get("error") or "unknown error")
+        self.log("刷新 %s 的 CodeArts 凭据失败，稍后再试: %s"
+                 % (uid[:8], self.last_error))
+        return None
+
+    def refresh_once(self, now=None):
+        """刷新一个到期账号；返回它的 uid，没有到期的返回 None。每次只打一个上游，
+        失败的账号按退避重新排队。两个提供方共用一个线程与一个重试预算。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            account = self.next_account(now)
+        if account is None:
+            view = self.next_codearts(now)
+            if view is None:
+                return None
+            return self.refresh_codearts(view, now)
+        uid = account.uid
+        try:
+            ok = account.refresh(force=True)
+        except Exception as exc:
+            account._set_last_error("refresh failed: %s" % exc)
+            ok = False
+        if ok:
+            self._parked.pop(uid, None)
+            self._jitter.pop(uid, None)
+            self._failures.pop(uid, None)
+            self.last_run = now
+            self.last_uid = uid
+            self.last_error = None
+            exp_text = (time.strftime("%Y-%m-%d %H:%M",
+                                      time.localtime(account.expires_at))
+                        if account.expires_at else "未知")
+            self.log("已刷新 %s 的凭据（有效期至 %s）" % (uid[:8], exp_text))
+            return uid
+        failures = self._failures.get(uid, 0) + 1
+        self._failures[uid] = failures
+        wait = min(CREDENTIAL_RETRY_MAX,
+                   CREDENTIAL_RETRY_MIN * (2 ** (failures - 1)))
+        self._parked[uid] = now + wait
+        self.last_error = account.last_error or "unknown error"
+        self.log("刷新 %s 的凭据失败，%d 分钟后再试: %s"
+                 % (uid[:8], int(wait / 60), self.last_error))
+        return None
+
+    def run(self):
+        while not self._stop_event.is_set():
+            self._wake.wait(timeout=self.interval_seconds)
+            if self._stop_event.is_set():
+                break
+            self._wake.clear()
+            try:
+                self.refresh_once()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log("刷新循环异常: %s" % exc)
+
+    def status(self):
+        return {
+            "interval_seconds": self.interval_seconds,
+            "last_run": self.last_run,
+            "last_uid": self.last_uid,
+            "last_error": self.last_error,
+            "logs": self.logs[-10:],
+        }
+
+
 class AccountPool(object):
     def __init__(self, directory, log=None):
         self.dir = directory
@@ -2968,15 +3355,12 @@ class AccountPool(object):
         self._remaining_weights = {}
         # 手动权重（weight > 1 才生效）的平滑加权轮询累计值，与临期偏好的轮次分开。
         self._manual_weights = {}
-        # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用 _cursor，
-        # 两条轮转互不挪动对方的位置。
+        # 页内选号（超限对话）的每页游标，键是 (页号, 页大小)；整池选号仍用 _cursor，
+        # 两个游标互不挪动对方的位置。
         self._page_cursors = {}
         # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
         self._page_order_cache = None
         self.affinity = SessionAffinity()
-        # 新建绑定用的选号方式：默认保持轮询顺序，只有 apply_smart_routing()
-        # 设过面板开关后才按评分选号，直接构造的账号池行为不变。
-        self.smart_routing = False
         self._stats_lock = threading.Lock()
         self.routing_stats = {name: 0 for name in ROUTING_COUNTERS}
 
@@ -3139,14 +3523,35 @@ class AccountPool(object):
             "invalid": invalid,
         }
 
-    def set_enabled(self, uid, enabled):
+    def set_enabled(self, uid, enabled, tasks_enabled=None):
         account = self.get(uid)
         if account is None: return None
         account.enabled = bool(enabled)
+        # 停用 API 默认连任务一起停；面板要「只停派单」时显式传 tasks_enabled。
+        account.tasks_enabled = (bool(tasks_enabled)
+                                 if tasks_enabled is not None
+                                 else bool(enabled))
         if enabled:
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
+        return account.public()
+
+    def set_tasks_enabled(self, uid, tasks_enabled):
+        """只切任务参与，不动 API 派单。"""
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.tasks_enabled = bool(tasks_enabled)
+        account.save(self.dir)
+        return account.public()
+
+    def set_group(self, uid, group):
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.group = str(group or "").strip()[:64]
+        account.save(self.dir)
         return account.public()
 
     def set_weight(self, uid, weight):
@@ -3383,26 +3788,36 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
-    def set_all_enabled(self, enabled, realm=None):
+    def set_all_enabled(self, enabled, realm=None, group=None):
+        group = str(group or "").strip()
         with self._lock:
             for account in self.accounts:
                 if realm and account.realm != realm: continue
+                if group and account.group != group: continue
                 account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
                 if enabled:
                     account.clear_error()
                 account.save(self.dir)
         self.apply_proxy_slots()
 
-    def apply_smart_routing(self, value=None):
-        """重新解析这个池的派单设置：settings.json 是真值来源，池里只存解析后的
-        布尔值；传 None 表示读取当前设置。
-        """
-        import wb_settings
-
-        if value is None:
-            value = wb_settings.smart_routing(self.dir)
-        self.smart_routing = bool(value)
-        return self.smart_routing
+    def set_group_enabled(self, group, enabled):
+        group = str(group or "").strip()
+        if not group:
+            return []
+        changed = []
+        with self._lock:
+            for account in self.accounts:
+                if account.group != group:
+                    continue
+                account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
+                if enabled:
+                    account.clear_error()
+                account.save(self.dir)
+                changed.append(account.uid)
+        self.apply_proxy_slots()
+        return changed
 
     def apply_credit_rates(self, per_day=None):
         """把最近的积分消耗速度（每天积分）推给各账号。"""
@@ -3421,10 +3836,9 @@ class AccountPool(object):
             self.routing_stats[name] = self.routing_stats.get(name, 0) + delta
 
     def routing_snapshot(self):
-        """计数器加解析后的设置，供面板使用。"""
+        """会话归属的计数，供面板使用。"""
         with self._stats_lock:
             out = dict(self.routing_stats)
-        out["smart_routing"] = bool(self.smart_routing)
         out["affinity_entries"] = self.affinity.size()
         return out
 
@@ -3432,6 +3846,15 @@ class AccountPool(object):
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token and a.ready(model=model))
+
+    def servable_accounts(self, realm, model=None):
+        """该出口此刻能接这个模型的账号摘要，给跨渠道混合调度用；只看本地状态，不刷新凭证。"""
+        with self._lock:
+            snapshot = [a for a in self.accounts if a.realm == realm]
+        return [{"uid": a.uid, "priority": int(a.priority), "weight": int(a.weight),
+                 "active": a.active_requests, "room": a.has_request_capacity(),
+                 "expiry": self._expiry_weight(a) if a.in_expiring_window() else 0}
+                for a in snapshot if a.servable(model=model)]
 
     def unavailable_reason(self, uid, realm=None, model=None):
         """为什么这个账号现在不能接单；可以接单时返回空串。测试台可以只用一个账号
@@ -3501,43 +3924,52 @@ class AccountPool(object):
         return account
 
     def pick(self, realm=None, exclude=None, model=None, page=None, claim=None):
+        """按优先级分层选号：优先级数字最小的一层先接单，整层都拿不到名额时才看
+        下一层。层内的顺序是手动权重 >1 的账号，然后是智能分配。
+        """
         exclude = set(exclude or ())
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         if page is not None:
             snapshot = self._page_slice(snapshot, page)
-        if not snapshot:
-            return None
-        # 手动权重 >1 的账号先于一切自动偏好接单（见 _pick_weighted_first），彼此按
-        # 权重平滑加权轮询；都不可交时落回下面的自动偏好与轮询。
+        for tier in self._priority_tiers(snapshot, exclude, model):
+            account = self._pick_in_tier(tier, exclude, model=model, claim=claim,
+                                         cursor_key=page)
+            if account is not None:
+                return account
+        return None
+
+    def _priority_tiers(self, snapshot, exclude, model):
+        """此刻能接单的账号按优先级数字分组，数字小的层在前。接单能力含冷却、限额、
+        名额与模型可用性，只看本地状态，不刷新凭证。
+        """
+        tiers = {}
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            if (not account.servable(model=model)
+                    or not account.has_request_capacity(model)):
+                continue
+            tiers.setdefault(int(account.priority), []).append(account)
+        for priority in sorted(tiers):
+            yield tiers[priority]
+
+    def _pick_in_tier(self, tier, exclude, model=None, claim=None, cursor_key=None):
+        """一层账号里的选号：手动权重 >1 的先接单，然后是始终打开的智能分配。"""
         while True:
-            account = self._pick_weighted_first(snapshot, exclude, model)
+            account = self._pick_weighted_first(tier, exclude, model)
             if account is None:
                 break
             if _claim(account, model, claim):
                 account.mark_pick()
                 return account
             exclude.add(account.uid)
-        # 智能调度打开时由 _pick_scored 按积分义务与忙闲评分选号（已含接单能力判断
-        # 与名额占用）。
-        if self.smart_routing:
-            return self._pick_scored(realm=realm, exclude=exclude, model=model,
-                                     claim=claim, snapshot=snapshot)
-        while True:
-            account = self._pick_expiring_first(snapshot, exclude, model)
-            if account is None:
-                break
-            if _claim(account, model, claim):
-                account.mark_pick()
-                return account
-            exclude.add(account.uid)
-        # 智能分配关闭时按优先级与轮询顺序派单；剩余用量偏好已并入智能分配的评分，
-        # 不再作为独立分层。
-        return self._rotate_pick(snapshot, exclude, model, cursor_key=page, claim=claim)
+        return self._pick_scored(exclude=exclude, model=model, claim=claim,
+                                 snapshot=tier, cursor_key=cursor_key)
 
     def _pick_weighted_first(self, snapshot, exclude, model):
         """手动权重 > 1 的账号优先接单，或 None（没有可交的）。权重是用户在面板上的
-        明确设置，优先级最高、不被自动偏好覆盖；同层之间按权重平滑加权轮询。权重 1
+        明确设置，层内优先级最高、不被自动偏好覆盖；同层之间按权重平滑加权轮询。权重 1
         的账号完全不进这一层，临期、剩余用量这些自动子权重照旧在它们身上生效。
         """
         ready = []
@@ -3648,13 +4080,15 @@ class AccountPool(object):
         return ranks
 
     def _pick_scored(self, realm=None, exclude=None, model=None, claim=None,
-                     snapshot=None):
+                     snapshot=None, cursor_key=None):
         """按积分到期节奏与最近一小时的忙闲给新对话选号。
 
         到期前每天要消耗掉的积分是义务，义务减去今天的消耗速度是欠账；欠账占候选
         欠账总和的比例是应担份额，减去最近一小时实际接到的份额，差得最多的先派。
         候选只包括此刻能接单的账号（接不了单的算进总和会把其余账号的份额压平）。
         评分前先过临期积分层；估计剩余接近耗尽的组合获得一点倾斜，但不独占流量。
+        优先级已经由外层分层决定，评分不再重复考虑。`cursor_key` 让超限对话用自己
+        的页游标，页内轮转不挪动整池游标。
         """
         exclude = exclude or set()
         if snapshot is None:
@@ -3664,7 +4098,8 @@ class AccountPool(object):
         if total == 0:
             return None
         with self._lock:
-            start = self._cursor
+            start = (self._page_cursors.get(cursor_key, 0) if cursor_key is not None
+                     else self._cursor)
         now = time.time()
         candidates = [index for index, account in enumerate(snapshot)
                       if account.uid not in exclude and account.servable(model=model)
@@ -3672,15 +4107,22 @@ class AccountPool(object):
         if not candidates:
             return None
 
+        def advance(index):
+            """推进这一轮用的游标：页游标与整池游标互不影响。"""
+            with self._lock:
+                if cursor_key is not None:
+                    self._page_cursors[cursor_key] = (index + 1) % total
+                else:
+                    self._cursor = (index + 1) % total
+
         def take(account):
             """结算一次智能分配命中：推进轮询游标、记录来源并计入忙闲。"""
-            with self._lock:
-                try:
-                    index = snapshot.index(account)
-                except ValueError:
-                    index = -1
-                if index >= 0:
-                    self._cursor = (index + 1) % total
+            try:
+                index = snapshot.index(account)
+            except ValueError:
+                index = -1
+            if index >= 0:
+                advance(index)
             self.count_routing("smart_pick")
             account.mark_pick(now)
             return account
@@ -3726,42 +4168,14 @@ class AccountPool(object):
                 urgency = max(0, weight - 1) * REMAINING_URGENCY_STEP
             # 评分相同时欠账多的先派，没有欠账的账号不会靠平局拿到新对话。
             ranked.append((done - share - urgency, -share, loads[index],
-                           snapshot[index].priority, (index - start) % total, index))
+                           (index - start) % total, index))
         ranked.sort()
-        for _score, _share, _hour, _priority, _offset, index in ranked:
+        for _score, _share, _hour, _offset, index in ranked:
             account = snapshot[index]
             if account.ready(model=model) and _claim(account, model, claim):
-                with self._lock:
-                    self._cursor = (index + 1) % total
+                advance(index)
                 self.count_routing("smart_pick")
                 account.mark_pick(now)
-                return account
-        return None
-
-    def _rotate_pick(self, group, exclude, model, cursor_key=None, claim=None):
-        """对一组账号轮询选号，推进它的游标。整池轮转用一直存在的 `_cursor`；页轮转
-        每页各有游标，两条轮转互不挪动对方的位置。
-        """
-        total = len(group)
-        if total == 0:
-            return None
-        with self._lock:
-            start = (self._page_cursors.get(cursor_key, 0) if cursor_key is not None
-                     else self._cursor)
-        order = sorted(range(total), key=lambda i: (group[i].priority,
-                                                    (i - start) % total))
-        for index in order:
-            account = group[index]
-            if account.uid in exclude:
-                continue
-            if account.ready(model=model) and _claim(account, model, claim):
-                with self._lock:
-                    if cursor_key is not None:
-                        self._page_cursors[cursor_key] = (index + 1) % total
-                    else:
-                        self._cursor = (index + 1) % total
-                self.count_routing("cursor_pick")
-                account.mark_pick()
                 return account
         return None
 
@@ -3772,18 +4186,42 @@ class AccountPool(object):
                 if account.access_token: return account
             return candidates[0] if candidates else None
 
-    def start_login(self, realm, product):
+    def _resolve_login_slot(self, slot_id):
+        """把登录时选的出口槽解析成 (slot id, proxy url)。auto 挑一个既没绑定账号、
+        也没被进行中登录占用的启用槽；没有空闲槽就直连。"""
+        slot_id = str(slot_id or "").strip()
+        if not slot_id:
+            return "", ""
+        slots = [entry for entry in wb_settings.proxy_slots(self.dir)
+                 if entry.get("enabled", True)]
+        with self._lock:
+            if slot_id == "auto":
+                bound = {a.proxy_slot for a in self.accounts if a.proxy_slot}
+                busy = {info.get("proxy_slot") for info in self.logins.values()
+                        if info.get("proxy_slot")}
+                for entry in slots:
+                    if entry["id"] not in bound and entry["id"] not in busy:
+                        return entry["id"], entry["url"]
+                return "", ""
+            for entry in slots:
+                if entry["id"] == slot_id:
+                    return entry["id"], entry["url"]
+        raise ValueError("unknown or disabled proxy slot")
+
+    def start_login(self, realm, product, proxy_slot=""):
         """向上游申请授权链接，platform 参数与所选官方客户端一致。product 同时记下来，
         登录完成后成为新账号的出站身份，登录用的客户端与之后对话用的客户端保持同一个。
+        proxy_slot 指定登录出口，避免授权 IP 与后续调用 IP 不一致。
         """
         product = wb_identity.normalize_product(product)
         platform = wb_identity.login_platform(realm, product)
         endpoint, domain = wb_identity.endpoint_for(realm, product)
+        slot_id, proxy = self._resolve_login_slot(proxy_slot)
         url = "%s%s?platform=%s" % (endpoint, AUTH_STATE_PATH,
                                     urllib.parse.quote(platform))
         headers = login_headers(realm, product)
         payload = http_json(url, data=b"{}", method="POST", headers=headers,
-                            timeout=30, retries=3, log=self.log)
+                            timeout=30, retries=3, log=self.log, proxy=proxy)
         data = payload.get("data") or {}
         state = data.get("state")
         auth_url = data.get("authUrl")
@@ -3791,9 +4229,11 @@ class AccountPool(object):
             raise RuntimeError("auth/state returned no state/authUrl: %s" % payload)
         with self._lock:
             self.logins[state] = {"created": time.time(), "platform": platform,
-                                  "product": product, "realm": realm}
+                                  "product": product, "realm": realm,
+                                  "proxy_slot": slot_id, "proxy": proxy}
         return {"state": state, "authUrl": auth_url, "realm": realm,
-                "domain": domain, "platform": platform, "product": product}
+                "domain": domain, "platform": platform, "product": product,
+                "proxySlot": slot_id, "proxy": _proxy_host_port(proxy)}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -3805,11 +4245,13 @@ class AccountPool(object):
             with self._lock: self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("realm") or "intl"
+        proxy = info.get("proxy") or ""
         url = "%s%s?state=%s" % (wb_identity.endpoint_for(realm, info["product"])[0],
                                  AUTH_TOKEN_PATH, urllib.parse.quote(state))
         headers = login_headers(realm, info["product"], method="GET")
         try:
-            payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2)
+            payload = http_json(url, method="GET", headers=headers, timeout=30,
+                                retries=2, proxy=proxy)
         except Exception as exc:
             return {"status": "pending", "message": "poll error: %s" % exc}
         code = payload.get("code")
@@ -3833,7 +4275,7 @@ class AccountPool(object):
             acct_headers.pop("X-No-Authorization", None)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = wb_upstream_pool.Request(acct_url, method="GET", headers=acct_headers)
-            with urlopen(req_acct, timeout=15) as resp_acct:
+            with urlopen(req_acct, timeout=15, proxy=proxy) as resp_acct:
                 profile = json.loads(resp_acct.read().decode("utf-8"))
                 profile_data = profile.get("data") or {}
                 nickname = str(profile_data.get("nickname") or "")
@@ -3852,6 +4294,7 @@ class AccountPool(object):
             "expiresAt": normalize_epoch(data.get("expiresAt")) or jwt_exp(token),
             "source": "oauth",
             "enabled": True,
+            "proxySlot": info.get("proxy_slot") or "",
         })
         self.add(account)
         if realm == "cn":
@@ -4250,6 +4693,12 @@ def normalise_import_row(row, realm=None):
     note = pick("note")
     if note is not None:
         kwargs["note"] = _stored_note(note)
+    tasks_enabled = pick("tasksEnabled")
+    if tasks_enabled is not None:
+        kwargs["tasksEnabled"] = bool(tasks_enabled)
+    group = pick("group")
+    if isinstance(group, str):
+        kwargs["group"] = group.strip()[:64]
     concurrency = pick("concurrencyLimit")
     if concurrency is not None:
         kwargs["concurrencyLimit"] = _stored_concurrency_limit(concurrency)
@@ -4267,22 +4716,24 @@ def _panel_gateway():
 
 
 def account_views(realm=None):
-    """账号列表视图，带上实时可用状态。"""
-    gateway = _panel_gateway()
-    if not gateway.POOL:
-        return []
-    return gateway.POOL.list_public(realm=realm)
+    """账号列表视图：每个提供方的统一账号视图，带上实时可用状态。"""
+    import wb_channels
+    if realm in ("", "all"):
+        realm = None
+    return wb_channels.all_views(realm=realm)
 
 
 def account_limits():
     """面板与网关共用一套账号字段上限。"""
     return {
+        "priorityMin": 0,
         "priorityDefault": DEFAULT_ACCOUNT_PRIORITY,
         "priorityMax": MAX_ACCOUNT_PRIORITY,
         "concurrencyMax": MAX_ACCOUNT_CONCURRENCY,
         "weightMin": 1,
         "weightMax": MAX_ACCOUNT_WEIGHT,
         "noteMax": MAX_ACCOUNT_NOTE,
+        "groupMax": MAX_ACCOUNT_GROUP,
         "apiKeyPrefixes": list(wb_identity.API_KEY_PREFIXES),
     }
 

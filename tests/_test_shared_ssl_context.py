@@ -114,8 +114,8 @@ custom = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 custom.check_hostname = False          # 必须先于 verify_mode 关闭：check_hostname
 custom.verify_mode = ssl.CERT_NONE     # 开启时 CERT_NONE 会被拒绝
 
-# 像池套件那样同时补丁两种拼写，跨版本都能用：3.13+ 走
-# http.client._create_https_context，3.9-3.12 走 ssl._create_default_https_context。
+# 像池套件那样同时补丁两种拼写：3.13+ 走 http.client._create_https_context，
+# 3.12 走 ssl._create_default_https_context。
 saved = {}
 for module, name in ((http.client, "_create_https_context"),
                      (ssl, "_create_default_https_context")):

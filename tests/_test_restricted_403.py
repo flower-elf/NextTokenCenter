@@ -72,6 +72,9 @@ class StubPool(object):
         return sum(1 for a in self.accounts
                    if a.realm == realm and a.ready(model=model))
 
+    def get(self, uid):
+        return next((a for a in self.accounts if a.uid == uid), None)
+
     def pick_for_session(self, realm=None, session_key=None, exclude=(),
                          model=None, page=None, claim=None):
         for a in self.accounts:
@@ -86,6 +89,9 @@ class StubPool(object):
     def apply_remaining_weights(self, weights=None):
         return None
 
+    def apply_credit_rates(self, per_day=None):
+        return None
+
     def apply_daily_token_limit(self, value=None, usage=None):
         return value or 0
 
@@ -94,6 +100,12 @@ class StubPool(object):
 
     def apply_model_daily_token_limit(self, value=None, per_model=None):
         return value or 0
+
+    def apply_reserve_credits(self, values=None):
+        return None
+
+    def apply_expiring_window(self, values=None):
+        return None
 
     def set_all_enabled(self, enabled, realm=None):
         for account in self.accounts:

@@ -17,13 +17,13 @@ export function openImportDialog({ onDone } = {}) {
 
   const ctl = openDialog({
     title: '导入账号',
-    desc: '选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象，以及桌面客户端保存的凭证文件。',
+    desc: '选择一个账号 JSON 文件，支持本网关导出的文件与桌面客户端凭证。',
     width: 640,
     body: () => html`
       <div class="row-between">
         <div class="grow">
           <div class="text-sm medium">${fileName || '尚未选择文件'}</div>
-          <div class="text-2xs muted">${preview ? '下面是这份文件的校验结果，此时还没有写入任何内容。' : '选择文件后先预览结果，点「确认导入」才会写入。'}</div>
+          <div class="text-2xs muted">${preview ? '下面是校验结果，还没有写入任何内容。' : '选择文件后先预览结果，点「确认导入」才会写入。'}</div>
         </div>
         <button class="btn btn-outline btn-sm" ?disabled=${busy} @click=${busyClick(() => pickFile())}>${icon('FolderOpen')}选择文件</button>
       </div>
@@ -78,7 +78,7 @@ export function openImportDialog({ onDone } = {}) {
       ${section('将跳过', skipped, 'muted')}
       ${section('无法解析', invalid, 'warning')}
       ${!added.length && !updated.length ? html`
-        <p class="text-xs tone-warning">没有可导入的账号。${skipped.length ? '若要覆盖已经存在的账号，请勾选下方的「覆盖同 UID 的现有账号」。' : ''}</p>` : nothing}`;
+        <p class="text-xs tone-warning">没有可导入的账号，${skipped.length ? '覆盖已有账号请勾选上方选项。' : '请选择包含账号的文件。'}</p>` : nothing}`;
   }
 
   function pickFile() {
@@ -127,7 +127,7 @@ export function openImportDialog({ onDone } = {}) {
     if (overwrite) {
       const go = await confirmDialog({
         title: '覆盖同 UID 的现有账号？',
-        desc: '同 UID 的账号会被文件里的凭证整体替换，原有令牌与备注之外的信息以文件为准。',
+        desc: '同 UID 的账号会被文件里的凭证整体替换。',
         confirmText: '继续导入',
         danger: true,
       });

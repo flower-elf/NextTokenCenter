@@ -26,7 +26,7 @@ from _isolated_dirs import isolated_data_dirs  # noqa: E402  独立数据根目�
 _TMP = isolated_data_dirs("wb-panel-route-auth-")
 
 import wb_proxy as proxy
-import wb_http as H  # noqa: E402
+import wb_models  # noqa: E402
 import wb_settings  # noqa: E402
 
 KEY = "panel-route-key"
@@ -130,7 +130,7 @@ class BoundaryCase(unittest.TestCase):
         with mock.patch.multiple(proxy, ACCOUNTS_DIR=self.directory, API_KEY=None,
                                  POOL=None, PRICING=None, UPDATES=self.updates,
                                  SCHEDULER=None), \
-                mock.patch.multiple(H, fetch_models=injected_models):
+                mock.patch.object(wb_models, "fetch_models", injected_models):
             return request.dispatch()
 
     def assert_refused(self, path, headers, command="GET", body=b""):
@@ -234,8 +234,8 @@ class RemoteAgentsTests(BoundaryCase):
     """一键配置只在「浏览器和网关同一台机器」时可用（issue #246）。
 
     判据是请求来源地址：远程看板（手机 / 另一台电脑 / 容器端口映射）即使拿着
-    面板会话，也读不到客户端清单、更写不了网关所在机器的客户端配置。环境标记
-    （容器 / OpenWrt）另算一道，命中时连回环来源也不放行。
+    面板会话，也读不到客户端清单、更写不了网关所在机器的客户端配置。容器标记
+    另算一道，命中时连回环来源也不放行。
     """
 
     def dispatch_remote(self, path, headers=None, command="GET", body=b"",
@@ -244,8 +244,9 @@ class RemoteAgentsTests(BoundaryCase):
         request.client_address = ("192.168.1.20", 40000)
         with mock.patch.multiple(proxy, ACCOUNTS_DIR=self.directory, API_KEY=None,
                                  POOL=None, PRICING=None, UPDATES=self.updates,
-                                 SCHEDULER=None, fetch_models=injected_models,
-                                 _SERVER_DEPLOYMENT=deployment):
+                                 SCHEDULER=None,
+                                 _SERVER_DEPLOYMENT=deployment), \
+                mock.patch.object(wb_models, "fetch_models", injected_models):
             return request.dispatch()
 
     def test_a_remote_panel_reads_enabled_false(self):

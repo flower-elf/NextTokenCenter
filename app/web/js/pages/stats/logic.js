@@ -1,6 +1,7 @@
-// 用量页的纯计算：时间范围的查询串、账号与密钥的用量行、模型性能矩阵的行与合计、筛选条件的生成与失效清理；只依赖 core/format.js，方便在 Node 里直接测试。
+// 用量页的纯计算：时间范围的查询串、账号与密钥的用量行、模型性能矩阵的行与合计、筛选条件的生成与失效清理；只依赖 core/format.js 与 core/channels.js，方便在 Node 里直接测试。
 
 import { compareText } from '../../core/format.js';
+import { channelLabel } from '../../core/channels.js';
 
 export const RANGES = [
   { id: 'today', label: '今日' },
@@ -49,13 +50,13 @@ export function trendSeries(mode, buckets, fmtNumber, fmtCompact, options = {}) 
   return { labels, series: withErrors ? [requests, failures, Object.assign({ axis: 'y2' }, tokens)] : [requests, Object.assign({ axis: 'y2' }, tokens)] };
 }
 
-/** 统计口径：默认只看当前查看的版本，勾选「含两个版本」后合并统计。 */
+/** 统计口径：默认只看当前查看的渠道，勾选「全部渠道」后合并统计。 */
 export function scopeRealm(viewRealm, includeAll) {
   return includeAll ? 'all' : viewRealm;
 }
 
 export function scopeText(includeAll, viewRealm) {
-  return includeAll ? '国内版与国际版合并' : (viewRealm === 'cn' ? '国内版' : '国际版');
+  return includeAll ? '全部渠道合并' : channelLabel(viewRealm);
 }
 
 /**
@@ -91,8 +92,9 @@ export function trendGranularity(range) {
  * 账号用量行，取自 analytics.accounts 的 window 桶，也就是当前选中的范围。
  * 只有零调用的未归属账号会被丢掉：它没有对应的账号，列出来也点不开。
  */
-export function accountRows(data) {
+export function accountRows(data, accounts = null) {
   const list = (data && data.accounts) || [];
+  const index = accountIndex(accounts);
   return list
     .filter((a) => {
       if (a.uid !== '(unattributed)') return true;
@@ -101,19 +103,20 @@ export function accountRows(data) {
     })
     .map((a) => {
       const win = a.window || {};
+      const info = index.get(String(a.uid || '')) || {};
       const models = Object.entries(a.window_models || {})
         .map(([id, m]) => ({ id, requests: Number(m.requests) || 0, tokens: Number(m.tokens) || 0 }))
         .filter((m) => m.requests > 0 || m.tokens > 0)
         .sort((x, y) => y.tokens - x.tokens || y.requests - x.requests || compareText(x.id, y.id));
       return {
         uid: a.uid || '',
-        nickname: a.nickname || a.uid || '',
-        realm: a.realm || '',
-        credits: a.credits || null,
+        nickname: a.nickname || info.nickname || a.uid || '',
+        realm: a.realm || info.realm || '',
+        credits: a.credits || info.credits || null,
         requests: Number(win.requests) || 0,
         errors: Number(win.errors) || 0,
         totalTokens: Number(win.total_tokens) || 0,
-        credit: Number(win.credit) || 0,
+        credit: creditCollected(win) ? creditValue(win.credit) : null,
         models,
       };
     })
@@ -149,7 +152,7 @@ export function keyRows(data) {
         requests: Number(win.requests) || 0,
         errors: Number(win.errors) || 0,
         totalTokens: Number(win.total_tokens) || 0,
-        credit: Number(win.credit) || 0,
+        credit: creditCollected(win) ? creditValue(win.credit) : null,
         cacheHitPct: win.cache_hit_pct == null ? null : Number(win.cache_hit_pct),
         ttftAvg: Number(win.ttft_ms_avg) || null,
         allTokens: Number(all.total_tokens) || 0,
@@ -173,6 +176,77 @@ export function idleKeyNames(data) {
     })
     .map((k) => k.key_name || k.key_id || '未命名密钥')
     .sort((a, b) => compareText(a, b));
+}
+
+/** 统一账号视图按 uid 建索引，供用量页补昵称、区域与积分。 */
+export function accountIndex(accounts) {
+  const map = new Map();
+  for (const account of accounts || []) {
+    const uid = String((account && account.uid) || '');
+    if (uid) map.set(uid, account);
+  }
+  return map;
+}
+
+/** 把 /accounts 的昵称、区域与积分补进 usage.accounts_map，服务端已有的字段优先。 */
+export function withAccountIndex(usage, accounts) {
+  const index = accountIndex(accounts);
+  if (!usage || !index.size) return usage;
+  const current = usage.accounts_map || {};
+  const map = { ...current };
+  for (const [uid, account] of index) {
+    const prev = map[uid] || {};
+    map[uid] = {
+      ...prev,
+      nickname: prev.nickname || account.nickname || uid,
+      realm: prev.realm || account.realm || '',
+      credits: prev.credits || account.credits || null,
+    };
+  }
+  return { ...usage, accounts_map: map };
+}
+
+/** 积分值：缺失保持 null（界面显示破折号），采集到的 0 才是 0。 */
+export function creditValue(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 该积分值是否采集到。 */
+export function creditKnown(value) {
+  return creditValue(value) !== null;
+}
+
+/**
+ * 这条汇总里的积分是否至少有一笔真正采集到。
+ * 完成行全部没有 credit 时（例如 CodeArts 不返回单次扣费），合计的 0 不是
+ * 「没花钱」，面板要显示未采集；旧服务端没有 credit_missing 时按已采集处理。
+ */
+export function creditCollected(stat) {
+  if (!stat) return false;
+  const requests = Number(stat.requests) || 0;
+  const missing = Number(stat.credit_missing) || 0;
+  return !(requests > 0 && missing >= requests);
+}
+
+/**
+ * 本月积分的显示状态：本月完成行全部没有扣费时视为未采集，部分缺失时仍可
+ * 显示已采集的金额并标出缺失行数。
+ */
+export function monthCreditState(month) {
+  if (!month || month.ok === false) {
+    return { known: false, partial: false, missing: 0, requests: 0, credit: 0 };
+  }
+  const requests = Number(month.requests) || 0;
+  const missing = Number(month.credit_missing) || 0;
+  return {
+    known: !(requests > 0 && missing >= requests),
+    partial: missing > 0 && missing < requests,
+    missing,
+    requests,
+    credit: Number(month.credit) || 0,
+  };
 }
 
 function accountOptionLabel(uid, info) {
@@ -216,7 +290,7 @@ function emptyStat() {
   return { requests: 0, prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 };
 }
 
-/** 一行明细的性能桶：先取这一账号在这一出口的，再取该出口的，最后退回该模型的整体值。 */
+/** 一行明细的性能桶：先取这一账号在这一渠道的，再取该渠道的，最后退回该模型的整体值。 */
 function perfBucket(perf, id, realm, acct) {
   if (!perf) return {};
   const byRealm = (perf.by_model_realm || {})[id] || {};
@@ -237,7 +311,7 @@ function weighted(bucket, field, acc) {
 /**
  * 模型性能与用量矩阵。
  *
- * 一个模型在一个出口上占一行；同一出口下有多个账号时按账号分行，这样区域、账号与
+ * 一个模型在一个渠道上占一行；同一渠道下有多个账号时按账号分行，这样渠道、账号与
  * 右边那一串数字说的是同一件事，不会把两个账号的消耗合成一个看不清来源的数。
  * 合计行在筛选生效时只用可见行重算，延迟与速度按各自样本数加权。
  */
@@ -293,7 +367,7 @@ export function buildMatrix(usage, perf, filters = {}) {
             parts.push({ stat, realm: r, acct: uid, accounts: { [uid]: Number(stat.requests) || 0 } });
           });
         } else if (!accountFilter) {
-          // 这份数据没有按账号分开统计：改用该出口的整体值，整行继续显示。
+          // 这份数据没有按账号分开统计：改用该渠道的整体值，整行继续显示。
           const fallback = (per && per[r]) || m;
           parts.push({ stat: fallback, realm: r, acct: '', accounts: fallback.accounts || {} });
         }

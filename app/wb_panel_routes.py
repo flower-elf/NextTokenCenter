@@ -14,6 +14,8 @@ import wb_accounts
 import wb_activity
 import wb_atrest
 import wb_catalog
+import wb_channels
+import wb_codearts
 import wb_identity
 import wb_modelsdev
 import wb_pricing
@@ -28,16 +30,88 @@ import wb_usage_recent
 import wb_usage_trend
 from urllib.parse import unquote
 
-from wb_models import (
-    _catalog_excluded, _catalog_raw_meta, catalog_meta, fetch_models, model_entry,
-    read_cached_remote_catalog, refresh_catalog, seed_default_disabled,
-)
+from wb_models import fetch_models, refresh_catalog
 
 
 def _g():
     """网关模块；与 wb_http._g 同一对象。函数内导入避免与 wb_http 形成导入环。"""
     import wb_http
     return wb_http._g()
+
+
+#: CodeArts 设置卡提交的字段与取值范围。与 wb_codearts.save_config 的边界保持一致：
+#: 面板先拒，保存层再拒一次，任何客户端都拿不到被悄悄夹紧的值。
+CODEARTS_SETTING_BOUNDS = {
+    "stream_timeout_seconds": (1.0, 3600.0),
+    "models_ttl_seconds": (60.0, 86400.0),
+    "checkin_max_attempts": (1.0, 10.0),
+    "checkin_retry_gap_seconds": (0.0, 86400.0),
+    "checkin_timeout_seconds": (1.0, 600.0),
+}
+CODEARTS_SETTING_BOOLEANS = ("benefit_auto_claim", "credits_auto_claim",
+                             "chat_encryption")
+
+
+def _all_providers():
+    """每个提供方一次；同一提供方的多个渠道共用账号池。"""
+    out, seen = [], set()
+    for realm in wb_channels.ids():
+        prov = wb_channels.provider(realm)
+        if prov.name in seen:
+            continue
+        seen.add(prov.name)
+        out.append(prov)
+    return out
+
+
+def validate_codearts_settings(raw):
+    """校验 CodeArts 设置补丁；返回错误文案，合法时返回空串。"""
+    allowed = set(CODEARTS_SETTING_BOUNDS) | set(CODEARTS_SETTING_BOOLEANS) | {
+        "client_type", "test_model", "accounts_dir"}
+    for key in raw:
+        if key == "accounts_dir":
+            return "accounts_dir is managed by the gateway"
+        if key not in allowed:
+            return "unknown codearts setting: %s" % key
+    if "client_type" in raw:
+        value = raw.get("client_type")
+        if not isinstance(value, str) or value.strip().lower() not in ("ide", "cli"):
+            return "client_type must be ide or cli"
+    if "test_model" in raw:
+        _model, problem = wb_settings.parse_test_model(raw.get("test_model"))
+        if problem:
+            return problem
+    for key in CODEARTS_SETTING_BOOLEANS:
+        if key in raw and not isinstance(raw.get(key), bool):
+            return "%s must be true or false" % key
+    for key, (low, high) in CODEARTS_SETTING_BOUNDS.items():
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "%s must be a number" % key
+        if not low <= float(value) <= high:
+            return "%s must be between %g and %g" % (key, low, high)
+    return ""
+
+
+def _mark_aliases(aliases, data):
+    """给模型表里作为别名源的条目加上 alias：target 是通告 id，active 表示 /v1/models
+    会用它通告 target。同出口已有开启的同名 target 时，请求交给那个模型，active 为 False。"""
+    native = {item["id"].lower() for item in data
+              if item.get("enabled") and not item.get("excluded")}
+    targets = {source.lower(): target for source, target in aliases.items()}
+    claimed = set()
+    for item in data:
+        target = targets.get(item["id"].lower())
+        if not target:
+            continue
+        active = (bool(item.get("enabled")) and not item.get("excluded")
+                  and target.lower() not in native and target.lower() not in claimed)
+        if active:
+            claimed.add(target.lower())
+        item["alias"] = {"target": target, "active": active}
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +361,10 @@ class PanelRoutes(object):
         # key 是否存在不算秘密；值不出进程，设置接口只报掩码形式。
         info["api_key_set"] = bool(_g().API_KEY)
         if self._panel_ok():
-            info["accounts"] = len(_g().POOL.accounts) if _g().POOL else 0
-            info["accounts_ready"] = _g().POOL.count_ready() if _g().POOL else 0
+            counts = _g().provider_counts()
+            info["accounts"] = counts["total"]
+            info["accounts_ready"] = counts["ready"]
+            info["by_provider"] = counts["by_provider"]
             info["stand_down"] = _g().stand_down_state()
         return self._json(200, info)
 
@@ -334,41 +410,23 @@ class PanelRoutes(object):
 
     def _get_panel_models(self, query):
         """面板的模型表：可用模型 + 上游列出但被筛选规则排除的模型。条目带 enabled 与
-        excluded；被排除的模型只在此列出，不自动写进 disabled_models，操作员明确取消勾选后
+        excluded；被排除的模型只在此列出，不自动写进关闭名单，操作员明确取消勾选后
         网关才拒绝它的请求。读取本页不改变路由状态。"""
         realm = str((query.get("realm") or [""])[0]).strip() or _g().CURRENT_REALM
         refresh = str((query.get("refresh") or [""])[0]).strip().lower() in (
             "1", "true", "yes", "on")
-        refresh_result = None
-        if refresh:
-            refresh_result = refresh_catalog(realm)
-        entries = fetch_models(realm=realm)
-        info = catalog_meta(realm) or {}
-        served = {mid for mid, _ in entries}
-        saved = read_cached_remote_catalog(realm) or ([], {})
-        extra = list(_catalog_excluded.get(realm) or [])
-        for mid in saved[0]:
-            if mid not in served and mid not in extra:
-                extra.append(mid)
-        seed_default_disabled(extra)
-        disabled = {m.strip().lower() for m in wb_settings.disabled_models(_g().ACCOUNTS_DIR)}
-        raw_meta = _catalog_raw_meta.get(realm) or {}
-        data = []
-        for mid, meta in list(entries) + [
-                (m, raw_meta.get(m) or saved[1].get(m) or {}) for m in extra]:
-            item = model_entry(mid, meta)
-            item["enabled"] = mid.strip().lower() not in disabled
-            item["excluded"] = mid not in served
-            data.append(item)
-        source = info.get("source")
-        source_label = {"remote": "server", "endpoint": "server",
-                        "cache": "cache", "legacy": "cache"}.get(source, source)
-        reply = {"object": "list", "data": data, "realm": realm,
-                 "source": source_label,
-                 "fetched_at": info.get("fetched_at")}
-        if refresh_result is not None:
-            reply["refresh_ok"] = bool(refresh_result.get("ok"))
-            reply["refresh_msg"] = refresh_result.get("msg") or ""
+        try:
+            result = wb_channels.provider(realm).panel_models(realm, refresh)
+        except wb_channels.ChannelError as exc:
+            return self._error(exc.status, str(exc), exc.etype)
+        disabled = {m.strip().lower() for m in
+                    wb_settings.disabled_models(_g().ACCOUNTS_DIR, realm)}
+        data = result.pop("data")
+        for item in data:
+            item["enabled"] = item["id"].strip().lower() not in disabled
+        aliases = wb_settings.model_aliases(_g().ACCOUNTS_DIR)
+        reply = {"object": "list", "data": _mark_aliases(aliases, data), "realm": realm}
+        reply.update(result)
         return self._json(200, reply)
 
     def _get_v1_usage(self, query):
@@ -467,24 +525,11 @@ class PanelRoutes(object):
             return self._error(400, str(exc), "invalid_request_error")
         return self._json(200, payload)
 
-    def _refresh_account_credits(self, targets):
-        results = []
-        for account in targets:
-            if account is None:
-                continue
-            res = account.fetch_credits()
-            results.append({"uid": account.uid, "ok": res.get("ok", False),
-                            "credits": account.credits,
-                            "error": res.get("error", "")})
-        return results
-
     def _get_accounts_credits(self):
         if not self._authorized():
             return
-        if _g().stand_down_active():
-            return self._error(503, _g().stand_down_message(_g().GatewayStandDown(
-                _g().STAND_DOWN.get("detail") or "")), "overloaded_error")
-        self._refresh_account_credits(_g().POOL.accounts if _g().POOL else [])
+        for prov in _all_providers():
+            prov.refresh_credits()
         return self._json(200, {"accounts": wb_accounts.account_views()})
 
     def _get_account_credits_grants(self):
@@ -499,14 +544,37 @@ class PanelRoutes(object):
         if not self._authorized():
             return
         # 建视图前先折叠用量日志，日限额徽标与停用计数才是此刻的值，不是上一次请求时的。
-        wb_usage.apply_daily_guards()
+        wb_usage.apply_pool_guards()
+        realm = (query.get("realm") or [None])[0] or _g().CURRENT_REALM
         return self._json(200, {
-            "accounts": wb_accounts.account_views(realm=query.get('realm', [None])[0] or _g().CURRENT_REALM),
+            "accounts": wb_accounts.account_views(realm=realm),
             "storage": _g().ACCOUNTS_DIR,
-            "usable": _g().POOL.count_ready() if _g().POOL else 0,
+            "usable": _g().provider_counts()["ready"],
             "limits": wb_accounts.account_limits(),
             "stand_down": _g().stand_down_state(),
         })
+
+    def _export_accounts(self, realm, include_secrets, uids):
+        """按 uid 或 realm 分派到各自提供方，合并它们的导出行。"""
+        providers = []
+        if uids:
+            seen = set()
+            for uid in uids:
+                prov = wb_channels.owner(uid)
+                if prov is not None and prov.name not in seen:
+                    seen.add(prov.name)
+                    providers.append(prov)
+        elif realm and realm not in ("all",):
+            providers = [wb_channels.provider(realm)]
+        else:
+            providers = _all_providers()
+        rows = []
+        for prov in providers:
+            rows.extend(prov.export(uids=uids or None,
+                                    include_secrets=include_secrets))
+        if realm and realm not in ("all",):
+            rows = [row for row in rows if row.get("realm") == realm]
+        return rows
 
     def _get_accounts_export(self, query):
         if not self._authorized():
@@ -514,32 +582,34 @@ class PanelRoutes(object):
         # ?download=1 让浏览器存成文件；不带则内联返回文档，看板可展示摘要。
         # ?uid= 限定到指定账号（可重复、逗号拼接），按行导出时使用。
         realm = (query.get("realm") or [None])[0] or None
-        if realm not in ("intl", "cn"):
-            realm = None
         include_secrets = (query.get("secrets") or ["1"])[0] not in ("0", "false", "no")
         uids = []
         for raw in query.get("uid") or []:
             uids.extend(part.strip() for part in str(raw).split(",") if part.strip())
         if uids:
-            known = {a.uid for a in (_g().POOL.accounts if _g().POOL else [])}
-            missing = [u for u in uids if u not in known]
+            missing = [u for u in uids if wb_channels.owner(u) is None]
             if missing:
                 return self._error(404, "no such account: %s" % ", ".join(missing[:5]),
                                    "invalid_request_error")
-        doc = wb_accounts.build_export_document(
-            _g().POOL.accounts if _g().POOL else [],
-            realm=realm,
-            include_secrets=include_secrets,
-            uids=uids or None,
-        )
+        try:
+            rows = self._export_accounts(realm, include_secrets, uids)
+        except wb_channels.ChannelError as exc:
+            return self._error_from_provider(exc)
+        doc = {
+            "format": wb_accounts.EXPORT_FORMAT,
+            "version": wb_accounts.EXPORT_VERSION,
+            "exportedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(rows),
+            "accounts": rows,
+        }
         if (query.get("download") or ["0"])[0] in ("1", "true", "yes"):
             stamp = time.strftime("%Y%m%d-%H%M%S")
             if len(uids) == 1:
                 # 单账号导出以账号 id 命名，一堆导出文件放一个目录也认得出来。
                 label = uids[0][:8]
             else:
-                label = realm + "-" if realm else ""
-            name = "workbuddy-accounts-%s%s.json" % (label, stamp)
+                label = realm + "-" if realm and realm != "all" else ""
+            name = "accounts-%s%s.json" % (label, stamp)
             return self._download(name, doc)
         return self._json(200, doc)
 
@@ -735,7 +805,7 @@ class PanelRoutes(object):
         log_data = _g().get_logs(limit=5000)
         lines = [f"[{item['ts']}] [{item['level']}] [{item['tag']}] {item['msg']}" for item in log_data["logs"]]
         text_content = "\n".join(lines).encode("utf-8")
-        filename = f"wb-proxy-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        filename = f"next-token-center-{time.strftime('%Y%m%d-%H%M%S')}.log"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -829,13 +899,11 @@ class PanelRoutes(object):
                                        "invalid_request_error")
                 # 提交里省略的字段保留已存值，与 models 同一规则：旧的或残缺的
                 # 客户端不得静默清掉出口绑定、名称、禁用状态。
-                if "realm" in item:
-                    realm = str(item.get("realm") or "").strip().lower()
-                else:
-                    realm = str(stored.get("realm") or "").strip().lower()
-                if realm not in ("", "intl", "cn"):
-                    return self._error(400, "realm must be intl, cn or empty",
-                                       "invalid_request_error")
+                try:
+                    route = list(wb_channels.parse_route(
+                        item["route"] if "route" in item else stored.get("route")))
+                except ValueError as exc:
+                    return self._error(400, "route: %s" % exc, "invalid_request_error")
                 # 旧面板缓存页根本不知道这个字段，省略它就保留已存值，不悄悄丢掉限制。
                 if "models" in item:
                     models = item.get("models")
@@ -882,7 +950,7 @@ class PanelRoutes(object):
                     "id": entry_id,
                     "name": name,
                     "key": value,
-                    "realm": realm,
+                    "route": route,
                     "models": models,
                     "enabled": enabled,
                     "created_at": created_at,
@@ -910,16 +978,6 @@ class PanelRoutes(object):
                                    "invalid_request_error")
             wb_settings.set_auth_disabled(_g().ACCOUNTS_DIR, raw)
             reply["auth_disabled"] = raw
-        if "smart_routing" in payload:
-            raw = payload.get("smart_routing")
-            if not isinstance(raw, bool):
-                return self._error(400, "smart_routing must be true or false",
-                                   "invalid_request_error")
-            wb_settings.set_smart_routing(_g().ACCOUNTS_DIR, raw)
-            reply["smart_routing"] = raw
-            if _g().POOL:
-                _g().POOL.apply_smart_routing(raw)
-                wb_usage.apply_routing_inputs(refresh=True)
         if "session_affinity" in payload:
             raw = payload.get("session_affinity")
             if not isinstance(raw, bool):
@@ -942,16 +1000,53 @@ class PanelRoutes(object):
             if problem:
                 return self._error(400, problem, "invalid_request_error")
             reply[field] = wb_settings.set_test_model(_g().ACCOUNTS_DIR, raw, realm)
-        if "disabled_models" in payload:
-            raw = payload.get("disabled_models")
-            if not isinstance(raw, list) or any(not isinstance(m, str) for m in raw):
-                return self._error(400, "disabled_models must be a list of model ids",
+        if "model_enabled" in payload:
+            raw = payload.get("model_enabled")
+            if (not isinstance(raw, dict) or raw.get("realm") not in _g().realm_options()
+                    or not isinstance(raw.get("model"), str) or not raw["model"].strip()
+                    or not isinstance(raw.get("enabled"), bool)):
+                return self._error(
+                    400, "model_enabled must be {realm, model, enabled}; realm is one of "
+                         + ", ".join(_g().realm_options()), "invalid_request_error")
+            reply["model_enabled"] = {
+                "realm": raw["realm"],
+                "disabled_models": wb_settings.set_model_enabled(
+                    _g().ACCOUNTS_DIR, raw["realm"], raw["model"], raw["enabled"]),
+            }
+        if "model_aliases" in payload:
+            raw, problem = wb_settings.parse_model_aliases(payload.get("model_aliases"))
+            if problem:
+                return self._error(400, problem, "invalid_request_error")
+            reply["model_aliases"] = wb_settings.set_model_aliases(_g().ACCOUNTS_DIR, raw)
+        if "media" in payload:
+            try:
+                reply["media"] = wb_settings.set_media_config(
+                    _g().ACCOUNTS_DIR, payload.get("media"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+        if "workbuddy_tasks_auto" in payload:
+            raw = payload.get("workbuddy_tasks_auto")
+            if not isinstance(raw, bool):
+                return self._error(400, "workbuddy_tasks_auto must be true or false",
                                    "invalid_request_error")
-            reply["disabled_models"] = wb_settings.set_disabled_models(
-                _g().ACCOUNTS_DIR, raw)
+            wb_settings.set_workbuddy_tasks_auto(_g().ACCOUNTS_DIR, raw)
+            reply["workbuddy_tasks_auto"] = raw
+        if "codearts" in payload:
+            raw = payload.get("codearts")
+            if not isinstance(raw, dict):
+                return self._error(400, "codearts must be an object",
+                                   "invalid_request_error")
+            problem = validate_codearts_settings(raw)
+            if problem:
+                return self._error(400, problem, "invalid_request_error")
+            try:
+                wb_codearts.save_config(_g().ACCOUNTS_DIR, raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_codearts.invalidate_models()
+            reply["codearts"] = wb_codearts.masked_config(_g().ACCOUNTS_DIR)
 
-        # 四条限额既可以按面板的形状归在 "limits" 下，也可以走旧客户端还在发的
-        # 顶层平铺键（按全局默认读取）；两者落进同一套分组存储，谁写都只有一个事实来源。
+        # 四条限额归在 "limits" 下，按出口分组保存。
         limits_payload = payload.get("limits")
         if limits_payload is not None and not isinstance(limits_payload, dict):
             return self._error(400, "limits must be an object",
@@ -963,8 +1058,6 @@ class PanelRoutes(object):
                 scopes = {scope: grouped[scope]
                           for scope in wb_settings.LIMIT_SCOPES
                           if scope in grouped}
-            elif key in payload:
-                scopes = {"global": payload.get(key)}
             else:
                 continue
             for scope, raw in scopes.items():
@@ -1005,14 +1098,8 @@ class PanelRoutes(object):
         if limits_payload is not None:
             reply["limits"] = wb_settings.limits_snapshot(_g().ACCOUNTS_DIR)
         if touched:
-            if _g().POOL and "reserve_credits" in touched:
-                _g().POOL.apply_reserve_credits()
-            if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
-                                          "model_daily_token_limit")):
-                # 一次折叠同时刷新三条：限额编辑不常有，守护也从同一次折叠发布。
-                wb_usage.apply_daily_guards(refresh=True)
-            if "expiring_window_days" in touched and _g().POOL:
-                _g().POOL.apply_expiring_window()
+            # 守卫设置对两个提供方同时生效：删除或改值都要立刻重推，值为 0 也推。
+            wb_usage.apply_pool_guards(refresh=True)
 
         if "pricing_enabled" in payload:
             raw = payload.get("pricing_enabled")
@@ -1029,22 +1116,17 @@ class PanelRoutes(object):
                     _g().ACCOUNTS_DIR, payload.get("cost_estimate"))
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
-        if "pricing_refresh_minutes" in payload or "pricing_refresh_hours" in payload:
-            # 间隔以分钟计；旧字段名仍接受（×60 折算），上一版缓存下来的面板页
-            # 才不会设错单位；应答一律用新字段名。
-            field = "pricing_refresh_minutes" \
-                if "pricing_refresh_minutes" in payload else "pricing_refresh_hours"
-            raw = payload.get(field)
+        if "pricing_refresh_minutes" in payload:
+            # 间隔以分钟计，应答沿用同一个字段名。
+            raw = payload.get("pricing_refresh_minutes")
             if isinstance(raw, bool) or raw is None:
-                return self._error(400, "%s must be a number" % field,
+                return self._error(400, "pricing_refresh_minutes must be a number",
                                    "invalid_request_error")
             try:
                 minutes = float(raw)
             except (TypeError, ValueError):
-                return self._error(400, "%s must be a number" % field,
+                return self._error(400, "pricing_refresh_minutes must be a number",
                                    "invalid_request_error")
-            if field == "pricing_refresh_hours":
-                minutes *= 60.0
             if minutes < 0:
                 return self._error(400, "pricing_refresh_minutes cannot be negative",
                                    "invalid_request_error")
@@ -1071,36 +1153,6 @@ class PanelRoutes(object):
                 wb_settings.set_credits_refresh_hours(_g().ACCOUNTS_DIR, hours)
             if _g().CREDITS_REFRESHER:
                 _g().CREDITS_REFRESHER.wake()
-        if "section_max_height" in payload:
-            # 面板窗口高度上限（像素），0 表示不限。bool 是 int 子类必须显式拒绝，
-            # 否则 true 会存成 1，把每个窗口压成一条缝。
-            raw = payload.get("section_max_height")
-            if isinstance(raw, bool) or raw is None:
-                return self._error(400, "section_max_height must be a whole number",
-                                   "invalid_request_error")
-            try:
-                number = int(raw)
-            except (TypeError, ValueError, OverflowError):
-                # JSON 载荷可能带 Infinity（1e400），int() 拒绝，回 400 而不是 500。
-                return self._error(400, "section_max_height must be a whole number",
-                                   "invalid_request_error")
-            # 小数拒绝而非截断：int(-0.5) 是 0，会绕过负数检查，悄悄把上限关掉。
-            if float(raw) != number:
-                return self._error(400, "section_max_height must be a whole number",
-                                   "invalid_request_error")
-            if number < 0:
-                return self._error(400, "section_max_height cannot be negative",
-                                   "invalid_request_error")
-            reply["section_max_height"] = \
-                wb_settings.set_section_max_height(_g().ACCOUNTS_DIR, number)
-        if "ui_language" in payload:
-            # 实例级默认语言；看板在每个浏览器用 localStorage 覆盖，本值是浏览器
-            # 本地无偏好时的回退。
-            raw = payload.get("ui_language")
-            if not isinstance(raw, str) or raw not in ("zh", "zh-Hant", "en"):
-                return self._error(400, "ui_language must be zh, zh-Hant or en",
-                                   "invalid_request_error")
-            reply["ui_language"] = wb_settings.set_ui_language(_g().ACCOUNTS_DIR, raw)
         if "pricing_variant_inherit" in payload:
             # 严格 JSON 布尔：字符串 "false" 为真值，会把功能悄悄打开。
             raw = payload.get("pricing_variant_inherit")
@@ -1273,41 +1325,6 @@ class PanelRoutes(object):
                     log_db_touched = True
             if log_db_touched:
                 _g().apply_log_db_settings()
-        if "accounts_collapsed" in payload:
-            # 一个折叠状态，也是本分支唯一会动的东西：提交只带这个键，未点名的
-            # 设置在写入后原样保留。
-            raw = payload.get("accounts_collapsed")
-            if not isinstance(raw, bool):
-                return self._error(400, "accounts_collapsed must be true or false",
-                                   "invalid_request_error")
-            wb_settings.set_accounts_collapsed(_g().ACCOUNTS_DIR, raw)
-            reply["accounts_collapsed"] = raw
-        if "accounts_separate_tab" in payload:
-            # 同上形状。严格 JSON 布尔：字符串 "false" 为真值，会把导航悄悄拆开。
-            raw = payload.get("accounts_separate_tab")
-            if not isinstance(raw, bool):
-                return self._error(400, "accounts_separate_tab must be true or false",
-                                   "invalid_request_error")
-            wb_settings.set_accounts_separate_tab(_g().ACCOUNTS_DIR, raw)
-            reply["accounts_separate_tab"] = raw
-        if "key_before_hidden" in payload:
-            # 同 accounts_collapsed 形状。严格 JSON 布尔：字符串 "false" 为真值，
-            # 会把行悄悄折起来。
-            raw = payload.get("key_before_hidden")
-            if not isinstance(raw, bool):
-                return self._error(400, "key_before_hidden must be true or false",
-                                   "invalid_request_error")
-            wb_settings.set_key_before_hidden(_g().ACCOUNTS_DIR, raw)
-            reply["key_before_hidden"] = raw
-        if "hidden_pages" in payload:
-            # 页面键列表是本分支唯一会动的东西，未点名的设置写入后原样保留。裸字符串会被
-            # 逐字符遍历只会隐藏一堆乱码，所以非字符串列表一律直接拒绝。
-            raw = payload.get("hidden_pages")
-            if not isinstance(raw, list) or any(not isinstance(k, str) for k in raw):
-                return self._error(400, "hidden_pages must be a list of page keys",
-                                   "invalid_request_error")
-            # 应答规范化后的列表：拼错的键进来时已被丢弃，面板回显的是实际存下的内容。
-            reply["hidden_pages"] = wb_settings.set_hidden_pages(_g().ACCOUNTS_DIR, raw)
         if "update_check_enabled" in payload:
             # 严格 JSON 布尔：字符串 "false" 为真值，会悄悄开始 GitHub 调用。
             raw = payload.get("update_check_enabled")
@@ -1365,23 +1382,6 @@ class PanelRoutes(object):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_prompt_config(_g().ACCOUNTS_DIR, patch)
             reply["prompt"] = wb_settings.prompt_config(_g().ACCOUNTS_DIR)
-        new_key = payload.get("api_key")
-        if new_key is not None:
-            new_key = str(new_key).strip()
-            if new_key and len(new_key) < 4:
-                return self._error(400, "api key must be at least 4 characters",
-                                   "invalid_request_error")
-            wb_settings.set_api_key(_g().ACCOUNTS_DIR, new_key)
-            _g().API_KEY = new_key
-            # 与 _g().API_KEY 同写网关状态：runtime_settings_view 从那里读
-            # api_key_set_by_panel，写成本模块的全局变量读不到。
-            _g().API_KEY_FILE_SET = True
-            reply["api_key_set"] = bool(new_key)
-        if payload.get("restart_scheduler"):
-            if _g().SCHEDULER:
-                _g().SCHEDULER.stop()
-                _g().SCHEDULER.start()
-            reply["scheduler"] = "restarted"
         reply.update(_g().runtime_settings_view())
         return self._json(200, reply)
 
@@ -1409,6 +1409,15 @@ class PanelRoutes(object):
                 if dropped:
                     _g().log("proxy slots: unbound %d account(s) from removed slots"
                         % dropped)
+            try:
+                ca_dropped = wb_codearts.drop_missing_bindings(
+                    _g().ACCOUNTS_DIR, saved)
+                if ca_dropped:
+                    _g().log("proxy slots: unbound %d CodeArts account(s) from "
+                             "removed slots" % ca_dropped)
+            except Exception as exc:
+                _g().log("proxy slots: CodeArts rebind failed: %s" % exc,
+                         level="WARN")
             _g().log("proxy slots saved: %d slot(s)" % len(saved))
             return self._json(200, {"slots": wb_proxy_slots.proxy_slots_view(_g().POOL, _g().ACCOUNTS_DIR)})
         if path == "/proxy/slots/test":
@@ -1568,7 +1577,7 @@ class PanelRoutes(object):
 
     def _get_agents(self):
         if not self._agents_client_allowed():
-            # 远程看板（服务端 / Docker / OpenWrt）：一键配置改的是网关所在
+            # 远程看板（服务端 / Docker）：一键配置改的是网关所在
             # 机器的配置目录，到不了用户自己的电脑，直接按不可用返回。
             return self._json(200, {
                 "enabled": False,
@@ -1749,9 +1758,51 @@ class PanelRoutes(object):
             return self._json(200, {"ok": True, "token": token})
         return self._error(404, "not found", "invalid_request_error")
 
+    def _codearts_admin_error(self, exc):
+        if isinstance(exc, wb_codearts.CodeArtsNotFound):
+            status = 404
+        elif isinstance(exc, (wb_codearts.CodeArtsBadRequest,
+                              wb_codearts.CodeArtsConflict)):
+            status = 400
+        elif isinstance(exc, wb_codearts.CodeArtsAuthError):
+            status = 502
+        else:
+            status = 502
+        return self._error(status, str(exc), "invalid_request_error")
+
+    def _handle_codearts(self, path, payload):
+        """`/codearts/*` 只保留 OAuth 登录三段；账号、配置与目录都走统一接口。"""
+        if not self._panel_ok():
+            return self._error(401, "panel password required",
+                               "invalid_request_error")
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object",
+                               "invalid_request_error")
+        cfg = wb_codearts.load_config(_g().ACCOUNTS_DIR)
+        try:
+            if path == "/codearts/accounts/oauth/start":
+                try:
+                    port = int(self.server.server_address[1])
+                except Exception:
+                    port = 8788
+                proxy_slot = str(payload.get("proxySlot") or "").strip()
+                return self._json(200, wb_codearts.oauth_start(
+                    cfg, port, proxy_slot=proxy_slot))
+            if path == "/codearts/accounts/oauth/poll":
+                return self._json(200, wb_codearts.oauth_poll(
+                    cfg, payload.get("session_id")))
+            if path == "/codearts/accounts/oauth/callback":
+                return self._json(200, wb_codearts.oauth_callback(
+                    cfg, payload.get("session_id"),
+                    payload.get("callback_url")))
+            return self._error(404, "unknown codearts endpoint",
+                               "invalid_request_error")
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_admin_error(exc)
+
     def _handle_accounts(self, path, payload):
-        if _g().POOL is None:
-            return self._error(503, "account pool unavailable")
+        if path.startswith("/codearts"):
+            return self._handle_codearts(path, payload)
         if path == "/accounts/import" and isinstance(payload, list):
             # 裸数组只对导入有意义；包一层，让本处理器其余部分继续假定是 dict。
             payload = {"data": payload}
@@ -1795,8 +1846,6 @@ class PanelRoutes(object):
             return self._route_accounts_test(payload)
         if path == "/accounts/set":
             return self._route_accounts_set(payload)
-        if path == "/accounts/product":
-            return self._route_accounts_product(payload)
         if path == "/accounts/set-all":
             return self._route_accounts_set_all(payload)
         if path == "/accounts/delete":
@@ -1807,61 +1856,27 @@ class PanelRoutes(object):
             return self._route_accounts_add_api_key(payload)
         return self._error(404, "unknown account endpoint", "invalid_request_error")
 
-    def _route_accounts_product(self, payload):
-        """官方有两套身份、两条配额线。某条满了可以切到另一条继续用。"""
-        target = str(payload.get("product") or "").strip().lower()
-        uid = payload.get("uid")
-        realm = payload.get("realm")
-
-        if target not in wb_identity.VALID_PRODUCTS:
-            return self._error(400, "product must be 'workbuddy', 'vscode', or 'cli'",
-                               "invalid_request_error")
-
-        if uid:
-            targets = [_g().POOL.get(uid)]
-        elif realm and realm != "all":
-            targets = [a for a in _g().POOL.accounts if a.realm == realm]
-        else:
-            targets = list(_g().POOL.accounts)
-
-        changed = []
-        for account in targets:
-            if account is None:
-                continue
-            try:
-                if account.set_product(target):
-                    # 立刻写盘：set_product() 只改内存，这一下是操作者的明确选择，不能等别的
-                    # 路径碰巧存档才生效，否则切完就重启容器的人会白白丢掉这次切换。
-                    try:
-                        account.save(_g().ACCOUNTS_DIR)
-                    except Exception as exc:
-                        _g().log("product save failed for %s: %s" % (account.uid[:8], exc),
-                            level="WARN")
-                    changed.append(account.uid[:8])
-                    _g().log("account %s: 面板手动切换身份 -> %s"
-                        % (account.uid[:8], target), level="INFO")
-            except Exception as exc:
-                _g().log("product switch failed for %s: %s" % (account.uid[:8], exc),
-                    level="WARN")
-
-        return self._json(200, {
-            "ok": True,
-            "product": target,
-            "changed": changed,
-            "accounts": wb_accounts.account_views(),
-        })
-
     def _route_accounts_credits(self, payload):
-        uid = payload.get("uid")
-        realm = payload.get("realm")
+        uid = str(payload.get("uid") or "").strip()
+        realm = str(payload.get("realm") or "").strip().lower() or None
+        results = []
         if uid:
-            targets = [_g().POOL.get(uid)]
-        elif realm and realm != "all":
-            targets = [a for a in _g().POOL.accounts if a.realm == realm]
+            prov = wb_channels.owner(uid)
+            if prov is None:
+                return self._error(404, "no such account", "invalid_request_error")
+            try:
+                results = prov.refresh_credits([uid])
+            except wb_channels.ChannelError as exc:
+                return self._error_from_provider(exc)
         else:
-            targets = list(_g().POOL.accounts)
-        results = self._refresh_account_credits(targets)
-        return self._json(200, {"results": results, "accounts": wb_accounts.account_views()})
+            for prov in _all_providers():
+                uids = self._provider_realm_uids(prov, realm)
+                try:
+                    results.extend(prov.refresh_credits(uids))
+                except wb_channels.ChannelError as exc:
+                    return self._error_from_provider(exc)
+        return self._json(200, {"results": results,
+                                "accounts": wb_accounts.account_views()})
 
     def _route_tasks_run(self, payload):
         if not _g().POOL:
@@ -2081,33 +2096,63 @@ class PanelRoutes(object):
                                 "known": known, "msg": msg})
 
     def _route_realm(self, payload):
-        # 切换出口影响所有未绑定 realm 的 key，属管理操作，只认面板会话；
-        # GET /realm 只报当前出口，对 API Key 开放。
+        # 改默认路由影响所有没有绑定渠道的 key，属管理操作，只认面板会话；
+        # GET /realm 只报当前路由，对 API Key 开放。
         if not self._panel_ok():
             return self._error(403, "changing the upstream exit requires the "
                                     "panel session, not an API key",
                                "invalid_request_error")
-        new_realm = payload.get("realm")
-        if new_realm in ("intl", "cn"):
-            wb_usage.save_persisted_realm(new_realm)
-        return self._json(200, {"ok": True, "current": _g().CURRENT_REALM, "persisted": True})
+        try:
+            route = wb_channels.parse_route(payload.get("route"))
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        if not route:
+            return self._error(400, "默认出口至少要选一个渠道", "invalid_request_error")
+        for realm in route:
+            if not wb_channels.provider(realm).configured(_g().ACCOUNTS_DIR):
+                return self._error(400, "%s没有可用账号，请在账号页添加或启用"
+                                   % wb_channels.label(realm), "invalid_request_error")
+        wb_usage.save_persisted_route(route)
+        return self._json(200, {"ok": True, "route": list(_g().ROUTE), "persisted": True})
+
+    @staticmethod
+    def _provider_realm_uids(prov, realm):
+        """提供方在某个渠道下的账号 uid；realm 为空或 all 时返回 None（全部账号）。"""
+        if not realm or realm == "all":
+            return None
+        return [view.get("uid") for view in prov.views(realm=realm)
+                if view.get("uid")]
 
     def _route_accounts_checkin(self, payload):
-        uid = payload.get("uid")
+        uid = str(payload.get("uid") or "").strip()
+        realm = str(payload.get("realm") or "").strip().lower() or None
         wb_tasks.invalidate_tasks_cache()          # 签到会改连续打卡状态，成长任务快照随之作废
-        targets = ([_g().POOL.get(uid)] if uid
-                   else [a for a in (_g().POOL.accounts if _g().POOL else [])
-                         if a.has_personal_program()])
         results = []
-        for account in targets:
-            if account is None:
-                continue
-            res = account.checkin(trigger="manual")
-            nick = account.nickname or account.uid[:8]
-            _g().add_log_entry(f"[任务福利] 账号 [{nick}] 每日签到: {res.get('msg') if res.get('ok') else res.get('error')}",
-                          level="INFO" if res.get("ok") else "WARN", tag="tasks")
-            results.append({"uid": account.uid, "nickname": account.nickname, **res})
-        return self._json(200, {"results": results, "accounts": wb_accounts.account_views()})
+        if uid:
+            prov = wb_channels.owner(uid)
+            if prov is None:
+                return self._error(404, "no such account", "invalid_request_error")
+            try:
+                results = prov.checkin([uid])
+            except wb_channels.ChannelError as exc:
+                return self._error_from_provider(exc)
+        else:
+            for prov in _all_providers():
+                uids = self._provider_realm_uids(prov, realm)
+                try:
+                    if uids is None:
+                        results.extend(prov.checkin())
+                    else:
+                        results.extend(prov.checkin(uids))
+                except wb_channels.ChannelError as exc:
+                    return self._error_from_provider(exc)
+        for row in results:
+            _g().log("[任务福利] 账号 [%s] 签到: %s"
+                     % ((row.get("uid") or "?")[:8],
+                        row.get("message") or row.get("error") or ""),
+                     level="INFO" if row.get("ok") else "WARN", tag="tasks")
+        return self._json(200, {"results": results,
+                                "accounts": wb_accounts.account_views()})
 
     def _route_accounts_daily_chat(self, payload):
         uid = payload.get("uid")
@@ -2162,12 +2207,18 @@ class PanelRoutes(object):
                                % ", ".join(wb_identity.VALID_PRODUCTS),
                                "invalid_request_error")
         target_realm = payload.get("realm") or _g().CURRENT_REALM
+        proxy_slot = str(payload.get("proxySlot") or "").strip()
         try:
-            started = _g().POOL.start_login(realm=target_realm, product=product)
+            started = _g().POOL.start_login(realm=target_realm, product=product,
+                                            proxy_slot=proxy_slot)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
         except Exception as exc:
             return self._error(502, "could not start login: %s" % exc)
-        _g().log("oauth login started (realm=%s, product=%s, platform=%s, state=%s)"
-            % (target_realm, product, started["platform"], started["state"][:8]))
+        _g().log("oauth login started (realm=%s, product=%s, platform=%s, state=%s, "
+                 "proxy=%s)"
+            % (target_realm, product, started["platform"], started["state"][:8],
+               started.get("proxy") or "direct"))
         return self._json(200, started)
 
     def _route_accounts_login_cancel(self, payload):
@@ -2243,20 +2294,36 @@ class PanelRoutes(object):
         })
 
     def _route_accounts_refresh(self, payload):
-        uid = payload.get("uid")
-        targets = [_g().POOL.get(uid)] if uid else list(_g().POOL.accounts)
+        """面板的「刷新 Token」：强制向上游换一次新令牌，两个提供方共用。"""
+        uid = str(payload.get("uid") or "").strip()
+        realm = str(payload.get("realm") or "").strip().lower() or None
         results = []
-        for account in targets:
-            if account is None:
-                continue
-            if not account.can_refresh():
-                results.append({"uid": account.uid, "ok": True,
-                                "msg": "API Key 长期有效，无需刷新"})
-                continue
-            ok = account.refresh()
-            account.save(_g().ACCOUNTS_DIR)
-            results.append({"uid": account.uid, "ok": ok, "error": account.last_error})
-        return self._json(200, {"results": results})
+        if uid:
+            prov = wb_channels.owner(uid)
+            if prov is None:
+                return self._error(404, "no such account", "invalid_request_error")
+            try:
+                results.append(prov.refresh_credential(uid))
+            except wb_channels.ChannelError as exc:
+                return self._error_from_provider(exc)
+        else:
+            for prov in _all_providers():
+                uids = self._provider_realm_uids(prov, realm)
+                if uids is None:
+                    uids = [view.get("uid") for view in prov.views() if view.get("uid")]
+                for target in uids:
+                    try:
+                        results.append(prov.refresh_credential(target))
+                    except wb_channels.ChannelError as exc:
+                        return self._error_from_provider(exc)
+        for row in results:
+            _g().log("account %s: 面板手动刷新凭据 %s"
+                     % ((row.get("uid") or "?")[:8],
+                        "成功" if row.get("ok") else
+                        "失败: " + (row.get("error") or "")),
+                     level="INFO" if row.get("ok") else "WARN", tag="accounts")
+        return self._json(200, {"results": results,
+                                "accounts": wb_accounts.account_views()})
 
     def _route_accounts_sync_profile(self, payload):
         """看板手动刷新昵称。上游响应带手机号等个人字段，wb_accounts.fetch_account_profile
@@ -2288,30 +2355,23 @@ class PanelRoutes(object):
                                 "accounts": wb_accounts.account_views()})
 
     def _route_accounts_test(self, payload):
-        uid = payload.get("uid")
+        uid = str(payload.get("uid") or "").strip()
         if not uid:
-            # 不带 uid 就是「一键测试」：一次看全区域里每个账号 + 本机连通性。
+            # 不带 uid 就是「一键测试」：一次看全区域里每个 WorkBuddy 账号 + 本机连通性。
             return self._route_accounts_test_all(payload)
-        account = _g().POOL.get(uid)
-        if not account:
+        prov = wb_channels.owner(uid)
+        if prov is None:
             return self._error(404, "no such account")
-        model = payload.get("model") or wb_settings.test_model(_g().ACCOUNTS_DIR, account.realm)
-        row = probe_account(account, model)
+        model = payload.get("model") or None
+        try:
+            result = prov.test(uid, model=model)
+        except wb_channels.ChannelError as exc:
+            return self._error_from_provider(exc)
         _g().log("account test: uid=%s model=%s wall=%sms ok=%s%s"
-            % (account.uid[:8], model, row.get("elapsed_ms"), row.get("ok"),
-               "" if row.get("ok") else " error=%s" % (row.get("error") or "")),
-            level="INFO" if row.get("ok") else "WARN", tag="accounts")
-        # 单账号测试的返回体保持原样（面板与客户端都在用），只在失败时多带一个
-        # network 标记：提示这是本机网络的问题，不是账号的问题。
-        result = {"ok": row["ok"], "uid": row["uid"], "model": row["model"],
-                  "elapsed_ms": row["elapsed_ms"]}
-        if row["ok"]:
-            result["reply"] = row["reply"]
-        else:
-            result["status"] = row["status"] if row["status"] is not None else 500
-            result["error"] = row["error"]
-            if row["network"]:
-                result["network"] = True
+            % (uid[:8], result.get("model"), result.get("elapsed_ms"),
+               result.get("ok"),
+               "" if result.get("ok") else " error=%s" % (result.get("error") or "")),
+            level="INFO" if result.get("ok") else "WARN", tag="accounts")
         return self._json(200, result)
 
     def _route_accounts_test_all(self, payload):
@@ -2320,7 +2380,8 @@ class PanelRoutes(object):
         （测试成功会顺手清掉这些计数），以及本机网络通不通；断网时每个账号都会失败。"""
         realm = str(payload.get("realm") or "").strip().lower()
         if realm not in ("intl", "cn"):
-            realm = _g().CURRENT_REALM
+            realm = (_g().CURRENT_REALM
+                     if _g().CURRENT_REALM in ("intl", "cn") else "intl")
         model = payload.get("model") or wb_settings.test_model(_g().ACCOUNTS_DIR, realm)
         targets = [a for a in (_g().POOL.accounts if _g().POOL else [])
                    if a.realm == realm and a.enabled]
@@ -2344,82 +2405,82 @@ class PanelRoutes(object):
                                 "results": rows, "accounts": wb_accounts.account_views()})
 
     def _route_accounts_set(self, payload):
-        uid = payload.get("uid")
+        uid = str(payload.get("uid") or "").strip()
         if not uid:
             return self._error(400, "uid required")
-        changes, problem = wb_accounts.parse_account_set(payload)
-        if problem:
-            return self._error(400, problem)
-        if _g().POOL.get(uid) is None:
+        # 字段校验只做一次，在提供方的 update() 里：未知键、越界值与 proxySlot
+        # 解析都在那里给出用户可读的错误。
+        changes = {key: value for key, value in payload.items() if key != "uid"}
+        if not changes:
+            return self._error(400, "nothing to update")
+        prov = wb_channels.owner(uid)
+        if prov is None:
             return self._error(404, "no such account")
-        updated = None
-        if "proxySlot" in changes:
-            updated = _g().POOL.set_proxy_slot(uid, changes["proxySlot"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s proxy slot set to %s"
-                % (uid[:8], updated.get("proxySlot") or "(direct)"))
-        if "proxy" in changes:
-            updated = _g().POOL.set_proxy(uid, changes["proxy"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s proxy set to %s"
-                % (uid[:8], updated.get("proxy") or "(direct)"))
-        if "enabled" in changes:
-            updated = _g().POOL.set_enabled(uid, changes["enabled"])
-            if updated is None:
-                return self._error(404, "no such account")
-            if changes["enabled"]:
-                _g().clear_stand_down()
-            _g().log("account %s %s"
-                % (uid[:8], "enabled" if changes["enabled"] else "disabled"))
-        if "weight" in changes:
-            updated = _g().POOL.set_weight(uid, changes["weight"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s weight set to %d" % (uid[:8], changes["weight"]))
-        if "priority" in changes:
-            updated = _g().POOL.set_priority(uid, changes["priority"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s priority set to %d" % (uid[:8], changes["priority"]))
-        if "concurrencyLimit" in changes:
-            updated = _g().POOL.set_concurrency_limit(uid, changes["concurrencyLimit"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s concurrency limit set to %d"
-                % (uid[:8], changes["concurrencyLimit"]))
-        if "note" in changes:
-            updated = _g().POOL.set_note(uid, changes["note"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s note set (%d chars)"
-                % (uid[:8], len(updated.get("note") or "")))
-        if "disabledModels" in changes:
-            # 人工黑名单：这些模型不再派给该账号，其他模型与别的账号都不受影响。
-            # 传空数组 = 清空禁用。
-            updated = _g().POOL.set_disabled_models(uid, changes["disabledModels"])
-            if updated is None:
-                return self._error(404, "no such account")
-            _g().log("account %s disabled models: %s"
-                % (uid[:8],
-                   ",".join(updated.get("disabledModels") or []) or "(none)"))
-        return self._json(200, {"account": updated})
+        try:
+            updated = prov.update(uid, changes)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except wb_channels.ChannelError as exc:
+            return self._error_from_provider(exc)
+        if updated is None:
+            return self._error(404, "no such account")
+        _g().log("account %s updated: %s"
+                 % (uid[:8], ", ".join(sorted(changes))), tag="accounts")
+        if "enabled" in changes and changes["enabled"] and \
+                prov.name == wb_channels.WorkBuddyProvider.name:
+            _g().clear_stand_down()
+        return self._json(200, {"account": updated,
+                                "accounts": wb_accounts.account_views()})
 
     def _route_accounts_set_all(self, payload):
-        _g().POOL.set_all_enabled(bool(payload.get("enabled")))
-        if payload.get("enabled"):
+        if "enabled" not in payload:
+            return self._error(400, "enabled required", "invalid_request_error")
+        enabled = bool(payload.get("enabled"))
+        realm = str(payload.get("realm") or "").strip().lower() or None
+        group = str(payload.get("group") or "").strip() or None
+        changed = []
+        workbuddy_changed = False
+        for prov in _all_providers():
+            target_realm = realm if realm and realm != "all" else None
+            uids = prov.set_all_enabled(enabled, realm=target_realm,
+                                        group=group)
+            changed.extend(uids)
+            if (prov.name == wb_channels.WorkBuddyProvider.name and uids):
+                workbuddy_changed = True
+        # 停止开关只属于 WorkBuddy：CodeArts 标签页的「全部启用」不能替
+        # WorkBuddy 解除上游限制。
+        if enabled and workbuddy_changed:
             _g().clear_stand_down()
-        return self._json(200, {"accounts": wb_accounts.account_views(),
+        _g().log("accounts %s: %d 个%s"
+                 % ("enabled" if enabled else "disabled", len(changed),
+                    (" in group " + group) if group else ""), tag="accounts")
+        return self._json(200, {"changed": changed,
+                                "accounts": wb_accounts.account_views(),
                                 "stand_down": _g().stand_down_state()})
 
+    @staticmethod
+    def _provider_error(exc):
+        """把提供方的 ChannelError 变成面板错误应答。"""
+        return exc.status, str(exc), exc.etype
+
+    def _error_from_provider(self, exc):
+        status, message, etype = self._provider_error(exc)
+        return self._error(status, message, etype)
+
     def _route_accounts_delete(self, payload):
-        uid = payload.get("uid")
+        uid = str(payload.get("uid") or "").strip()
         if not uid:
             return self._error(400, "uid required")
-        removed = _g().POOL.remove(uid)
-        _g().log("account %s deleted" % uid[:8])
-        return self._json(200, {"deleted": removed, "accounts": wb_accounts.account_views()})
+        prov = wb_channels.owner(uid)
+        if prov is None:
+            return self._error(404, "no such account")
+        try:
+            prov.delete(uid)
+        except wb_channels.ChannelError as exc:
+            return self._error_from_provider(exc)
+        _g().log("account %s deleted" % uid[:8], tag="accounts")
+        return self._json(200, {"deleted": True,
+                                "accounts": wb_accounts.account_views()})
 
     def _route_accounts_add_api_key(self, payload):
         """新增静态 API Key 账号；先探测一次企业额度端点，成功才保存。"""
@@ -2478,23 +2539,62 @@ class PanelRoutes(object):
         dry_run = bool(payload.get("dryRun"))
         overwrite = bool(payload.get("overwrite"))
         forced_realm = (payload.get("realm") or "").strip().lower() or None
-        if forced_realm and forced_realm not in ("intl", "cn"):
-            return self._error(400, "realm must be intl or cn", "invalid_request_error")
-        if dry_run:
-            # 不动池子、逐行校验，让调用方先看清导入会做什么再提交。与真实导入
-            # 共用规则，预览不会与实际不一致。
-            return self._json(200, {
-                "dryRun": True,
-                "count": len(rows),
-                "result": _g().POOL.preview_import_rows(rows, realm=forced_realm, overwrite=overwrite),
-                "accounts": wb_accounts.account_views(),
-            })
-        report = _g().POOL.import_rows(rows, realm=forced_realm, overwrite=overwrite)
-        _g().log("account import: %d added, %d updated, %d skipped, %d invalid"
-            % (len(report["added"]), len(report["updated"]),
-               len(report["skipped"]), len(report["invalid"])))
-        return self._json(200, {
+        if forced_realm and forced_realm not in wb_channels.ids():
+            return self._error(400, "realm must be one of: %s" % ", ".join(wb_channels.ids()),
+                               "invalid_request_error")
+        groups = {}
+        for row in rows:
+            if forced_realm:
+                row["realm"] = forced_realm
+            prov = self._import_row_provider(row)
+            groups.setdefault(prov.name, (prov, []))[1].append(row)
+        merged = {"added": [], "updated": [], "skipped": [], "invalid": []}
+        for prov, group in groups.values():
+            try:
+                result = prov.import_rows(group, dry_run=dry_run,
+                                          overwrite=overwrite)
+            except wb_channels.ChannelError as exc:
+                return self._error_from_provider(exc)
+            self._merge_import_report(merged, result)
+        labels = {"added": "added", "updated": "updated",
+                  "skipped": "skipped", "invalid": "invalid"}
+        _g().log("account import: %s" % ", ".join(
+            "%d %s" % (len(merged[key]), labels[key]) for key in labels), tag="accounts")
+        body = {
             "count": len(rows),
-            "result": report,
+            "result": merged,
             "accounts": wb_accounts.account_views(),
-        })
+        }
+        if dry_run:
+            body["dryRun"] = True
+        return self._json(200, body)
+
+    @staticmethod
+    def _import_row_provider(row):
+        """一行属于哪个提供方：显式 provider 优先，否则按 realm 归属。"""
+        name = str(row.get("provider") or "").strip().lower()
+        for prov in _all_providers():
+            if prov.name == name:
+                return prov
+        realm = str(row.get("realm") or "").strip().lower()
+        if realm in wb_channels.ids():
+            return wb_channels.provider(realm)
+        return wb_channels.provider(None)
+
+    @staticmethod
+    def _merge_import_report(merged, result):
+        """把提供方的导入报告并进统一形状 added/updated/skipped/invalid。"""
+        result = result or {}
+        if "added" in result or "updated" in result:
+            merged["added"].extend(result.get("added") or [])
+            merged["updated"].extend(result.get("updated") or [])
+        else:
+            for item in result.get("imported") or []:
+                uid = item.get("uid") if isinstance(item, dict) else item
+                action = item.get("action") if isinstance(item, dict) else ""
+                if action == "updated":
+                    merged["updated"].append(uid)
+                else:
+                    merged["added"].append(uid)
+        merged["skipped"].extend(result.get("skipped") or [])
+        merged["invalid"].extend(result.get("invalid") or result.get("errors") or [])

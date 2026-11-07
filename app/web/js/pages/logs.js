@@ -15,8 +15,7 @@ import {
 
 export const refreshMs = LOG_POLL_MS;
 
-const PAGE_DESC = '网关运行日志：反向代理请求、流式转发、调度巡检、任务打卡与异常告警。'
-  + '网关内存中保留最新 2000 条，标签页在前台时每 2 秒读取一次新日志。';
+const PAGE_DESC = '网关运行日志，内存中保留最新 2000 条。';
 
 export function mount(host) {
   const state = {
@@ -98,7 +97,7 @@ export function mount(host) {
       state.error = '';
       state.status = '就绪 · ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
     } catch (err) {
-      state.error = '日志没有读取成功。' + (err.message ? ' ' + err.message : '');
+      state.error = '日志没有读取成功：' + (err.message || '未知原因');
       state.status = '连接中断 · ' + (err.message || '读取失败');
     } finally {
       fetching = false;
@@ -147,14 +146,14 @@ export function mount(host) {
   }
 
   async function exportLogs() {
-    const name = await downloadFile('/logs/export', 'wb-proxy-center.log');
+    const name = await downloadFile('/logs/export', 'next-token-center.log');
     toast.success('日志文件已保存', name);
   }
 
   async function clearLogs() {
     const done = await confirmDialog({
       title: '清空网关日志？',
-      desc: '将清空网关内存里保留的全部日志，最多 2000 条。用量统计与请求记录不受影响，清空后新产生的日志会继续出现在这里。',
+      desc: '清空网关内存里保留的日志，用量统计与请求记录不受影响。',
       confirmText: '清空',
       danger: true,
       onConfirm: async () => {
@@ -201,7 +200,7 @@ export function mount(host) {
               <span class="terminal-dot" style="background:#ef4444"></span>
               <span class="terminal-dot" style="background:#f59e0b"></span>
               <span class="terminal-dot" style="background:#10b981"></span>
-              <span class="terminal-title">wb-proxy-center-console.log</span>
+              <span class="terminal-title">next-token-center-console.log</span>
             </span>
             <span class="terminal-status">${state.status}</span>
           </div>

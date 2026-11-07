@@ -2,9 +2,11 @@ import { html, render, nothing, live } from './core/dom.js';
 import { icon } from './core/icons.js';
 import { getJSON, postJSON, onUnauthorized, setApiKey, setPanelToken } from './core/api.js';
 import { getState, subscribe, initRealms, setViewRealm, setPanelStatus, setVersion } from './core/store.js';
+import { channel, channelLabel, channelProvider, channelTitle } from './core/channels.js';
 import { startRouter, stopRouter, remount, navigate, currentRoute } from './core/router.js';
 import { refreshSeconds, setRefreshSeconds, onRefreshSeconds } from './core/refresh.js';
 import { initTheme, themeMode, setThemeMode } from './core/theme.js';
+import { spaceMixed } from './core/format.js';
 import { mountDock, setDockActive, dockMode, setDockMode } from './ui/dock.js';
 import { installPaletteShortcut, paletteTrigger } from './ui/palette.js';
 import { openDialog } from './ui/dialog.js';
@@ -14,8 +16,8 @@ import { toast, toastError } from './ui/toast.js';
 import { showLogin } from './pages/login.js';
 
 const app = document.getElementById('app');
-// 顶栏状态点来自 /panel/status，该接口只在带面板会话时返回。
-let gateway = { ok: null, ready: 0, total: 0 };
+// 顶栏状态点来自 /panel/status，该接口只在带面板会话时返回；by_provider 按提供方给出总数与可用数。
+let gateway = { ok: null, ready: 0, total: 0, byProvider: {} };
 let gatewayTimer = null;
 let shellRunning = false;
 
@@ -31,24 +33,32 @@ function takeUrlParam(name) {
 }
 
 function topbar() {
-  const { viewRealm, version } = getState();
-  const dotClass = gateway.ok === null ? '' : gateway.ok ? 'ok' : 'bad';
-  const dotTitle = gateway.ok === null ? '正在检查网关状态' : gateway.ok ? `网关运行中，${gateway.ready} / ${gateway.total} 个账号可用` : '网关没有可用账号或无法连接';
+  const { viewRealm, version, realms } = getState();
+  const label = channelLabel(viewRealm);
+  // 顶栏只反映当前查看渠道所属提供方的账号；by_provider 缺失时退回整体计数。
+  const stats = (gateway.byProvider || {})[channelProvider(viewRealm)] || null;
+  const ready = stats ? Number(stats.ready) || 0 : gateway.ready;
+  const total = stats ? Number(stats.total) || 0 : gateway.total;
+  const ok = stats ? ready > 0 : gateway.ok;
+  const known = stats !== null || gateway.ok !== null;
+  const dotClass = known ? (ok ? 'ok' : 'bad') : '';
+  const dotTitle = !known ? '正在检查网关状态' : spaceMixed(ok ? `${label}运行中，${ready} / ${total} 个账号可用` : `${label}没有可用账号或网关无法连接`);
   return html`
     <div class="topbar">
-      <a class="topbar-brand" href="#/dashboard" style="text-decoration:none">
+      <a class="topbar-brand" href="#/dashboard">
         <span class="brand-mark">${icon('Bot')}</span>
-        <span>WorkBuddy 网关</span>
+        <span>NextTokenCenter</span>
         <span class="status-dot ${dotClass}" title=${dotTitle}></span>
         ${version ? html`<span class="text-2xs muted medium">v${version}</span>` : nothing}
       </a>
       <div class="topbar-tools">
         ${paletteTrigger()}
-        <div class="realm-toggle" role="radiogroup" aria-label="查看的版本">
-          <button type="button" class=${viewRealm === 'intl' ? 'active' : ''} role="radio" aria-checked=${viewRealm === 'intl' ? 'true' : 'false'}
-                  title="查看国际版 (www.workbuddy.ai) 的账号与模型" @click=${() => setViewRealm('intl')}>${icon('Globe')}国际版</button>
-          <button type="button" class=${viewRealm === 'cn' ? 'active' : ''} role="radio" aria-checked=${viewRealm === 'cn' ? 'true' : 'false'}
-                  title="查看国内版 (www.workbuddy.cn) 的账号与模型" @click=${() => setViewRealm('cn')}>${icon('House')}国内版</button>
+        <div class="realm-toggle" role="radiogroup" aria-label="查看的渠道">
+          ${realms.map((realm) => {
+            const meta = channel(realm);
+            return html`<button type="button" class=${viewRealm === realm ? 'active' : ''} role="radio" aria-checked=${viewRealm === realm ? 'true' : 'false'}
+                    title=${spaceMixed('查看' + channelTitle(realm) + '的账号与模型')} @click=${() => setViewRealm(realm)}>${icon(meta.icon)}${meta.label}</button>`;
+          })}
         </div>
       </div>
     </div>`;
@@ -62,9 +72,14 @@ function drawTopbar() {
 async function pollGateway() {
   try {
     const data = await getJSON('/panel/status');
-    gateway = { ok: !!data.accounts_ready, ready: data.accounts_ready || 0, total: data.accounts || 0 };
+    gateway = {
+      ok: !!data.accounts_ready,
+      ready: data.accounts_ready || 0,
+      total: data.accounts || 0,
+      byProvider: data.by_provider || {},
+    };
   } catch {
-    gateway = { ok: false, ready: 0, total: 0 };
+    gateway = { ok: false, ready: 0, total: 0, byProvider: {} };
   }
   drawTopbar();
 }
@@ -102,11 +117,11 @@ function openPanelOptions() {
     width: 520,
     title: '面板选项',
     icon: 'SlidersHorizontal',
-    desc: '外观、菜单栏与自动刷新只影响本浏览器的显示方式，修改后立即生效。',
+    desc: '这些选项只影响本浏览器的显示方式。',
     body: () => html`
       ${status.panel_password_is_default ? html`
         <div class="notice notice-warn">${icon('TriangleAlert')}
-          <div class="grow">面板仍在使用默认密码 admin，局域网内的其他人也能打开本页面。</div>
+          <div class="grow">默认密码 admin 尚未修改，局域网内其他人也能打开面板。</div>
           <button class="btn btn-ghost" @click=${() => { ctl.close(); navigate('settings', 'security'); }}>去修改</button>
         </div>` : nothing}
       <div class="col">
@@ -143,7 +158,7 @@ function openPanelOptions() {
       </div>
       <hr class="divider">
       <div class="row-between text-xs">
-        <span class="muted">WorkBuddy 网关 ${getState().version ? 'v' + getState().version : ''}</span>
+        <span class="muted">NextTokenCenter ${getState().version ? 'v' + getState().version : ''}</span>
         <button class="btn btn-ghost btn-sm tone-danger" @click=${logout}>${icon('LogOut')}退出登录</button>
       </div>`,
   });
@@ -158,8 +173,8 @@ async function logout() {
 async function onDockAction(id) {
   if (id === 'panel') openPanelOptions();
   if (id === 'add-account') {
-    const dialogs = await import('./pages/accounts/dialogs/add.js');
-    dialogs.openAddAccountDialog();
+    const dialogs = await import('./pages/accounts/dialogs/open.js');
+    await dialogs.openAccountDialog(getState().viewRealm);
   }
 }
 
@@ -233,7 +248,7 @@ async function boot() {
   if (key) setApiKey(key);
   subscribe((reason) => {
     if (reason === 'viewRealm') { drawTopbar(); remount(); }
-    if (reason === 'version' || reason === 'activeRealm') drawTopbar();
+    if (reason === 'version' || reason === 'activeRoute' || reason === 'realms') drawTopbar();
   });
   onUnauthorized(() => {
     if (!shellRunning) return;

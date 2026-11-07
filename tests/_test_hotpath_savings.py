@@ -285,7 +285,7 @@ class SettingsCacheTests(unittest.TestCase):
         self.path = wb_settings.settings_path(self.dir)
 
     def test_repeated_loads_parse_once(self):
-        wb_settings.save(self.dir, {"ui_language": "en"})
+        wb_settings.save(self.dir, {"messages_format": "openai-completions"})
         real_json = wb_settings.json
         spy = JsonSpy(real_json)
         wb_settings.json = spy
@@ -294,32 +294,32 @@ class SettingsCacheTests(unittest.TestCase):
             second = wb_settings.load(self.dir)
         finally:
             wb_settings.json = real_json
-        self.assertEqual(first, {"ui_language": "en"})
+        self.assertEqual(first, {"messages_format": "openai-completions"})
         self.assertEqual(second, first)
         self.assertEqual(spy.parsed, 1, "第二次 load 应命中缓存，不再解析")
 
     def test_save_invalidates_the_cache(self):
-        wb_settings.save(self.dir, {"ui_language": "en"})
+        wb_settings.save(self.dir, {"messages_format": "openai-completions"})
         real_json = wb_settings.json
         spy = JsonSpy(real_json)
         wb_settings.json = spy
         try:
             wb_settings.load(self.dir)              # 1 次解析
             wb_settings.load(self.dir)              # 命中缓存
-            wb_settings.save(self.dir, {"ui_language": "zh"})
-            self.assertEqual(wb_settings.load(self.dir)["ui_language"], "zh")
+            wb_settings.save(self.dir, {"messages_format": "openai-responses"})
+            self.assertEqual(wb_settings.load(self.dir)["messages_format"], "openai-responses")
             wb_settings.load(self.dir)              # 再次命中
         finally:
             wb_settings.json = real_json
         self.assertEqual(spy.parsed, 2, "save() 之后必须重新解析一次，且只一次")
 
     def test_external_rewrite_is_seen(self):
-        wb_settings.save(self.dir, {"ui_language": "en"})
-        self.assertEqual(wb_settings.load(self.dir)["ui_language"], "en")
+        wb_settings.save(self.dir, {"messages_format": "openai-completions"})
+        self.assertEqual(wb_settings.load(self.dir)["messages_format"], "openai-completions")
         # 模拟面板之外的进程改写（尺寸不同 -> 缓存键必变）
         with open(self.path, "w", encoding="utf-8") as fh:
-            json.dump({"ui_language": "zh-Hant", "extra": "x" * 64}, fh)
-        self.assertEqual(wb_settings.load(self.dir)["ui_language"], "zh-Hant")
+            json.dump({"messages_format": "openai-completions", "extra": "x" * 64}, fh)
+        self.assertEqual(wb_settings.load(self.dir)["messages_format"], "openai-completions")
 
     def test_write_through_even_when_mtime_is_forced_back(self):
         # 极端情况：新内容与旧文件同尺寸、mtime 又被强行改回旧值（FAT 只有 2s

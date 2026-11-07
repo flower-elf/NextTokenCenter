@@ -269,7 +269,8 @@ def aggregate_stream(raw_iter, model, resp_id):
             first_chunk_at = time.time()
         if chunk.get("id"):
             resp_id = chunk["id"]
-        if chunk.get("model"):
+        # 响应里写客户端请求的模型 id：别名合并的模型由哪个渠道承接，客户端都看到同一个 id
+        if chunk.get("model") and not model:
             model = chunk["model"]
         u = chunk.get("usage")
         if u:
@@ -1630,7 +1631,7 @@ def stream_messages_events(raw_iter, model, holder=None, tool_alias=None):
         state["started"] = True
         if isinstance(chunk, dict):
             state["id"] = _anthropic_text(chunk.get("id"))
-            state["model"] = _anthropic_text(chunk.get("model")) or state["model"]
+            state["model"] = state["model"] or _anthropic_text(chunk.get("model"))
         return anthropic_sse_frame("message_start", {
             "message": {
                 "id": _anthropic_message_id(state["id"]),

@@ -53,17 +53,17 @@ store = os.path.join(work, "accounts")
 os.makedirs(store)
 settings_path = os.path.join(store, "settings.json")
 with open(settings_path, "w", encoding="utf-8") as fh:
-    json.dump({"ui_language": "zh"}, fh)
+    json.dump({"session_affinity": True}, fh)
 
 
-def set_language(value):
-    """改实例界面语言（读改写，保留服务器自己写进去的键）。"""
+def set_session_affinity(value):
+    """改一项设置（读改写，保留服务器自己写进去的键）。"""
     try:
         with open(settings_path, encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception:
         data = {}
-    data["ui_language"] = value
+    data["session_affinity"] = value
     with open(settings_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh)
 
@@ -171,10 +171,10 @@ try:
         status, _, body = get("/", {"If-None-Match": junk})
         check("200 for %r" % junk, status == 200 and body == disk, status)
 
-    print("[7] 改界面语言：静态页面不变，ETag 继续有效")
-    set_language("en")
+    print("[7] 改设置：静态页面不变，ETag 继续有效")
+    set_session_affinity(False)
     status, headers, body = get("/", {"If-None-Match": etag})
-    check("旧 ETag -> 304（页面与语言无关）", status == 304, status)
+    check("旧 ETag -> 304（页面与设置无关）", status == 304, status)
     check("body 为空", body == b"", "%d bytes" % len(body))
     check("ETag 不变", (headers.get("ETag") or "") == etag, headers.get("ETag"))
 

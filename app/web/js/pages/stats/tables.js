@@ -2,7 +2,7 @@
 import { html, nothing } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { fmtNumber, fmtPercent, fmtLatency, fmtDateTime } from '../../core/format.js';
-import { realmBadge, emptyState } from '../../ui/widgets.js';
+import { channelBadge, emptyState } from '../../ui/widgets.js';
 import { rangeLabel, matrixOptions, buildMatrix } from './logic.js';
 
 /** 输入 / 输出 / 思考三段 Token 的一行小字。 */
@@ -28,6 +28,14 @@ function ttftCell(stat) {
     ${stat.ttftP99 != null ? html`<div class="muted text-2xs">P99 ${fmtLatency(stat.ttftP99)}</div>` : nothing}`;
 }
 
+/** 积分列：上游没有返回扣费时明确写未采集，不把缺失画成 0。 */
+function creditCell(credit) {
+  if (credit === null || credit === undefined) {
+    return html`<span class="muted" title="上游没有返回单次扣费">未采集</span>`;
+  }
+  return Number(credit).toFixed(2);
+}
+
 export function accountTable(rows, range) {
   return html`
     <div class="card card-flush">
@@ -43,7 +51,7 @@ export function accountTable(rows, range) {
               <thead>
                 <tr>
                   <th>账号</th>
-                  <th>所属区域</th>
+                  <th>渠道</th>
                   <th class="right">剩余积分</th>
                   <th class="right">请求次数</th>
                   <th class="right">消耗 Token</th>
@@ -58,18 +66,18 @@ export function accountTable(rows, range) {
                       <div class="medium truncate">${row.nickname}</div>
                       <div class="cell-mono">${row.uid.slice(0, 10)}</div>
                     </td>
-                    <td>${row.realm ? realmBadge(row.realm) : nothing}</td>
+                    <td>${row.realm ? channelBadge(row.realm) : nothing}</td>
                     <td class="right nums">${row.credits && row.credits.remain != null
                       ? html`<b>${fmtNumber(row.credits.remain)}</b>${row.credits.size ? html`<span class="muted text-2xs"> / ${fmtNumber(row.credits.size)}</span>` : nothing}`
                       : html`<span class="muted">—</span>`}</td>
                     <td class="right nums">${fmtNumber(row.requests)}</td>
                     <td class="right nums"><b>${fmtNumber(row.totalTokens)}</b></td>
-                    <td class="right nums">${Number(row.credit).toFixed(2)}</td>
+                    <td class="right nums">${creditCell(row.credit)}</td>
                     <td>
                       ${row.models.length === 0
                         ? html`<span class="muted text-2xs">无调用</span>`
                         : html`<div class="model-pills">${row.models.map((m) => html`
-                            <span class="model-pill"><span class="cell-mono">${m.id}</span> ${fmtNumber(m.requests)} 次 · ${fmtNumber(m.tokens)} token</span>`)}</div>`}
+                            <span class="badge badge-sm"><span class="cell-mono">${m.id}</span> ${fmtNumber(m.requests)} 次 · ${fmtNumber(m.tokens)} token</span>`)}</div>`}
                     </td>
                   </tr>`)}
               </tbody>
@@ -83,7 +91,7 @@ export function keyTable(rows, idle, range) {
     <div class="card card-flush">
       <div class="card-head">
         <h2 class="card-title">${icon('KeyRound')}按密钥</h2>
-        <span class="card-sub">每把密钥在当前范围内的调用与消耗，密钥名取自密钥列表</span>
+        <span class="card-sub">每把密钥在当前范围的调用与消耗。</span>
       </div>
       ${rows.length === 0
         ? html`<div class="empty text-xs muted">${rangeLabel(range)}没有密钥调用数据</div>`
@@ -109,7 +117,7 @@ export function keyTable(rows, idle, range) {
                     <td class="right nums">${fmtNumber(row.requests)}</td>
                     <td class="right nums">${row.errors ? html`<span class="tone-danger">${fmtNumber(row.errors)}</span>` : html`<span class="muted">0</span>`}</td>
                     <td class="right nums"><b>${fmtNumber(row.totalTokens)}</b></td>
-                    <td class="right nums">${Number(row.credit).toFixed(2)}</td>
+                    <td class="right nums">${creditCell(row.credit)}</td>
                     <td class="right nums">${row.cacheHitPct == null ? '—' : fmtPercent(row.cacheHitPct)}</td>
                     <td class="right nums">${row.ttftAvg ? fmtLatency(row.ttftAvg) : '—'}</td>
                     <td class="share-cell">
@@ -121,7 +129,7 @@ export function keyTable(rows, idle, range) {
             </table>
           </div>`}
       ${idle.length
-        ? html`<div class="card-sub" style="padding:10px 16px 14px">另有 ${idle.length} 把密钥在这个范围没有调用：${idle.slice(0, 6).join('、')}${idle.length > 6 ? ' 等' : ''}。</div>`
+        ? html`<div class="card-foot">另有 ${idle.length} 把密钥在这个范围没有调用：${idle.slice(0, 6).join('、')}${idle.length > 6 ? ' 等' : ''}。</div>`
         : nothing}
     </div>`;
 }
@@ -174,7 +182,7 @@ export function matrixTable({ usage, perf, filters, range, setFilter }) {
           <thead>
             <tr>
               <th>模型名称</th>
-              <th class="center">区域</th>
+              <th class="center">渠道</th>
               <th>账号</th>
               <th class="right">请求数</th>
               <th class="right">失败</th>
@@ -208,7 +216,7 @@ export function matrixTable({ usage, perf, filters, range, setFilter }) {
                   <div class="cell-mono">${row.id}</div>
                   ${row.split && row.first ? html`<div class="text-2xs muted nowrap">共 ${row.splitAccounts} 个账号参与此模型处理</div>` : nothing}
                 </td>
-                <td class="center">${row.realm ? realmBadge(row.realm) : html`<span class="muted">—</span>`}</td>
+                <td class="center">${row.realm ? channelBadge(row.realm) : html`<span class="muted">—</span>`}</td>
                 <td>${matrixCell(row, usage)}</td>
                 <td class="right nums">${fmtNumber(row.requests)}</td>
                 <td class="right nums">${row.errors ? html`<span class="tone-danger">${fmtNumber(row.errors)}</span>` : html`<span class="muted">0</span>`}</td>
@@ -226,10 +234,10 @@ export function matrixTable({ usage, perf, filters, range, setFilter }) {
           </tbody>
         </table>
       </div>
-      <div class="card-sub" style="padding:10px 16px 14px">
-        首字延迟与生成速度取自最后一次性能采样，范围比采样更宽时这三列只覆盖较新的请求。
+      <div class="card-foot">
+        首字延迟与生成速度取自最后一次性能采样。
         ${perf && perf.sample_capped && perf.sample_from
-          ? html`当前统计的是自 ${fmtDateTime(perf.sample_from)} 之后的部分请求。`
+          ? html`这三列仅覆盖自 ${fmtDateTime(perf.sample_from)} 之后的请求。`
           : nothing}
       </div>
     </div>`;

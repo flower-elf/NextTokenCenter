@@ -6,22 +6,24 @@ import { busyClick } from '../../../ui/widgets.js';
 import { toast, toastError } from '../../../ui/toast.js';
 import * as acct from '../actions.js';
 
+const DEFAULT_MAX_NOTE = 200;
+
 export function openNoteDialog(account, { onDone, limits } = {}) {
-  const maxNote = Number(limits && limits.noteMax) || 100;
+  const maxNote = Number(limits && limits.noteMax) || DEFAULT_MAX_NOTE;
   let value = String(account.note || '');
   let busy = false;
   const name = account.nickname || String(account.uid || '').slice(0, 8);
 
   const ctl = openDialog({
     title: '账号备注',
-    desc: '给「' + name + '」写一句只有你看得懂的备注，例如「张叔叔」「备用号」。留空保存即清除。',
+    desc: '给「' + name + '」写一句备注，留空保存即清除。',
     width: 400,
     body: () => html`
       <label class="field">
         <span class="field-label">备注内容</span>
         <input class="input" autofocus maxlength=${maxNote} placeholder="例如：张叔叔" .value=${value}
                @input=${(e) => { value = e.target.value; }}>
-        <span class="field-hint">最长 ${maxNote} 字，只保存在本机，不会写进上游。</span>
+        <span class="field-hint">最长 ${maxNote} 字，只保存在本机。</span>
       </label>`,
     foot: () => html`
       <button class="btn btn-ghost" @click=${() => ctl.close()}>取消</button>

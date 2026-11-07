@@ -6,8 +6,8 @@
 
 ## 1. 核心设计原则
 
-1. **纯标准库实现 (Zero Dependencies)**：
-   网关作为绿色免安装工具，不能为了读写 YAML/TOML 而引入 `pyyaml`、`tomli`、`tomlkit` 等三方轮子。所有配置解析与写入完全使用 Python 标准库（`os`, `re`, `json`, `shutil`, `hashlib`, `time`）。
+1. **配置模块不新增依赖 (No Added Dependencies)**：
+   网关的第三方依赖由仓库根的 `requirements.txt` 固定（`cryptography`、`brotli`、`zstandard`）。配置模块不引入 `pyyaml`、`tomli`、`tomlkit` 等第三方库，所有配置解析与写入使用 Python 标准库（`os`, `re`, `json`, `shutil`, `hashlib`, `time`）。
 2. **非破坏性文本级编辑 (Non-destructive Text-level Editing)**：
    用户的配置文件中往往包含个人手写的注释、特殊格式缩进、以及其他第三方 provider 的设置。标准库 `json` 只能安全操作 JSON，而对于 YAML、TOML 与 `.env`，模块采用自主实现的文本级更新器（Upserter）：仅在必要路径进行局部插入与替换，**绝不重排或抹除用户未修改的行**。
 3. **零风险备份与事务回滚 (Safe Backup & Rollback)**：
@@ -294,7 +294,7 @@ python wb_agents.py restore  --client CLIENT [--home DIR] [--state-dir DIR] [--j
 | 维度 | 看板一键配置（服务端） | CLI（客户端） |
 |---|---|---|
 | 运行位置 | 网关进程所在机器 | 客户端所在机器 |
-| 可用条件 | 回环访问 + 非容器 / OpenWrt | 无限制（能 HTTP 到网关即可） |
+| 可用条件 | 回环访问 + 非容器 | 无限制（能 HTTP 到网关即可） |
 | 状态与备份 | `<ACCOUNTS_DIR>/integration-state.json`、`agent-backups/` | `~/.wb-agent-config/`（`--state-dir` 可覆盖），每台机器一份 |
 | 写入与还原逻辑 | `integrate()` / `restore()` / `overview()` / `plan()`（完全共用） | 同左 |
 

@@ -1,11 +1,8 @@
-"""一键切换所有出站身份：面板工具栏那个按钮背后的那条路由。
+"""出站身份切换走统一的 /accounts/set {identity}：单个账号、校验、落盘。
 
     python tests/_test_product_switch.py
 
-按钮提交时不带 uid、也不带 realm，全量切换靠的就是服务端这条分支。它的语义没有别
-处钉着，而错了的表现很安静：只切了一个账号、或者一个都没切，面板都提示成功。
-
-Run with: python tests/_test_product_switch.py
+旧的全量 /accounts/product 路由按契约删除，按钮只按行切换身份。
 """
 import os
 import sys
@@ -21,6 +18,7 @@ _TMP = isolated_data_dirs("wb-product-switch-")
 
 import wb_accounts as A  # noqa: E402
 import wb_identity  # noqa: E402
+import wb_panel_routes  # noqa: E402
 import wb_proxy as proxy  # noqa: E402
 
 UIDS = ("intl-aaa-1", "intl-bbb-2", "cn-ccc-3")
@@ -29,7 +27,9 @@ UIDS = ("intl-aaa-1", "intl-bbb-2", "cn-ccc-3")
 class FakeRequest(object):
     """够被测路由使用的最小 Handler 替身。"""
 
-    _route_accounts_product = proxy.Handler._route_accounts_product
+    _route_accounts_set = wb_panel_routes.PanelRoutes._route_accounts_set
+    _provider_error = wb_panel_routes.PanelRoutes._provider_error
+    _error_from_provider = wb_panel_routes.PanelRoutes._error_from_provider
 
     def __init__(self, payload):
         self.payload = payload
@@ -44,7 +44,7 @@ class FakeRequest(object):
         return status, payload
 
     def call(self):
-        return self._route_accounts_product(self.payload)
+        return self._route_accounts_set(self.payload)
 
     def answered(self):
         return self.answering[-1]
@@ -69,8 +69,6 @@ class ProductSwitchTests(unittest.TestCase):
             }))
         proxy.ACCOUNTS_DIR = self.dir
         proxy.POOL = self.pool
-        # 这条路由记录每次切换，这正是日志的用途，但 8 个用例的日志会淹没
-        # 套件自己的输出。
         real_log = proxy.log
         proxy.log = lambda *a, **k: None
         self.addCleanup(setattr, proxy, "log", real_log)
@@ -83,56 +81,36 @@ class ProductSwitchTests(unittest.TestCase):
         pool.load()
         return dict((a.uid, a.product) for a in pool.accounts)
 
-    def test_no_uid_switches_every_account(self):
-        """工具栏按钮走的就是这条：不带 uid、不带 realm。"""
-        status, payload = FakeRequest({"product": "cli"}).call()
+    def test_a_single_uid_switches_one_account(self):
+        status, payload = FakeRequest({"uid": "intl-bbb-2",
+                                       "identity": "cli"}).call()
         self.assertEqual(status, 200)
-        self.assertEqual(payload["product"], "cli")
-        self.assertEqual(payload["changed"],
-                         [uid[:8] for uid in UIDS])
-        self.assertEqual(set(self.products().values()), {"cli"})
-
-    def test_realm_narrows_the_batch(self):
-        status, payload = FakeRequest({"product": "vscode", "realm": "intl"}).call()
-        self.assertEqual(status, 200)
-        self.assertEqual(sorted(payload["changed"]), ["intl-aaa", "intl-bbb"])
-        self.assertEqual(self.products()["cn-ccc-3"], "workbuddy")
-
-    def test_realm_all_means_everyone(self):
-        status, payload = FakeRequest({"product": "vscode", "realm": "all"}).call()
-        self.assertEqual(status, 200)
-        self.assertEqual(len(payload["changed"]), 3)
-        self.assertEqual(set(self.products().values()), {"vscode"})
-
-    def test_a_single_uid_still_switches_one_account(self):
-        """行内那三个按钮（WB / VSC / CLI）不能被批量分支抢走。"""
-        status, _payload = FakeRequest({"product": "cli", "uid": "intl-bbb-2"}).call()
-        self.assertEqual(status, 200)
+        self.assertEqual(payload["account"]["identity"], "cli")
         self.assertEqual(self.products()["intl-bbb-2"], "cli")
         self.assertEqual(self.products()["intl-aaa-1"], "workbuddy")
         self.assertEqual(self.products()["cn-ccc-3"], "workbuddy")
 
     def test_an_unknown_product_is_rejected(self):
-        status, _payload = FakeRequest({"product": "vsc"}).call()
+        status, _payload = FakeRequest({"uid": "intl-bbb-2",
+                                        "identity": "vsc"}).call()
         self.assertEqual(status, 400)
         self.assertEqual(set(self.products().values()), {"workbuddy"})
 
     def test_the_switch_survives_a_restart(self):
-        """set_product() 只改内存；这条路由必须当场落盘。"""
-        FakeRequest({"product": "cli"}).call()
-        self.assertEqual(set(self.reload().values()), {"cli"})
-
-    def test_switching_to_the_same_product_reports_no_change(self):
-        FakeRequest({"product": "cli"}).call()
-        status, payload = FakeRequest({"product": "cli"}).call()
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["changed"], [])
+        """set_product() 只改内存；路由必须当场落盘。"""
+        FakeRequest({"uid": "intl-aaa-1", "identity": "cli"}).call()
+        self.assertEqual(self.reload()["intl-aaa-1"], "cli")
 
     def test_every_valid_product_is_accepted(self):
         for product in wb_identity.VALID_PRODUCTS:
-            status, payload = FakeRequest({"product": product}).call()
+            status, payload = FakeRequest({"uid": "intl-bbb-2",
+                                           "identity": product}).call()
             self.assertEqual(status, 200, product)
-            self.assertEqual(payload["product"], product)
+            self.assertEqual(payload["account"]["identity"], product)
+
+    def test_an_unknown_uid_is_a_404(self):
+        status, _payload = FakeRequest({"uid": "nobody", "identity": "cli"}).call()
+        self.assertEqual(status, 404)
 
 
 if __name__ == "__main__":

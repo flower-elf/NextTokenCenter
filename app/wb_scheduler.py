@@ -69,6 +69,13 @@ class Scheduler:
         except Exception:
             pass
 
+    def _jitter(self):
+        """账号之间的随机间隔，两个提供方共用；下限固定，上限来自设置页。"""
+        directory = getattr(self.pool, "dir", "") if self.pool else ""
+        upper = (wb_settings.task_jitter_max(directory) if directory
+                 else wb_settings.TASK_JITTER_DEFAULT)
+        time.sleep(random.uniform(wb_settings.TASK_JITTER_MIN, upper))
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -167,13 +174,15 @@ class Scheduler:
     def _run_cycle_inner(self, trigger_reason="周期巡检", force=False):
         self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S", wb_tasks.cst_now())
         proxy = wb_host.loaded_gateway("stand_down_active")
-        if getattr(proxy, "stand_down_active", lambda: False)():
-            self.log("账号被上游限制，网关已停止：跳过本次巡检")
-            return
+        # 停止开关只属于 WorkBuddy：它由 WorkBuddy 上游的 403 触发，也只拦 WorkBuddy
+        # 的任务；CodeArts 的签到与保活照常按时段执行。
+        workbuddy_down = bool(getattr(proxy, "stand_down_active", lambda: False)())
+        if workbuddy_down:
+            self.log("WorkBuddy 账号被上游限制，跳过本提供方的任务")
+        directory = getattr(self.pool, "dir", "") if self.pool else ""
+        tasks_auto = (wb_settings.workbuddy_tasks_auto(directory) if directory
+                      else True)
         self.log(f"开始执行任务 ({trigger_reason})...")
-        if not self.pool or not self.pool.accounts:
-            self.log("暂无可用的活跃账号，跳过本次巡检")
-            return
 
         refreshed_count = 0
         checkin_count = 0
@@ -188,20 +197,28 @@ class Scheduler:
         run_keepalive = force or cycle_hour in self.keepalive_hours
         run_cat = force or cycle_hour in self.cat_hours
 
+        if not self.pool or not self.pool.accounts:
+            ca_checkin = self._run_codearts_checkin(run_checkin)
+            ca_keepalive = self._run_codearts_keepalive(run_keepalive)
+            if ca_checkin or ca_keepalive:
+                self.log(f"巡检完成：CodeArts 签到 {ca_checkin} 个，"
+                         f"CodeArts 保活 {ca_keepalive} 个")
+            else:
+                self.log("暂无可用的活跃账号，跳过本次巡检")
+            return
+
         processed = 0
-        for idx, acc in enumerate(list(self.pool.accounts)):
-            # 停用的账号一个请求都不发：签到、保活、活跃上报都算请求。
-            if not acc.enabled:
+        workbuddy_accounts = [] if workbuddy_down else list(self.pool.accounts)
+        for idx, acc in enumerate(workbuddy_accounts):
+            # 不参与任务的账号一个请求都不发：签到、保活、活跃上报都算请求。
+            if not getattr(acc, "tasks_enabled", True):
                 continue
             if processed:
-                # 账号间随机错峰防并发风控；下限固定 2 秒，上限由设置页决定。
-                directory = getattr(self.pool, "dir", "")
-                upper = (wb_settings.task_jitter_max(directory) if directory
-                         else wb_settings.TASK_JITTER_DEFAULT)
-                time.sleep(random.uniform(wb_settings.TASK_JITTER_MIN, upper))
+                # 账号间随机错峰防并发风控；两个提供方用同一套抖动设置。
+                self._jitter()
             processed += 1
             uid8 = acc.uid[:8] if acc.uid else "?"
-            if run_keepalive:
+            if run_keepalive and acc.enabled:
                 exp = acc.expires_at or 0
                 if exp and (exp - time.time()) < 7200:
                     self.log(f"账号 [{uid8}] Token 即将到期，执行主动保活刷新")
@@ -211,7 +228,7 @@ class Scheduler:
                     else:
                         self.log(f"! 账号 [{uid8}] Token 保活刷新失败: {acc.last_error}")
 
-            if acc.realm == "cn":
+            if acc.realm == "cn" and tasks_auto:
                 if run_checkin:
                     if acc.can_checkin():
                         self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到")
@@ -255,7 +272,7 @@ class Scheduler:
                         self.log(f"🌙 {line}")
                     time.sleep(1.0)
 
-            if acc.realm == "intl" and run_checkin:
+            if acc.realm == "intl" and run_checkin and tasks_auto:
                 if acc.can_daily_chat():
                     self.log(f"检测到国际版账号 [{uid8}] 今日尚未活跃，执行每日活跃打卡对话")
                     res = acc.daily_chat(trigger="scheduler")
@@ -268,7 +285,84 @@ class Scheduler:
                         self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")
                     time.sleep(1.5)
 
-        self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
+        codearts_checkin_count = self._run_codearts_checkin(run_checkin)
+        codearts_keepalive_count = self._run_codearts_keepalive(run_keepalive)
+        self.log(f"巡检完成：WorkBuddy 保活 {refreshed_count} 个，国内签到 {checkin_count} 个，"
+                 f"CodeArts 签到 {codearts_checkin_count} 个，"
+                 f"CodeArts 保活 {codearts_keepalive_count} 个，"
+                 f"活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，"
+                 f"国际活跃 {daily_chat_count} 个")
+
+    def _run_codearts_keepalive(self, run_keepalive):
+        if not run_keepalive:
+            return 0
+        directory = getattr(self.pool, "dir", "") or ""
+        if not directory:
+            return 0
+        try:
+            import wb_codearts
+            cfg = wb_codearts.load_config(directory)
+        except Exception as exc:
+            self.log(f"CodeArts 自动保活读取配置失败: {exc}")
+            return 0
+        try:
+            res = wb_codearts.keepalive(cfg, gap_sleep=self._jitter)
+        except Exception as exc:
+            self.log(f"CodeArts 自动保活失败: {exc}")
+            return 0
+        refreshed = int(res.get("refreshed") or 0)
+        if refreshed:
+            self.log(f"✓ CodeArts 自动保活续期 {refreshed} 个账号")
+        return refreshed
+
+    def _run_codearts_checkin(self, run_checkin):
+        if not run_checkin:
+            return 0
+        directory = getattr(self.pool, "dir", "") or ""
+        if not directory:
+            return 0
+        try:
+            import wb_codearts
+            cfg = wb_codearts.load_config(directory)
+        except Exception as exc:
+            self.log(f"CodeArts 自动签到读取配置失败: {exc}")
+            return 0
+        # 「定时任务」开关就是 CodeArts 的 credits_auto_claim；关闭后不再自动签到。
+        if not cfg.get("credits_auto_claim", False):
+            return 0
+        try:
+            pool = wb_codearts.pool_for(directory)
+        except Exception as exc:
+            self.log(f"CodeArts 自动签到读取账号失败: {exc}")
+            return 0
+        checked = 0
+        processed = 0
+        now = time.time()
+        for acct in list(pool.accounts):
+            uid8 = (acct.uid or "?")[:8]
+            if acct.disabled or not getattr(acct, "tasks_enabled", True):
+                continue
+            if acct.cool_until > now:
+                self.log(f"跳过 CodeArts 账号 [{uid8}]：冷却中")
+                continue
+            if acct.checked_in_today(now):
+                continue
+            if processed:
+                self._jitter()
+            processed += 1
+            try:
+                res = wb_codearts.checkin(cfg, acct.uid)
+            except Exception as exc:
+                self.log(f"! CodeArts 账号 [{uid8}] 自动签到失败: {exc}")
+                continue
+            if res.get("ok"):
+                checked += 1
+                self.log(f"✓ CodeArts 账号 [{uid8}] 自动签到成功: "
+                         f"{res.get('message') or ''}")
+            else:
+                self.log(f"! CodeArts 账号 [{uid8}] 自动签到未成功: "
+                         f"{res.get('message') or ''}")
+        return checked
 
     def status(self):
         def label(hours):
@@ -283,6 +377,8 @@ class Scheduler:
                           label(self.keepalive_hours), label(self.cat_hours)),
             "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 %s 集中巡检)"
                          % label(self.keepalive_hours),
+            "mode_codearts": "整点排程 (CodeArts 签到 %s · 保活 %s)"
+                             % (label(self.checkin_hours), label(self.keepalive_hours)),
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "logs": self.logs[-20:],

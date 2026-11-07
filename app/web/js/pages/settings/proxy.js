@@ -129,7 +129,7 @@ export function createProxyTab(page) {
     slots = importCandidates(slots, discover, [...picked]);
     const added = slots.length - before;
     if (!added) {
-      toast.warn('勾选的出口都已经在列表里');
+      toast.warn('勾选的代理都已经在列表里');
       return;
     }
     structChanged();
@@ -148,7 +148,7 @@ export function createProxyTab(page) {
       const accounts = data.accounts || [];
       const unbound = unboundEnabledAccounts(accounts);
       if (!unbound.length) {
-        toast.info('所有已启用账号都已绑定代理出口');
+        toast.info('所有已启用账号都已绑定代理槽');
         return;
       }
       const plan = autoAssignPlan(accounts, slots);
@@ -159,15 +159,15 @@ export function createProxyTab(page) {
       busy = '';
       page.draw();
       await confirmDialog({
-        title: '自动分配代理出口？',
-        desc: `将为 ${plan.length} 个还没有绑定出口的启用账号分配代理槽，已经绑定过的账号保持不变。`,
+        title: '自动分配代理槽？',
+        desc: `将为 ${plan.length} 个未绑定代理槽的启用账号分配槽位，已有绑定保持不变。`,
         confirmText: '开始分配',
         onConfirm: async () => {
           for (const item of plan) {
             await postJSON('/accounts/set', { uid: item.uid, proxySlot: item.slotId });
           }
           await loadSlots();
-          toast.success(`已为 ${plan.length} 个账号分配代理出口`);
+          toast.success(`已为 ${plan.length} 个账号分配代理槽`);
         },
       });
     } catch (err) {
@@ -237,7 +237,7 @@ export function createProxyTab(page) {
             <div>
               <h2 class="card-title">${icon('Network')}代理槽</h2>
               <div class="card-sub">
-                每个账号固定绑定一个代理槽：槽位地址变化时绑定账号自动跟随；槽位停用后绑定账号回退直连，重新启用即恢复；槽位删除会解除绑定并回退直连。
+                每个账号固定绑定一个代理槽，槽位停用或删除后回退直连。
                 <span class="text-2xs ${isDirty() ? 'tone-warning' : 'muted'}">${isDirty() ? '(代理槽有未保存的改动)' : (fetched ? `共 ${slots.length} 个槽位` : '(正在读取代理槽)')}</span>
               </div>
             </div>
@@ -263,22 +263,22 @@ export function createProxyTab(page) {
                 <tbody>${slots.map((slot, index) => slotRow(slot, index))}</tbody>
               </table>
             </div>` : html`
-            <p class="text-xs muted">还没有代理槽。点「自动发现 mihomo 端口」或「添加槽位」创建。</p>`}
+            <p class="text-xs muted">还没有代理槽，点「自动发现 mihomo 端口」或「添加槽位」创建。</p>`}
           ${discover.length ? html`
             <div class="discover-box">
-              <div class="text-xs muted">勾选要导入为槽位的出口。不可达的地址已禁用。</div>
+              <div class="text-xs muted">勾选要导入为槽位的代理，不可达的地址已禁用。</div>
               ${discover.map((candidate) => html`
                 <label class="row text-xs">
                   <input type="checkbox" .checked=${picked.has(candidate.url)} ?disabled=${!candidate.reachable}
                          @change=${(e) => { if (e.target.checked) picked.add(candidate.url); else picked.delete(candidate.url); }}>
                   <code class="mono">${candidate.url}</code>
                   <span class="${candidate.reachable ? 'tone-success' : 'tone-danger'}">
-                    ${candidate.reachable ? `出口 ${candidate.exit_ip} · ${candidate.latency_ms}ms` : '不可达'}
+                    ${candidate.reachable ? `出口 IP ${candidate.exit_ip} · ${candidate.latency_ms}ms` : '不可达'}
                   </span>
                 </label>`)}
-              <button class="btn btn-outline btn-sm" @click=${importPicked}>${icon('Download')}导入勾选的出口</button>
+              <button class="btn btn-outline btn-sm" @click=${importPicked}>${icon('Download')}导入勾选的代理</button>
             </div>` : nothing}
-          <p class="text-2xs muted">「绑定账号」只统计启用中的账号；在账号页的出口下拉里调整绑定。测试会真实经过代理访问一次外网。</p>
+          <p class="text-2xs muted">「绑定账号」只统计启用中的账号，测试会真实经过代理访问外网。</p>
         </div>`;
     },
     onMount() {

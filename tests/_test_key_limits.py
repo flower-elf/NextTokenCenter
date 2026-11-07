@@ -157,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix="wb-keylimits-") as directory:
     with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory,
                                                     POOL=None, SCHEDULER=None):
         S.set_api_keys(directory, [{"id": "k1", "name": "限额", "key": "key-one",
-                                    "realm": "cn", "models": ["deepseek/*"],
+                                    "route": ["cn"], "models": ["deepseek/*"],
                                     "quota_tokens": 500, "expires_at": 1790000000}])
 
         def save(payload):
@@ -192,12 +192,14 @@ with tempfile.TemporaryDirectory(prefix="wb-keylimits-") as directory:
               (cleared["expires_at"], cleared["quota_tokens"], cleared["quota_credit"],
                cleared["ip_allowlist"]) == (0, 0, 0.0, []), cleared)
         check("省略的 models 保留原值", cleared["models"] == ["deepseek/*"], cleared)
-        check("省略的 realm 保留原值", cleared["realm"] == "cn", cleared)
-        cleared_exit = save({"api_keys": [{"id": "k1", "key": "", "realm": ""}]})
-        check("显式空串清掉出口", cleared_exit.status == 200
-              and S.api_keys(directory)[0]["realm"] == "", S.api_keys(directory)[0])
-        # 恢复出口，后面的检查还要用
-        save({"api_keys": [{"id": "k1", "key": "", "realm": "cn"}]})
+        check("省略的 route 保留原值", cleared["route"] == ["cn"], cleared)
+        cleared_exit = save({"api_keys": [{"id": "k1", "key": "", "route": []}]})
+        check("显式空列表清掉路由", cleared_exit.status == 200
+              and S.api_keys(directory)[0]["route"] == [], S.api_keys(directory)[0])
+        conflict = save({"api_keys": [{"id": "k1", "key": "", "route": ["intl", "cn"]}]})
+        check("同一提供方的两个渠道返回 400", conflict.status == 400, conflict.body)
+        # 恢复路由，后面的检查还要用
+        save({"api_keys": [{"id": "k1", "key": "", "route": ["cn"]}]})
 
         again = save({"api_keys": [{"id": "k1", "key": "", "expires_at": 1890000000,
                                     "quota_tokens": 42, "ip_allowlist": ["10.0.0.0/24"]}]})

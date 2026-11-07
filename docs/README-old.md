@@ -2,14 +2,14 @@
 
 <p align="center">
   <a href="https://github.com/flower-elf/workbuddy2api-center/releases"><img src="https://img.shields.io/github/v/release/flower-elf/workbuddy2api-center?style=flat-square&color=2496ED&label=Release" alt="Release"></a>
-  <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.12+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/Vibe_Coding-100%25-ff69b4?style=flat-square" alt="Vibe Coding">
 </p>
 
-本项目把腾讯的两个服务封装成 OpenAI 兼容接口：国际版 **[www.workbuddy.ai](https://www.workbuddy.ai)** 和国内版 **[codebuddy.cn](https://www.codebuddy.cn)**。Codex、Claude Code 等客户端指向同一个地址，就可以使用这两个服务。账号池、出口、密钥和配额都在 Web 看板上管理。程序只使用 Python 标准库。
+本项目把腾讯的两个服务封装成 OpenAI 兼容接口：国际版 **[www.workbuddy.ai](https://www.workbuddy.ai)** 和国内版 **[codebuddy.cn](https://www.codebuddy.cn)**。Codex、Claude Code 等客户端指向同一个地址，就可以使用这两个服务。账号池、出口、密钥和配额都在 Web 看板上管理。程序依赖 Python 标准库和 `cryptography`、`brotli`、`zstandard` 三个第三方包，版本固定在 `requirements.txt`。
 
 > 本项目由 **吃白饭的蓝色大肥鱼（Deepseek-V4.1-Flash）** 配合开发。人类开发者提供架构和需求，大肥鱼完成界面编写和后端改进。
 
@@ -29,7 +29,7 @@
 - **活动与自动化**：国内版 Buddy 加油站签到、成长任务与连登活跃、猫猫旅行，国际版今日活跃打卡；后台调度器按固定时刻巡检。账号被上游限制时，网关立即停止全部账号并向客户端返回 503。
 - **剩余用量与限额护栏**：账号级保留积分、每日 Token、每日积分、按模型 Token 四条护栏，另有剩余用量估算。
 - **本地网络工具**：网关可代替客户端执行声明的 `web_search` 和 `web_fetch` 工具。
-- **零依赖**：只需要 Python 3.9 或更新版本。项目提供 Windows、macOS、Linux 启动脚本和 Docker 镜像。
+- **轻量依赖**：需要 Python 3.12 或更新版本，第三方依赖由 `requirements.txt` 固定。项目提供 Windows、macOS、Linux 启动脚本和 Docker 镜像。
 
 ## 目录
 
@@ -48,7 +48,7 @@
 
 ### 本机运行
 
-本机运行需要 Python 3.9 或更新版本，不需要用 `pip install` 安装任何依赖。
+本机运行需要 Python 3.12 或更新版本，先执行 `python -m pip install -r requirements.txt` 安装依赖。
 
 | 系统 | 启动方式 |
 |---|---|
@@ -56,7 +56,7 @@
 | macOS | 双击 `start-wb-proxy.command`；首次启动遭到 Gatekeeper 拦截时，右键选择“打开” |
 | Linux 与 macOS 终端 | 执行 `./start-wb-proxy.sh`，可以在后面加端口号，例如 `./start-wb-proxy.sh 9000` |
 
-如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`。绿色包只为 Windows 附带精简 Python 运行时，Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 使用系统 Python，解压后同样用 `.command` 或 `.sh` 脚本启动。
+如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`。绿色包只为 Windows 附带精简 Python 运行时，运行时里已带 `cryptography`、`brotli`、`zstandard`，Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 使用系统 Python，先按上一节的命令安装依赖，解压后同样用 `.command` 或 `.sh` 脚本启动。
 
 macOS 和 Linux 的脚本按顺序查找三个位置：包内的 `python/bin/python3`、`/usr/bin/python3` 和 Homebrew 的 python3。macOS 上没有 Python 时，执行 `xcode-select --install` 或 `brew install python`。
 
@@ -137,7 +137,7 @@ python tests/run_all.py realm      # 只运行名字里含 realm 的套件
 
 测试共有 156 个套件：142 个 Python 套件 + 14 个 JavaScript 套件。看板的 JavaScript 套件位于 `tests/javascript`。JavaScript 套件需要 Node.js 22 或更新版本，没有安装 Node.js 时会跳过并给出提示。
 
-GitHub Actions 在三个环境里运行同一条命令：Ubuntu 的 Python 3.9 和 3.12，以及 Windows 的 Python 3.12。`tests/manual/_mobile_check.py` 是需要手动运行的 Playwright 布局检查器，不属于测试套件。
+GitHub Actions 在 Ubuntu 和 Windows 两个环境里运行同一条命令，Python 版本都是 3.12。`tests/manual/_mobile_check.py` 是需要手动运行的 Playwright 布局检查器，不属于测试套件。
 
 ---
 

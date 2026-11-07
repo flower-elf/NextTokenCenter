@@ -12,7 +12,7 @@
 文件不可能混进发布包。
 
     python release/release_tools.py portable --version 0.2.0 --tag v0.2.0 \
-        --out dist/wb-proxy-center-v0.2.0.zip
+        --out dist/next-token-center-v0.2.0.zip
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ SCHEMA = 1
 
 # 所有打包文件的根目录，与启动脚本的布局一致：解压得到单一目录，不会散落
 # 一堆文件；#29 的自更新也有单一前缀可剥离（写在 manifest 里）。
-PACKAGE_ROOT = "wb-proxy-center"
+PACKAGE_ROOT = "next-token-center"
 
 # 自更新永远不能碰的路径。它们随包内 manifest 一起发布，#29 直接按契约断言，
 # 不需要第二份硬编码。
@@ -148,12 +148,15 @@ def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
         # files 之下的一切都在这个目录里，自更新剥前缀即可，无需猜压缩包形状。
         "root": root,
         "files": files,
-        # 运行时整体算一个受管子树，不占几百行清单。
+        # 运行时整体算一个受管子树，不占几百行清单。packages 是 site-packages
+        # 里随包携带的固定 wheel，运行时子树一并替换。
         "runtime": {
             "prefix": "python/",
             "python": portable_runtime.RUNTIME_VERSION,
             "source": portable_runtime.RUNTIME_URL,
             "files": runtime_files,
+            "packages": {name: version for name, version, *_ in
+                         portable_runtime.BUNDLED_WHEELS},
         },
         "protected": PROTECTED,
     }
@@ -203,7 +206,7 @@ def download_block(zip_name):
         "- `%s`" % zip_name,
         "  - 绿色包（内置 Windows Python 运行时 + 看板 + 启动脚本）",
         "  - 解压后运行 start-wb-proxy.bat",
-        "  - macOS / Linux 使用系统 Python 3.9+ 运行对应启动脚本",
+        "  - macOS / Linux 使用系统 Python 3.12+ 运行对应启动脚本",
         "",
         "- `checksums.txt`",
         "  - Release 资产的 SHA-256 校验值",
@@ -227,7 +230,7 @@ def compose_body(existing, block):
 
 def asset_names(version):
     """便携构建为一个发布产出的唯一资产名。"""
-    return "wb-proxy-center-v%s.zip" % version
+    return "next-token-center-v%s.zip" % version
 
 
 def _utf8_stdio():
@@ -284,6 +287,9 @@ def main(argv=None):
                                      root=args.root, epoch=args.epoch)
         print("portable: %s（%d 个受管文件 + python/ 运行时 %s + %s）"
               % (path, len(files), portable_runtime.RUNTIME_VERSION, MANIFEST_NAME))
+        print("packages: %s"
+              % "、".join("%s %s" % (n, v)
+                         for n, v, *_ in portable_runtime.BUNDLED_WHEELS))
         print("sha256  : %s" % sha256(path))
         return 0
 

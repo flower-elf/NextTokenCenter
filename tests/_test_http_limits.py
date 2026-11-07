@@ -1,6 +1,6 @@
 """HTTP 服务层的两个「一行修」+ 一个内存护栏，固定路由器上实测的三个数字。
 
-三处改动都来自 OpenWrt 路由器（2 核 Celeron N2840 / 2GB，前面挂 nginx）上的实测：
+三处改动都来自路由器（2 核 Celeron N2840 / 2GB，前面挂 nginx）上的实测：
 
   - Handler.disable_nagle_algorithm：响应头（end_headers）和响应体是两次独立
     write，服务端 Nagle 碰上客户端 delayed ACK 让每个小响应白付 ~40ms（真机

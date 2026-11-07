@@ -77,7 +77,7 @@ function showLoadError(box, err) {
   title.textContent = '页面加载失败：' + (err && err.message ? err.message : String(err));
   const hint = document.createElement('div');
   hint.className = 'text-xs muted';
-  hint.textContent = '可以先重试；如果反复出现，请查看运行日志页里的报错。';
+  hint.textContent = '可以先重试；如果反复出现，请查看「运行日志」页里的报错。';
   const retry = document.createElement('button');
   retry.type = 'button';
   retry.className = 'btn btn-outline btn-sm';
@@ -116,7 +116,7 @@ async function show() {
     const box = document.createElement('div');
     host.appendChild(box);
     showLoadError(box, err);
-    document.title = route.title + ' - WorkBuddy 网关';
+    document.title = route.title + ' - NextTokenCenter';
     onChange(route, sub);
     return;
   }
@@ -130,16 +130,16 @@ async function show() {
     entry.instance = mod.mount(mount, { sub, route });
   } catch (err) {
     showLoadError(mount, err);
-    document.title = route.title + ' - WorkBuddy 网关';
+    document.title = route.title + ' - NextTokenCenter';
     onChange(route, sub);
     return;
   }
   armRefresh(entry);
-  document.title = route.title + ' - WorkBuddy 网关';
+  document.title = route.title + ' - NextTokenCenter';
   onChange(route, sub);
 }
 
-/** 切换查看的版本后调用，重新挂载当前页面，旧版本的数据不会残留在新版本里。 */
+/** 切换查看的渠道后调用，重新挂载当前页面，旧渠道的数据不会残留在新渠道里。 */
 export function remount() {
   if (current) show();
 }

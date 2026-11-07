@@ -54,10 +54,9 @@ def packages(*pairs):
         for remain, days in pairs]}
 
 
-def pool_with(*accounts, smart=True):
+def pool_with(*accounts):
     pool = wb_accounts.AccountPool(os.path.join(_TMP, "pools"))
     pool.accounts = list(accounts)
-    pool.smart_routing = smart
     return pool
 
 
@@ -80,31 +79,6 @@ def reset_daily_cache():
     with U._daily_usage_lock:
         U._daily_usage.update({"day": "", "totals": None, "credits": None,
                                "offset": 0, "at": 0.0})
-
-
-class SettingTests(unittest.TestCase):
-    """开关默认打开，读写走 settings.json。"""
-
-    def test_defaults_to_on_and_round_trips(self):
-        with tempfile.TemporaryDirectory(prefix="routing-set-") as directory:
-            self.assertTrue(wb_settings.smart_routing(directory),
-                            "没写过这个键时必须按打开处理")
-            self.assertFalse(wb_settings.set_smart_routing(directory, False))
-            self.assertFalse(wb_settings.smart_routing(directory))
-            self.assertTrue(wb_settings.set_smart_routing(directory, True))
-            self.assertTrue(wb_settings.smart_routing(directory))
-
-    def test_the_pool_resolves_the_setting_and_the_argument(self):
-        with tempfile.TemporaryDirectory(prefix="routing-set-") as directory:
-            pool = wb_accounts.AccountPool(directory)
-            self.assertFalse(pool.smart_routing,
-                             "直接构造的账号池默认要保持原来的轮询行为")
-            pool.apply_smart_routing()
-            self.assertTrue(pool.smart_routing)
-            wb_settings.set_smart_routing(directory, False)
-            pool.apply_smart_routing()
-            self.assertFalse(pool.smart_routing)
-            self.assertTrue(pool.apply_smart_routing(True))
 
 
 class ScoredPlacementTests(unittest.TestCase):
@@ -159,15 +133,6 @@ class ScoredPlacementTests(unittest.TestCase):
                          account("uid-intl", realm="intl", remain=1000, days=10))
         self.assertEqual(pool.pick(realm="intl").uid, "uid-intl")
 
-    def test_the_switch_puts_the_cursor_order_back(self):
-        pool = pool_with(account("uid-a", remain=1000, days=10),
-                         account("uid-b", remain=1000, days=60))
-        pool.smart_routing = False
-        picked = [pool.pick(realm="cn").uid for _ in range(4)]
-        self.assertEqual(picked, ["uid-a", "uid-b", "uid-a", "uid-b"],
-                         "关掉开关后应当回到轮询顺序")
-        self.assertEqual(pool.routing_snapshot()["cursor_pick"], 4)
-
     def test_a_late_package_is_spread_over_its_own_term(self):
         # 500 积分两天后到期与 10000 积分三十天后到期并存：目标取 max(500/2, 10500/30) = 350。
         a = account("uid-a")
@@ -221,8 +186,67 @@ class ScoredPlacementTests(unittest.TestCase):
         self.assertEqual(pool.routing_snapshot()["smart_pick"], 8 * 1500)
 
 
+class DispatchOrderTests(unittest.TestCase):
+    """分配顺序：优先级分层 > 手动权重 > 智能分配；整层拿不到名额时换下一层。"""
+
+    def _window(self, pool, days=7):
+        pool.apply_expiring_window({"global": days, "intl": days, "cn": days})
+        return pool
+
+    def test_a_smaller_priority_outranks_the_manual_weight(self):
+        first = account("tier-first")
+        first.priority = 10
+        heavy = account("weighted-later")
+        heavy.weight = 9
+        pool = pool_with(first, heavy)
+        self.assertEqual({pool.pick(realm="cn").uid for _ in range(6)}, {"tier-first"})
+
+    def test_a_smaller_priority_outranks_the_expiring_layer(self):
+        urgent = account("urgent-later", remain=100, days=1)
+        calm = account("calm-first", remain=1000, days=60)
+        calm.priority = 10
+        pool = self._window(pool_with(urgent, calm))
+        # 临期积分在层内才起作用，压不过优先级数字更小的账号。
+        self.assertEqual({pool.pick(realm="cn").uid for _ in range(6)}, {"calm-first"})
+
+    def test_the_manual_weight_outranks_the_expiring_and_scored_layer(self):
+        heavy = account("heavy-in-tier", remain=1000, days=60)
+        heavy.weight = 5
+        soon = account("soon-in-tier", remain=100, days=1)
+        pool = self._window(pool_with(soon, heavy))
+        self.assertEqual({pool.pick(realm="cn").uid for _ in range(6)}, {"heavy-in-tier"})
+
+    def test_the_score_decides_among_equal_priority_weight_one_accounts(self):
+        on_pace = account("order-paced", remain=1000, days=10, rate=100.0)
+        behind = account("order-behind", remain=1000, days=10, rate=0.0)
+        pool = pool_with(on_pace, behind)
+        self.assertEqual(pool.pick(realm="cn").uid, "order-behind",
+                         "同层同权重时由欠账评分决定")
+
+    def test_a_tier_member_that_cannot_be_claimed_lets_its_mate_try(self):
+        blocked = account("mate-blocked")
+        blocked.priority = 10
+        mate = account("mate-open")
+        mate.priority = 10
+        later = account("tier-later")
+        later.priority = 20
+        pool = pool_with(blocked, mate, later)
+        claim = lambda candidate: candidate.uid != "mate-blocked"
+        self.assertEqual(pool.pick(realm="cn", claim=claim).uid, "mate-open")
+
+    def test_a_tier_that_cannot_be_claimed_falls_through_to_the_next(self):
+        best = account("tier-best")
+        best.priority = 10
+        following = account("tier-following")
+        following.priority = 20
+        pool = pool_with(best, following)
+        claim = lambda candidate: candidate.uid != "tier-best"
+        self.assertEqual(pool.pick(realm="cn", claim=claim).uid, "tier-following")
+        self.assertEqual(pool.routing_snapshot()["smart_pick"], 1)
+
+
 class ExpiringTierTests(unittest.TestCase):
-    """智能分配打开时，窗口内的临期积分仍然先被消耗。"""
+    """智能分配里，窗口内的临期积分先被消耗。"""
 
     def _pool(self, *accounts, window=7):
         pool = pool_with(*accounts)
@@ -269,7 +293,7 @@ class ExpiringTierTests(unittest.TestCase):
 
 
 class RemainingTierTests(unittest.TestCase):
-    """智能分配打开时，估计剩余接近耗尽的组合在评分里更靠前。"""
+    """智能分配里，估计剩余接近耗尽的组合在评分里更靠前。"""
 
     def test_tight_account_gets_more_picks(self):
         # 同等积分义务时才看剩余用量倾斜：欠账差很大时仍由智能分配主导。
@@ -324,7 +348,6 @@ class RoutingCounterTests(unittest.TestCase):
         self.assertEqual(stats["bound_lost"], 0)
         self.assertEqual(stats["affinity_entries"], 1)
         self.assertEqual(stats["smart_pick"], 2)
-        self.assertTrue(stats["smart_routing"])
 
     def test_a_binding_that_cannot_serve_counts_as_a_switch(self):
         bound = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
@@ -399,7 +422,7 @@ class DailyCreditFoldTests(unittest.TestCase):
 
 
 class RoutingInputsTests(unittest.TestCase):
-    """积分速度推到账号上；开关关掉时整段折叠都跳过。"""
+    """积分速度推到账号上；日志里没有的账号清零。"""
 
     def setUp(self):
         reset_daily_cache()
@@ -416,14 +439,8 @@ class RoutingInputsTests(unittest.TestCase):
         P.POOL = self.old_pool
         reset_daily_cache()
 
-    def test_rates_are_pushed_only_while_the_switch_is_on(self):
-        self.pool.smart_routing = False
+    def test_rates_are_pushed_to_every_account(self):
         self.pool.accounts[2].credit_rate_per_day = 99.0
-        self.assertIsNone(U.apply_routing_inputs(refresh=True))
-        self.assertEqual(self.pool.accounts[2].credit_rate_per_day, 99.0,
-                         "开关关掉时不该动账号上的速度")
-
-        self.pool.smart_routing = True
         U.apply_routing_inputs(refresh=True)
         scale = U.credit_rate_scale()
         self.assertAlmostEqual(self.pool.accounts[0].credit_rate_per_day, 2.0 * scale,
@@ -438,7 +455,7 @@ class TransientRetryTests(unittest.TestCase):
     """5xx 与连接抖动先在同一个账号上重试，429 直接换号。"""
 
     def setUp(self):
-        self.pool = pool_with(account("uid-a"), account("uid-b"), smart=False)
+        self.pool = pool_with(account("uid-a"), account("uid-b"))
         self.old_pool = P.POOL
         P.POOL = self.pool
         self.calls = []

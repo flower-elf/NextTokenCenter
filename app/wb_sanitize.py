@@ -3,6 +3,7 @@
 客户端（Codex、Claude Code、DSH 等）的提示词与工具定义带着各自的指纹，上游按指纹拦截；这里在
 出站前抹掉这些标记，并把打印成文本的工具调用还原成结构化调用。
 """
+import functools
 import json
 import re
 import time
@@ -25,16 +26,20 @@ SANITIZE_FEATURES = (
     "11128",
 )
 SANITIZE_REWRITES = (
-    ("You are Claude Code, Anthropic's official CLI for Claude",
-     "You are Claude Code, Anthropic's official CLI tool for Claude"),
-    ("Main branch (you will usually use this for PRs)",
+    ("Default branch (you will usually use this for PRs)",
      "Default branch (you will usually use this for PRs)"),
-    ("You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+    ("You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
      "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant."),
-    ("To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+    ("To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
      "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"),
-    ("11128", "11-128"),
+    ("11-128", "11-128"),
 )
+# Claude Code 的自述首段本身就是指纹：整句中性化，其后的 Claude Code 提示词原样保留。
+SANITIZE_CLAUDE_CODE_INTRO_RE = re.compile(
+    r"(?i)You are Claude Code,\s*Anthropic['’]s official CLI"
+    r"(?: tool)? for Claude(?: Code)?\.?")
+SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT = "You are a helpful AI assistant."
+SANITIZE_CLAUDE_CODE_LOWER = "you are claude code,"
 SANITIZE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\r\n]*;?\s*")
 SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
@@ -66,7 +71,9 @@ def has_fingerprint(text):
         low = text.translate(SANITIZE_REI_FOLD).lower()
     else:
         low = text.lower()
-    return SANITIZE_BARE_HDR_LOWER in low or SANITIZE_OMO_JUNIOR_LOWER in low
+    return (SANITIZE_BARE_HDR_LOWER in low
+            or SANITIZE_OMO_JUNIOR_LOWER in low
+            or SANITIZE_CLAUDE_CODE_LOWER in low)
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
@@ -75,6 +82,8 @@ def sanitize_text(text):
     # 改写范围刻意收窄：不整体删掉 "OhMyOpenCode" 或 "Sisyphus-Junior"，
     # 两个词单独出现时上游都接受，只中和这处确认过的连续指纹。
     text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
+    text = SANITIZE_CLAUDE_CODE_INTRO_RE.sub(
+        SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
     text = SANITIZE_HDR_RE.sub("", text)
@@ -188,10 +197,22 @@ SANITIZE_DSH_SYSTEM_REWRITES = (
 SANITIZE_DSH_ASSISTANT_REWRITES = SANITIZE_DSH_SYSTEM_REWRITES
 
 
-def _sanitize_dsh_text(text, rewrites):
+def _apply_dsh_rewrites(text, rewrites):
     for pattern, replacement in rewrites:
         text = pattern.sub(replacement, text)
     return text
+
+
+# 每轮请求都带着完整的对话历史，同一条 assistant 消息会被反复改写；改写是纯函数，
+# 按原文缓存结果。只缓存 8192 字以内的文本，缓存最多占用约 16 MB 内存。
+_DSH_CACHE_MAX_TEXT = 8192
+_cached_dsh_rewrites = functools.lru_cache(maxsize=512)(_apply_dsh_rewrites)
+
+
+def _sanitize_dsh_text(text, rewrites):
+    if len(text) <= _DSH_CACHE_MAX_TEXT:
+        return _cached_dsh_rewrites(text, rewrites)
+    return _apply_dsh_rewrites(text, rewrites)
 
 
 def _sanitize_dsh_content(content, rewrites):

@@ -198,7 +198,7 @@ def wait_identity(timeout=20):
             urllib.request.urlopen(BASE + "/panel/status", timeout=2)
         except urllib.error.HTTPError as exc:
             # 没有面板会话时这个接口回 401；响应头带本网关的名字
-            if exc.headers.get("Server", "").startswith("wb-proxy-center/"):
+            if exc.headers.get("Server", "").startswith("NextTokenCenter/"):
                 return True
         except Exception:
             pass

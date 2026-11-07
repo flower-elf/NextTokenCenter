@@ -7,6 +7,7 @@ import json
 import time
 import urllib.error
 
+import wb_channels
 import wb_usage
 
 
@@ -16,7 +17,7 @@ P = None
 
 # 本模块向网关索取的接口。bind 时逐个核对，接线缺东西在启动阶段即失败。
 REQUIRED = (
-    "CURRENT_REALM", "ContentRejected", "LocalNetworkError", "RateLimited",
+    "ContentRejected", "LocalNetworkError", "RateLimited", "SlotLease",
     "_new_id", "aggregate_stream", "chat_to_response", "cors_origin_allowed",
     "custom_tool_names", "estimate_tokens", "extract_session_key",
     "follow_up_with_tool_results", "internal_calls_from_chat", "open_upstream",
@@ -540,18 +541,21 @@ def _stream_aborted(handler, writer, model, fp, account, t_start, first_ms, mess
         pass
 
 
-def _open_upstream(handler, chat_req, session_key, model, t_start):
+def _open_upstream(handler, chat_req, session_key, model, t_start, req_realm, public,
+                   lease=None):
     try:
-        req_realm = handler._request_realm() or P.CURRENT_REALM
         for guard in (handler._cross_realm_error(chat_req.get("model"), req_realm),
-                      handler._banned_model_error(chat_req.get("model")),
-                      handler._key_model_error(chat_req.get("model"))):
+                      handler._banned_model_error(chat_req.get("model"), req_realm),
+                      handler._key_model_error(public)):
             if guard:
                 handler._anthropic_error(400, guard, "invalid_request_error")
                 return None, None, None
-        upstream, account, effort = P.open_upstream(chat_req, session_key=session_key,
-                                                    target_realm=req_realm)
+        upstream, account, effort = P.open_upstream(
+            chat_req, session_key=session_key, target_realm=req_realm,
+            only_uid=handler._debug_account(), lease=lease)
         return upstream, account, effort
+    except wb_channels.ChannelError as exc:
+        handler._channel_error(model, exc, t_start, anthropic=True)
     except P.ContentRejected as exc:
         _record_error(handler, model, 403, exc.detail[:200],
                       elapsed_ms=int((time.time() - t_start) * 1000),
@@ -570,7 +574,8 @@ def _open_upstream(handler, chat_req, session_key, model, t_start):
     except P.RateLimited as exc:
         _record_error(handler, model, 429, exc.detail[:200],
                       elapsed_ms=int((time.time() - t_start) * 1000),
-                      account=getattr(exc, "account_uid", None))
+                      account=getattr(exc, "account_uid", None),
+                      outcome="rate_limited")
         handler._anthropic_rate_limited(exc)
     except urllib.error.HTTPError as exc:
         try:
@@ -610,26 +615,39 @@ def handle(handler, payload):
         "parallel_tool_calls": resp_req.get("parallel_tool_calls", True),
     }
     model = resp_req.get("model") or "deepseek-v4.1-flash"
+    t_start = time.time()
+    try:
+        req_realm, public = handler._route_model(chat_req)
+    except wb_channels.ChannelError as exc:
+        return handler._channel_error(model, exc, t_start, anthropic=True)
+    model = public or model
     want_stream = bool(payload.get("stream"))
     session_key = P.extract_session_key(handler.headers, payload)
     fp = P.prompt_fingerprint(chat_req.get("messages"))
-    t_start = time.time()
-    upstream, account, effort = _open_upstream(handler, chat_req, session_key, model, t_start)
+    lease = P.SlotLease()
+    upstream, account, effort = _open_upstream(handler, chat_req, session_key, model,
+                                               t_start, req_realm, public, lease=lease)
     if upstream is None:
+        lease.release()
         return None
-    with upstream:
-        if want_stream:
-            return _messages_stream(handler, upstream, model, custom_names, request_meta,
-                                    chat_req, namespace_map, fp, account, t_start,
-                                    session_key, effort, tool_alias=tool_alias)
-        return _messages_nonstream(handler, upstream, model, custom_names, request_meta,
-                                   chat_req, namespace_map, fp, account, t_start,
-                                   session_key, effort, tool_alias=tool_alias)
+    try:
+        with upstream:
+            if want_stream:
+                return _messages_stream(handler, upstream, model, custom_names, request_meta,
+                                        chat_req, namespace_map, fp, account, t_start,
+                                        session_key, effort, req_realm, tool_alias=tool_alias,
+                                        lease=lease)
+            return _messages_nonstream(handler, upstream, model, custom_names, request_meta,
+                                       chat_req, namespace_map, fp, account, t_start,
+                                       session_key, effort, req_realm, tool_alias=tool_alias,
+                                       lease=lease)
+    finally:
+        lease.release()
 
 
 def _messages_stream(handler, upstream, model, custom_names, request_meta, chat_req,
-                     namespace_map, fp, account, t_start, session_key, effort,
-                     tool_alias=None):
+                     namespace_map, fp, account, t_start, session_key, effort, realm,
+                     tool_alias=None, lease=None):
     _stream_headers(handler)
     writer = MessageStreamWriter(model, input_tokens=_input_estimate(chat_req))
     holder = {"usage": None, "custom_names": custom_names,
@@ -637,7 +655,7 @@ def _messages_stream(handler, upstream, model, custom_names, request_meta, chat_
               "tool_alias": tool_alias,
               "base_body": chat_req, "base_messages": chat_req.get("messages"),
               "session_key": session_key,
-              "realm": handler._request_realm() or P.CURRENT_REALM}
+              "realm": realm}
     first_ms = None
     total_usage = None
     try:
@@ -666,7 +684,8 @@ def _messages_stream(handler, upstream, model, custom_names, request_meta, chat_
             except Exception:
                 pass
             upstream, account, _ = P.follow_up_with_tool_results(
-                internal, holder, model, session_key, t_start, drop_tools=give_up)
+                internal, holder, model, session_key, t_start, drop_tools=give_up,
+                lease=lease)
         if total_usage:
             writer.usage = total_usage
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -691,8 +710,8 @@ def _messages_stream(handler, upstream, model, custom_names, request_meta, chat_
 
 
 def _messages_nonstream(handler, upstream, model, custom_names, request_meta, chat_req,
-                        namespace_map, fp, account, t_start, session_key, effort,
-                        tool_alias=None):
+                        namespace_map, fp, account, t_start, session_key, effort, realm,
+                        tool_alias=None, lease=None):
     sources = []
     rounds = 0
     web_tools = P.web_tools_active(chat_req)
@@ -716,11 +735,12 @@ def _messages_nonstream(handler, upstream, model, custom_names, request_meta, ch
         except Exception:
             pass
         holder = {"base_messages": chat_req.get("messages"), "base_body": chat_req,
-                  "realm": handler._request_realm() or P.CURRENT_REALM,
+                  "realm": realm,
                   "web_sources": sources}
         try:
             upstream, account, _ = P.follow_up_with_tool_results(
-                calls, holder, model, session_key, t_start, drop_tools=give_up)
+                calls, holder, model, session_key, t_start, drop_tools=give_up,
+                lease=lease)
         except Exception as exc:
             _record_error(handler, model, 502, "web tool follow-up failed: %s" % exc,
                           elapsed_ms=int((time.time() - t_start) * 1000),

@@ -359,6 +359,13 @@
 
 ## 未发布
 
+- **最低 Python 版本改为 3.12**：CI 矩阵从三条腿收敛为 Ubuntu 3.12 与 Windows 3.12；Docker 镜像改用 `python:3.12-alpine`；启动脚本在挑选解释器时按 3.12 起判定，Windows 启动脚本也会检查 PATH 上的 Python 版本；`requirements.txt` 去掉旧解释器的条件分支，只保留 3.12 可用的固定版本。
+- **程序名改为 NextTokenCenter**：响应头 `Server` 改为 `NextTokenCenter/<版本>`；绿色包目录与压缩包改名为 `next-token-center/`、`next-token-center-v<版本>.zip`；导出日志改名为 `next-token-center-<时间>.log`；看板的会话与 API Key 存储键改名，升级后需要重新登录面板并重新填写 API Key。
+- **不再支持 OpenWrt**：删除 `wrt/` 下的打包脚本、包配方与 Python 绑定配方，网关也不再识别 OpenWrt 部署形态；发布渠道只保留绿色 ZIP 与 Docker 镜像。
+- **本月积分区分未采集**：`/usage/month-credit` 新增 `requests` 与 `credit_missing`，统计本月完成行与其中没有扣费记录的行数；看板在本月完成行全部未采集时显示「本月积分未采集」，部分缺失时标出缺失行数，只有全部采集到才显示真实数字。聚合缓存改为按出口记录 `{credit, requests, missing}`，schema 变化时自动从零重建。
+- **设置视图暴露出站身份选项**：`GET /settings` 新增 `identity_options`，WorkBuddy 与 CodeArts 的设置页身份下拉改读后端定义，与账号页共用同一份列表。
+- **CodeArts 接口测试模型**：设置页新增 CodeArts 的测试模型，留空时使用账号自己的默认模型；指定的模型不在被测账号目录里时，测试直接报错，不退回默认模型。
+- **移除面板不再读取的旧设置**：`accounts_collapsed`、`accounts_separate_tab`、`key_before_hidden`、`hidden_pages`、`section_max_height`、`ui_language` 不再读取或保存；`runtime_settings_view` 同时去掉 `deleted_api_keys` 与若干无人读取的默认值字段。`/settings/save` 不再处理顶层平铺的限额键、`pricing_refresh_hours`、整表写入的模型关闭名单，以及旧面板写入单个 API Key 与重启调度器的载荷；下一次保存会从 `settings.json` 去掉已删除的键。
 - **智能体一键配置 (Agent Config)**：参照 EasyCLIProxyAPI 的 agents 机制，支持对本机 Claude Code、Codex CLI、OpenCode、DSH、Crush 客户端的一键检测、配置写入与安全备份还原；内置纯标准库文本级 YAML/TOML/JSON 编辑器与两阶段事务回滚保护。
 - 新增 `tests/_test_agents.py`（26 项 / 97 断言）：覆盖 YAML/TOML/dotenv/JSON 编辑器、客户端注册表、两阶段原子回滚、备份还原与网关 handlers 端到端测试。
 - 新增 `tests/_test_agent_ui.js`（18 项断言）：把看板脚本载入 DOM 桩后直接调用真实的 `applyAgent()` / `restoreAgent()` / `loadAgents()`，断言实际发出的请求体与渲染结果，钉住请求字段名漂移与未声明标识符这两类只在浏览器里暴露的缺陷。

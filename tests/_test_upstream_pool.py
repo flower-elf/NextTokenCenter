@@ -641,7 +641,7 @@ try:
         return ctx
 
     # 客户端侧把默认的证书校验换成放行的，只为了让本地自签证书能握手。
-    # 3.13 用 http.client._create_https_context，3.9~3.11 直接问
+    # 3.13 用 http.client._create_https_context，3.12 直接问
     # ssl._create_default_https_context；两边都在就都换，finally 里原样还回去。
     patched = []
     for module, name in ((http.client, "_create_https_context"),

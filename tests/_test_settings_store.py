@@ -177,12 +177,12 @@ print("[7] 非 ASCII API key 正常参与比较")
 
 keys_dir = tempfile.mkdtemp(prefix="wb-store-keys-")
 S.set_api_keys(keys_dir, [
-    {"id": "cn", "name": "cn", "key": "密钥-测试-α", "realm": "cn"},
-    {"id": "en", "name": "en", "key": "ASCII-key", "realm": "intl"},
+    {"id": "cn", "name": "cn", "key": "密钥-测试-α", "route": ["cn"]},
+    {"id": "en", "name": "en", "key": "ASCII-key", "route": ["intl"]},
 ])
 entry, exc = attempt(S.match_api_key, keys_dir, "密钥-测试-α")
 check("非 ASCII key 命中自己", exc is None and (entry or {}).get("id") == "cn", (entry, exc))
-check("命中的 entry 带着自己的 realm", (entry or {}).get("realm") == "cn", entry)
+check("命中的 entry 带着自己的路由", (entry or {}).get("route") == ["cn"], entry)
 
 miss, exc = attempt(S.match_api_key, keys_dir, "密钥-测试-β")
 check("不匹配的非 ASCII key 返回 None", exc is None and miss is None, (miss, exc))
@@ -354,6 +354,26 @@ try:
     check("重读拿到新值", S.load(_tmp_dir).get("probe") == 2, S.load(_tmp_dir))
     leftovers = [n for n in os.listdir(_tmp_dir) if n.endswith(".tmp")]
     check("失败路径不留下临时文件", leftovers == [], leftovers)
+finally:
+    shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+print()
+print("[取消] 面板不再读取的显示偏好会在下一次写入时清掉")
+_tmp_dir = tempfile.mkdtemp(prefix="wb-settings-retired-")
+try:
+    S.save(_tmp_dir, {
+        "accounts_collapsed": True,
+        "accounts_separate_tab": True,
+        "key_before_hidden": True,
+        "hidden_pages": ["tasks"],
+        "section_max_height": 640,
+        "ui_language": "en",
+        "keep_this": 1,
+    })
+    stored = S.load(_tmp_dir)
+    leftover = [key for key in S.RETIRED_SETTINGS_KEYS if key in stored]
+    check("已删除的键不会写进文件", leftover == [], leftover)
+    check("其它设置原样保留", stored.get("keep_this") == 1, stored)
 finally:
     shutil.rmtree(_tmp_dir, ignore_errors=True)
 

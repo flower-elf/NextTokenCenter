@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -11,6 +12,8 @@ from http.server import ThreadingHTTPServer
 
 import wb_accounts
 import wb_activity
+import wb_channels
+import wb_codearts
 import wb_logstore
 import wb_pricing
 import wb_scheduler
@@ -93,6 +96,28 @@ def _probe_running_instance(gateway, args):
         existing = json.loads(probe.read().decode("utf-8"))
     except Exception:
         existing = None  # /health 无人应答，交给下面的绑定判定
+    if existing is None:
+        # 端口能连上但 /health 不应答：可能是卡死的实例，也可能是别的 HTTP 服务。
+        # Windows 的 SO_REUSEADDR 允许再绑一次，内核仍把连接分给旧的持有者，
+        # 看板会一直空白；这里直接拒绝启动。
+        probe_host = args.host if args.host not in ("", "0.0.0.0", "::") else "127.0.0.1"
+        try:
+            with socket.create_connection((probe_host, args.port), timeout=1.0):
+                occupied = True
+        except OSError:
+            occupied = False
+        if occupied:
+            print()
+            print(f"  [ERROR] port {args.port} is already accepting connections "
+                  "but does not answer /health.")
+            print("          It may be a stuck wb-proxy or another program; "
+                  "nothing was started.")
+            print()
+            print("  Fix: stop the process holding the port, or pick another port:")
+            print("          %s" % gateway.port_owner_hint(args.port))
+            print("          %s" % gateway.launcher_hint(args.port + 1))
+            print()
+            raise SystemExit(1)
     if isinstance(existing, dict):
         # 只有自己的 /health 带账号池字段 "accounts"。同端口的其他服务（开发代理、
         # 另一个网关）也会用 JSON 应答 /health；当作已启动会静默退出，看板显示的是
@@ -160,20 +185,22 @@ def _bootstrap_runtime(gateway, args):
     gateway.POOL.load()
     gateway.POOL.apply_proxy_slots()
     gateway.POOL.apply_reserve_credits()
-    gateway.POOL.apply_smart_routing()
     wb_usage.apply_routing_inputs(refresh=True)
-    # WB_MAX_CONCURRENT_CHAT=auto：按刚加载完的账号池确定并发上限。此刻监听器
-    # 还没启动，没有请求能占住名额，信号量替换是安全的。
-    gateway.resize_chat_slots(gateway.POOL.count_ready())
+    # WB_MAX_CONCURRENT_CHAT=auto：按两个提供方刚加载完的账号池确定并发上限。此刻
+    # 监听器还没启动，没有请求能占住名额，信号量替换是安全的。
+    gateway.resize_chat_slots(gateway.provider_counts()["ready"])
     wb_usage.apply_daily_guards()
     # 虚拟档位别名默认停止处理；操作者在模型页勾选后，excluded_seen 保证
     # 下一次启动不会又关掉。
     seed_default_disabled(sorted(VIRTUAL_ALIAS_MODELS))
-    wb_usage.load_persisted_realm()
+    wb_usage.load_persisted_route()
     from wb_scheduler import Scheduler
     gateway.SCHEDULER = Scheduler(gateway.POOL)
     gateway.SCHEDULER.enabled = wb_settings.scheduler_enabled(gateway.ACCOUNTS_DIR)
     gateway.SCHEDULER.start()
+    # CodeArts 的设备会话登记按官方节奏在后台推进：登录时登记，之后每 120 秒查状态。
+    gateway.DEVICE_SESSIONS = wb_codearts.start_device_sessions(
+        wb_codearts.load_config(gateway.ACCOUNTS_DIR))
     # 目录兜底：每天至少从上游 API 取一次（活跃使用的部署里 300s 缓存早就
     # 刷得更新，这个线程只兜长时间没人访问 / 一直吃缓存文件或内置快照）。
     start_catalog_daily()
@@ -190,9 +217,17 @@ def _bootstrap_runtime(gateway, args):
         wb_settings.pricing_refresh_minutes(gateway.ACCOUNTS_DIR))
     gateway.PRICING.start()
     # 余额支撑「临期额度优先派发」的调度偏好。刷新器在后台保持余额常新，
-    # 请求路径不花查询代价。
-    gateway.CREDITS_REFRESHER = wb_accounts.CreditsRefresher(gateway.POOL)
+    # 请求路径不花查询代价；CodeArts 账号走同一个线程与同一个间隔设置。
+    codearts_provider = wb_channels.provider("codearts")
+    gateway.CREDITS_REFRESHER = wb_accounts.CreditsRefresher(
+        gateway.POOL, extra_provider=codearts_provider)
     gateway.CREDITS_REFRESHER.start()
+    # 令牌与 refreshToken 都有各自的有效期。官方客户端每 24 小时换一次令牌，这里
+    # 用同一节奏在后台续期，长期运行的网关不会因为 refreshToken 过期而掉线。
+    gateway.CREDENTIAL_REFRESHER = wb_accounts.CredentialRefresher(
+        gateway.POOL, extra_provider=codearts_provider,
+        log=lambda msg: gateway.add_log_entry("[凭据] %s" % msg, tag="accounts"))
+    gateway.CREDENTIAL_REFRESHER.start()
     # 只做版本发现：检查器向 GitHub 查询最新稳定版并报告，不下载、不替换、
     # 不重启任何东西；每日开关默认关闭，关闭时不发出任何请求。
     gateway.UPDATES = wb_updates.UpdateChecker(
@@ -220,7 +255,7 @@ def _report_first_run(gateway, args):
         for account in imported:
             print("  %s  %s  %s" % (account.uid[:8], account.nickname, account.domain))
         return True
-    first_run = not gateway.POOL.accounts
+    first_run = gateway.provider_counts()["total"] == 0
     if first_run:
         # 绝不静默采纳桌面客户端的登录：只报告扫到什么，让用户从看板导入。
         detected = wb_accounts.desktop_credential_scan()
@@ -234,17 +269,35 @@ def _report_first_run(gateway, args):
             gateway.log("open the dashboard and click [Scan desktop app] to import")
         else:
             gateway.log("no accounts yet - no desktop credentials found on this machine")
-    if first_run and not gateway.POOL.accounts:
+    if first_run:
         # 这里不能退出：看板必须保持可达，才能走浏览器登录流程添加新账号。
         gateway.log("still no accounts - starting anyway so you can log in via the dashboard")
 
+def _providers():
+    """每个提供方一次；同一提供方的多个渠道共用账号池。"""
+    out, seen = [], set()
+    for realm in wb_channels.ids():
+        prov = wb_channels.provider(realm)
+        if prov.name in seen:
+            continue
+        seen.add(prov.name)
+        out.append(prov)
+    return out
+
+
 def _log_startup_summary(gateway, args, api_key_generated):
     rep = gateway.current_account()
-    gateway.log("accounts   : %d total, %d usable" % (len(gateway.POOL.accounts), gateway.POOL.count_ready()))
-    for account in gateway.POOL.accounts:
-        gateway.log("  - %s  %s  %s  %s" % (account.uid[:8], account.nickname or "(no name)",
-                                    account.domain, wb_accounts._human_delta(
-                                        (account.expires_at or 0) - time.time()) or "?"))
+    counts = gateway.provider_counts()
+    gateway.log("accounts   : %d total, %d usable" % (counts["total"], counts["ready"]))
+    for prov in _providers():
+        views = prov.views()
+        gateway.log("%-10s : %d account(s)" % (prov.name, len(views)))
+        for view in views:
+            gateway.log("  - %s  %s  %s  %s" % (
+                str(view.get("uid") or "?")[:8],
+                view.get("nickname") or "(no name)",
+                view.get("realm") or "-",
+                view.get("expiresIn") or "?"))
     gateway.log("store      : %s" % gateway.ACCOUNTS_DIR)
     gateway.log(f"credential : {rep.path if rep else chr(45)}")
     if os.path.exists(gateway.PRODUCT_CONFIG_CACHE):
@@ -253,9 +306,8 @@ def _log_startup_summary(gateway, args, api_key_generated):
         gateway.log("catalog    : app cache not found - will use the model API instead")
     gateway.log(f"account    : {rep.uid if rep else chr(45)} @ {rep.domain if rep else chr(45)}")
     gateway.log(f"issuer     : {wb_accounts.jwt_issuer(rep.access_token) if rep else chr(45)}")
-    gateway.log("realm      : %s (%s)" % (
-        gateway.CURRENT_REALM,
-        "www.workbuddy.ai" if gateway.CURRENT_REALM == "intl" else "www.workbuddy.cn"))
+    gateway.log("route      : %s" % " + ".join(
+        wb_channels.label(r) for r in gateway.ROUTE))
     panel_keys = gateway.configured_keys()
     if panel_keys and not gateway.API_KEY:
         if args.api_key:
@@ -302,7 +354,7 @@ def _log_startup_summary(gateway, args, api_key_generated):
         print("  " + "=" * 62)
         print()
         sys.stdout.flush()
-    if not gateway.POOL.accounts:
+    if gateway.provider_counts()["total"] == 0:
         print()
         print("  " + "=" * 62)
         print("  NO ACCOUNTS YET")
@@ -357,6 +409,10 @@ def _serve_forever(gateway, args):
     except KeyboardInterrupt:
         gateway.log("bye")
     finally:
+        try:
+            wb_codearts.stop_device_sessions()
+        except Exception:
+            pass
         try:
             server.server_close()
         except Exception:

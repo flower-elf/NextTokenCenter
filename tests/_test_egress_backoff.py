@@ -186,8 +186,17 @@ class _OpenUpstreamHarness(unittest.TestCase):
             def apply_model_daily_token_limit(self, *a, **k):
                 return 0
 
+            def apply_reserve_credits(self, values=None):
+                return None
+
+            def apply_expiring_window(self, values=None):
+                return None
+
             def apply_remaining_weights(self, weights=None):
                 return weights or {}
+
+            def apply_credit_rates(self, per_day=None):
+                return None
 
         pool = Pool()
         pool.accounts = accounts

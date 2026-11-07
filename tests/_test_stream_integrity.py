@@ -85,7 +85,7 @@ class HandlerStub(object):
                                         t_start, effort=None, lease=None):
         return wb_messages_responses._messages_stream(
             self, upstream, model, custom_names, request_meta, chat_req,
-            namespace_map, None, account, t_start, None, effort)
+            namespace_map, None, account, t_start, None, effort, "intl")
 
     class _WFile(object):
         def __init__(self, sink):
@@ -125,9 +125,6 @@ class HandlerStub(object):
 
     def _error(self, code, message, err_type="server_error"):
         return self._json(code, {"error": {"message": message, "type": err_type}})
-
-    def _request_realm(self, explicit=None):
-        return None
 
     def body(self):
         return b"".join(self.written).decode("utf-8", "replace")

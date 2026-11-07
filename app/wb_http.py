@@ -11,15 +11,17 @@ import time
 from http.server import BaseHTTPRequestHandler
 
 import wb_accounts
+import wb_channels
+import wb_codearts
 import wb_host
-import wb_modelsdev
 import wb_proxy_slots
 import wb_settings
 import wb_usage
 from urllib.parse import parse_qs, urlparse
 
 from wb_chat_routes import ChatRoutes
-from wb_models import catalog_meta, fetch_models, model_entry
+from wb_media_routes import MediaRoutes
+from wb_models import announce_model_aliases
 from wb_panel_routes import PanelRoutes
 from wb_translate import anthropic_error_obj
 
@@ -35,7 +37,7 @@ def _g():
             import wb_proxy as _GATEWAY
     return _GATEWAY
 
-class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
+class Handler(PanelRoutes, ChatRoutes, MediaRoutes, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关闭 Nagle（对连接设 TCP_NODELAY）：响应头与响应体是两次独立 write，
     # Nagle 会攒住第二次小写等第一次的 ACK，遇上客户端 delayed ACK，面板几乎
@@ -116,7 +118,7 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
 
-    server_version = "wb-proxy-center/"  # 版本后缀由 wb_proxy 导入后补全
+    server_version = "NextTokenCenter/"  # 版本后缀由 wb_proxy 导入后补全
 
     def log_message(self, fmt, *args):
         # 看板高频轮询的正常 200 GET（/logs、/usage 等）不记日志：读日志本身
@@ -342,8 +344,8 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             "upstream rate limit reached for this model; retry in %ds" % wait)
         # 上游 detail 只缀在上游文案后；本地文案缀上去只是重复。
         detail = ""
-        if exc.detail and not custom:
-            detail = " - " + exc.detail[:200]
+        if getattr(exc, "detail", "") and not custom:
+            detail = " - " + str(exc.detail)[:200]
         # 模型冷却在入口就检查，429 可能在正文未读时回答，所以同 _error 一样先排空。
         self._handle_expect_continue()
         self._discard_body()
@@ -451,9 +453,9 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return True
         return False
 
-    def _key_realm(self):
-        """本请求所用 key 绑定的出口，未绑定为 ""。"""
-        return (self.key_entry or {}).get("realm") or ""
+    def _key_route(self):
+        """本请求所用 key 绑定的路由，未绑定为空元组。"""
+        return tuple((self.key_entry or {}).get("route") or ())
 
     def _key_id(self):
         """为本请求付费的 key 的设置 id，无则 None。
@@ -533,6 +535,9 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         """
         if not realm or not model:
             return ""
+        if wb_channels.provider(realm).name != wb_channels.WorkBuddyProvider.name:
+            # 单侧出口表只描述 WorkBuddy 的国际版与国内版；其它渠道的出口由 Key 或面板显式选定。
+            return ""
         owner = _g().exclusive_realm(model)
         if not owner or owner == realm:
             return ""
@@ -543,13 +548,34 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
 
-    def _banned_model_error(self, model):
+    def _banned_model_error(self, model, realm=""):
         """被封锁的模型直接报错，不碰上游、不扣任何点数。"""
-        if not wb_settings.model_served(_g().ACCOUNTS_DIR, model):
-            return _g().disabled_model_message(model)
+        if not wb_settings.model_served(_g().ACCOUNTS_DIR, model, realm):
+            return _g().disabled_model_message(model, realm)
         if not _g().is_model_banned(model):
             return ""
         return _g().banned_model_message(model)
+
+    def _route_model(self, body):
+        """按本请求的路由为模型挑渠道，把请求体的模型换成该渠道接单的 id，并把渠道与上游 id
+        记进审计上下文，用量行据此写出实际调用的渠道与模型。返回 (渠道, 对客户端通告的 id)；
+        请求体没写模型时通告 id 为 None。路由写法不合法时抛 ChannelError。"""
+        requested = body.get("model")
+        realm, upstream, public = wb_channels.select(
+            self._request_route(), requested,
+            session_key=_g().extract_session_key(self.headers, body))
+        audit = getattr(self, "audit", None)
+        if audit is not None:
+            audit["realm"] = realm
+        if not requested:
+            return realm, None
+        if upstream != requested:
+            _g().log("model route: realm=%s requested=%s -> upstream=%s"
+                     % (realm, requested, upstream))
+        body["model"] = upstream
+        if audit is not None:
+            audit["upstream_model"] = upstream
+        return realm, public
 
     def _key_model_error(self, model):
         """按 key 的模型限制在请求到上游前拒绝。未列模型的 key 不受限，
@@ -562,23 +588,21 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return ""
         return _g().key_model_message(entry, model)
 
-    def _request_realm(self, explicit=None):
-        """为本请求选择上游出口。
-        优先级：显式 realm 参数、key 绑定的出口、X-Realm 头、?realm= 查询参数、
-        全局开关。返回 None 时 open_upstream() 按模型检测。
-        """
-        if explicit:
-            return explicit
-        bound = self._key_realm()
+    def _request_route(self):
+        """本请求的路由。优先级：key 绑定的路由、X-Realm 头、?realm= 查询参数、面板默认路由。
+        头与查询参数可以写一个渠道，也可以写逗号分隔的多个渠道。"""
+        bound = self._key_route()
         if bound:
             return bound
-        header = self.headers.get("X-Realm")
-        if header:
-            return header
-        try:
-            return parse_qs(urlparse(self.path).query).get("realm", [None])[0]
-        except Exception:
-            return None
+        for raw in (self.headers.get("X-Realm"),
+                    parse_qs(urlparse(self.path).query).get("realm", [None])[0]):
+            try:
+                route = wb_channels.parse_route(raw)
+            except ValueError as exc:
+                raise wb_channels.ChannelError(str(exc), 400, "invalid_request_error")
+            if route:
+                return route
+        return tuple(_g().ROUTE)
 
     def _authorized(self):
         if self._key_ok():
@@ -617,14 +641,6 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return ""
         return uid
 
-    def _stand_down_block(self, path):
-        """网关停止时，会带账号令牌访问上游的入口一律 503。返回是否已处理。"""
-        if not (_g().stand_down_active() and path in _g().STAND_DOWN_POST_PATHS):
-            return False
-        self._error(503, _g().stand_down_message(_g().GatewayStandDown(
-            _g().STAND_DOWN.get("detail") or "")), "overloaded_error")
-        return True
-
     @staticmethod
     def _is_panel_route(path):
         """web 面板的管理端点。模型清单仅凭 API Key 仍可访问，普通 OpenAI
@@ -657,6 +673,8 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return True
         if path.startswith("/agents"):
             return True
+        if path.startswith("/codearts"):
+            return True
         return False
 
     def do_OPTIONS(self):
@@ -668,6 +686,18 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _html(self, code, text):
+        body = str(text or "").encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -677,6 +707,9 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         # 与仓库里同一份 wb_agents.py，不含机密。
         if path == "/agents/cli":
             return self._get_agents_cli()
+        # 华为云授权完成后的浏览器回跳：不带面板会话，按 state/session_id 校验。
+        if path in ("/oauth/callback", "/codearts/oauth/callback"):
+            return self._get_codearts_oauth_callback(query)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
@@ -699,6 +732,14 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return self._get_realm()
         if path in ("/v1/models", "/models"):
             return self._get_v1_models()
+        if path in ("/v1/media/models", "/media/models"):
+            return self._get_media_models(query)
+        if path == "/v1/media/tasks":
+            return self._get_media_tasks(query)
+        if path.startswith("/v1/videos/"):
+            return self._get_media_video(path, query)
+        if path.startswith("/v1/media/content/"):
+            return self._get_media_content(path.rsplit("/", 1)[-1], query)
         if path in ("/usage", "/v1/usage"):
             return self._get_v1_usage(query)
         if path == "/usage/recent":
@@ -835,8 +876,6 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
-        if self._stand_down_block(path):
-            return
         is_messages_route = path in (
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
@@ -844,15 +883,30 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         is_account_route = (
             path.startswith("/accounts/")
             or path == "/realm"
+            or path.startswith("/codearts")
             or path.startswith("/tasks")
             or path.startswith("/scheduler")
             or path.startswith("/logs")
         )
-        if not is_account_route and not is_messages_route and path not in (
+        is_media_route = (
+            path in ("/v1/images/generations", "/images/generations",
+                     "/v1/images/edits", "/images/edits",
+                     "/v1/videos", "/videos")
+            or path.startswith("/v1/media/")
+        )
+        if not is_account_route and not is_messages_route and not is_media_route \
+                and path not in (
                 "/v1/chat/completions", "/chat/completions",
                 "/v1/completions", "/completions",
                 "/v1/responses", "/responses"):
             return self._error(404, "not found", "invalid_request_error")
+        if is_media_route:
+            if not self._authorized():
+                return
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            return self._handle_media_post(path, payload)
         if is_messages_route:
             if not self._key_ok():
                 return self._anthropic_error(
@@ -1033,12 +1087,13 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         # 无论鉴权与否都应答（启动器靠它探测运行中的实例），但账号身份只对
         # 鉴权通过的调用方暴露。
         rep = _g().current_account()
+        counts = _g().provider_counts()
         info = {
             "ok": True,
-            # 报告实际使用的出口，跟随面板切换。
-            "realm": _g().CURRENT_REALM,
-            "accounts": len(_g().POOL.accounts) if _g().POOL else 0,
-            "accounts_ready": _g().POOL.count_ready() if _g().POOL else 0,
+            # 报告默认路由，跟随面板切换。
+            "route": list(_g().ROUTE),
+            "accounts": counts["total"],
+            "accounts_ready": counts["ready"],
             "api_key_required": _g().auth_required(),
         }
         if self._key_ok():
@@ -1052,31 +1107,53 @@ class Handler(PanelRoutes, ChatRoutes, BaseHTTPRequestHandler):
         return self._json(200, info)
 
     def _get_realm(self):
-        return self._json(200, {"current": _g().CURRENT_REALM, "options": ["intl", "cn"]})
+        return self._json(200, {"route": list(_g().ROUTE),
+                                "options": _g().realm_options(),
+                                "channels": wb_channels.public()})
+
+    def _get_codearts_oauth_callback(self, query):
+        cfg = wb_codearts.load_config(_g().ACCOUNTS_DIR)
+        try:
+            status, html = wb_codearts.oauth_callback_get(cfg, query)
+        except wb_codearts.CodeArtsError as exc:
+            return self._html(400, "CodeArts 授权失败：%s" % exc)
+        return self._html(status, html)
 
     def _get_v1_models(self):
         if not self._authorized():
             return
-        req_realm = self._request_realm() or _g().CURRENT_REALM
         try:
-            entries = fetch_models(realm=req_realm)
-        except Exception as exc:
-            return self._error(502, str(exc))
-        # Level 4 尽力而为：冷却期内至多后台预热一次本地缓存，离线部署继续
-        # 用回退清单。
-        try:
-            wb_modelsdev.refresh_async(_g().ACCOUNTS_DIR, log=_g().log)
-        except Exception:
-            pass
-        disabled = {m.strip().lower()
-                    for m in wb_settings.disabled_models(_g().ACCOUNTS_DIR)}
-        data = [model_entry(mid, meta) for mid, meta in entries
-                if mid.strip().lower() not in disabled]
-        payload = {"object": "list", "data": data,
-                   "realm": req_realm or _g().CURRENT_REALM}
-        # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
-        # 本机桌面缓存文件/内置快照，以及各自的时间戳。
-        meta = catalog_meta(req_realm)
-        if meta:
-            payload["catalog"] = meta
+            route = self._request_route()
+        except wb_channels.ChannelError as exc:
+            return self._error(exc.status, str(exc), exc.etype)
+        aliases = wb_settings.model_aliases(_g().ACCOUNTS_DIR)
+        data = []
+        seen = set()
+        catalogs = {}
+        for realm in route:
+            channel_provider = wb_channels.provider(realm)
+            try:
+                entries = channel_provider.model_entries(realm)
+            except wb_channels.ChannelError as exc:
+                # 混合路由里一个渠道取不到目录时，其余渠道的模型照常列出
+                if len(route) == 1:
+                    return self._error(exc.status, str(exc), exc.etype)
+                _g().log("/v1/models: %s skipped: %s" % (realm, exc))
+                continue
+            disabled = {m.strip().lower()
+                        for m in wb_settings.disabled_models(_g().ACCOUNTS_DIR, realm)}
+            entries = [item for item in entries if item["id"].strip().lower() not in disabled]
+            # 同一个 id 由多个渠道提供时只列一次，元数据取登记表里靠前的渠道
+            for item in announce_model_aliases(aliases, entries):
+                low = item["id"].strip().lower()
+                if low not in seen:
+                    seen.add(low)
+                    data.append(item)
+            meta = channel_provider.catalog_meta(realm)
+            if meta:
+                catalogs[realm] = meta
+        payload = {"object": "list", "data": data, "route": list(route)}
+        # 来源说明：每个渠道的清单是上游实时取的，还是读的本机缓存或内置快照。
+        if catalogs:
+            payload["catalogs"] = catalogs
         return self._json(200, payload)

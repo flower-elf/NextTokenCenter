@@ -58,7 +58,7 @@ export function switchRow(ctl, { name, desc, field }) {
 }
 
 /** 数字输入行。 */
-export function numberRow(ctl, { name, desc, field, suffix, min = '0', step = '1' }) {
+export function numberRow(ctl, { name, desc, field, suffix, min = '0', max = '', step = '1' }) {
   return html`
     <div class="setting">
       <div class="setting-main">
@@ -68,7 +68,7 @@ export function numberRow(ctl, { name, desc, field, suffix, min = '0', step = '1
         ${rowError(ctl, field)}
       </div>
       <div class="setting-control">
-        <input class="input input-num" type="number" min=${min} step=${step} aria-label=${name}
+        <input class="input input-num" type="number" min=${min} max=${max || nothing} step=${step} aria-label=${name}
                .value=${live(ctl.form[field])} ?disabled=${ctl.saving}
                @input=${(e) => ctl.change(field, e.target.value)}>
         <span class="setting-unit">${suffix}</span>

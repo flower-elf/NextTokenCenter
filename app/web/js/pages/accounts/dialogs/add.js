@@ -1,41 +1,33 @@
-// 添加账号弹窗：OAuth 授权与 API Key 两种方式。菜单栏的「添加账号」直接调用这里导出的 openAddAccountDialog。
-import { html, nothing, unsafeSVG } from '../../../core/dom.js';
+// 添加账号弹窗：腾讯 OAuth 授权与 API Key 两种方式，只用于账号来源是 workbuddy 的渠道；按渠道分流见 open.js。
+import { html, nothing } from '../../../core/dom.js';
 import { icon } from '../../../core/icons.js';
 import { getState } from '../../../core/store.js';
-import { qrcode } from '../../../../vendor/qrcode-generator-2.0.4.mjs';
+import { channelLabel, channelProvider, channelTitle } from '../../../core/channels.js';
+import { spaceMixed } from '../../../core/format.js';
 import { openDialog } from '../../../ui/dialog.js';
 import { busyClick, notice, segmented } from '../../../ui/widgets.js';
 import { toast, toastError } from '../../../ui/toast.js';
 import { copyWithToast } from '../../../ui/copy.js';
 import * as acct from '../actions.js';
 import { PRODUCTS, productLabel } from '../logic.js';
+import { qrMarkup } from './qr.js';
 
-const REALM_LABEL = { cn: '国内版 (www.workbuddy.cn)', intl: '国际版 (www.workbuddy.ai)' };
-const REALM_NAME = { cn: '国内版', intl: '国际版' };
-
-/** 二维码只用 SVG 一种形态，按链接缓存，重新生成链接时才重算。 */
-const qrCache = new Map();
-
-function qrSvg(text) {
-  const hit = qrCache.get(text);
-  if (hit) return hit;
-  const qr = qrcode(0, 'M');
-  qr.addData(text);
-  qr.make();
-  const svgText = qr.createSvgTag({ cellSize: 4, margin: 8, scalable: true, alt: '授权链接二维码' });
-  if (qrCache.size > 8) qrCache.clear();
-  qrCache.set(text, svgText);
-  return svgText;
+/** 走腾讯登录的渠道：可用渠道里账号来源是 workbuddy 的那些。 */
+function loginRealms() {
+  return getState().realms.filter((id) => channelProvider(id) === 'workbuddy');
 }
 
 /**
- * 添加账号 (OAuth)：默认选中当前查看的版本与 WorkBuddy 桌面端，链接生成后展示二维码与可复制链接，
+ * 添加账号 (OAuth)：默认选中当前查看的渠道与 WorkBuddy 桌面端，链接生成后展示二维码与可复制链接，
  * 每 2 秒轮询一次登录状态，关闭弹窗时通知服务端取消本次登录。登录所用的客户端就是新账号的出站身份。
  */
 export function openAddAccountDialog(options = {}) {
-  const initial = options.realm === 'cn' || options.realm === 'intl' ? options.realm : getState().viewRealm;
+  const realms = loginRealms();
+  const initial = [options.realm, getState().viewRealm].find((id) => realms.includes(id)) || realms[0];
   let realm = initial;
   let product = 'workbuddy';
+  let proxySlot = '';
+  let proxySlots = [];
   let mode = options.mode === 'apikey' ? 'apikey' : 'oauth';
   let apiKey = '';
   let apiNickname = '';
@@ -53,9 +45,9 @@ export function openAddAccountDialog(options = {}) {
   const ctl = openDialog({
     title: () => (mode === 'apikey' ? '添加 API Key 账号' : '添加账号'),
     desc: () => (mode === 'apikey'
-      ? '粘贴企业版控制台签发的静态 Key。添加前会先验证企业额度，验证失败不会写入账号池。'
-      : '先选择要登录的版本和客户端，再打开链接或用手机扫码完成授权。授权完成后账号会自动加入账号池，所选客户端就是这个账号的出站身份。'),
-    width: 460,
+      ? '粘贴企业版控制台签发的静态 Key，添加前会验证企业额度。'
+      : '先选择渠道和客户端，再打开链接或用手机扫码完成授权。'),
+    width: 512,
     body: () => html`
       <div class="realm-choice">
         <span class="field-label">添加方式</span>
@@ -70,7 +62,7 @@ export function openAddAccountDialog(options = {}) {
           <input class="input" type="password" autocomplete="off" spellcheck="false"
                  placeholder="ck_..." .value=${apiKey}
                  @input=${(event) => { apiKey = event.target.value; }}>
-          <span class="field-hint">企业版 CodeBuddy 控制台签发，形如 ck_&lt;id&gt;.&lt;secret&gt;；只适用于国内版。</span>
+          <span class="field-hint">企业版 CodeBuddy 控制台签发，只适用于国内版。</span>
         </label>
         <label class="field">
           <span class="field-label">备注名（可选）</span>
@@ -81,17 +73,26 @@ export function openAddAccountDialog(options = {}) {
         <p class="text-2xs muted">验证通过后出站身份默认 CLI，可在账号行切换。</p>
       ` : html`
       <div class="realm-choice">
-        <span class="field-label">登录到哪个版本</span>
-        ${segmented([
-          { id: 'cn', label: REALM_LABEL.cn },
-          { id: 'intl', label: REALM_LABEL.intl },
-        ], realm, switchRealm)}
+        <span class="field-label">登录到哪个渠道</span>
+        ${segmented(realms.map((id) => ({ id, label: spaceMixed(channelTitle(id)) })), realm, switchRealm)}
       </div>
       <div class="realm-choice">
         <span class="field-label">以哪个官方客户端登录</span>
         ${segmented(PRODUCTS.map((item) => ({ id: item.id, label: item.short })), product, switchProduct)}
         <span class="text-2xs muted">${productLabel(product)}</span>
       </div>
+      ${proxySlots.length ? html`
+        <div class="realm-choice">
+          <span class="field-label">登录使用的代理槽</span>
+          <select class="select" .value=${proxySlot}
+                  @change=${(event) => { proxySlot = event.target.value; }}>
+            <option value="">直连（不走代理槽）</option>
+            <option value="auto">自动（挑一个空闲槽）</option>
+            ${proxySlots.filter((slot) => slot.enabled !== false).map((slot) => html`
+              <option value=${slot.id}>${slot.name || slot.id} · ${slot.ip || slot.url}</option>`)}
+          </select>
+          <span class="text-2xs muted">授权与拉取账号资料都走这个代理槽，登录后账号绑定到该槽。</span>
+        </div>` : nothing}
       <div class="step-list">
         <div class="step ${stepClass(1)}">
           <span class="step-n">1</span>
@@ -99,11 +100,11 @@ export function openAddAccountDialog(options = {}) {
         </div>
         <div class="step ${stepClass(2)}">
           <span class="step-n">2</span>
-          <div class="step-t">在浏览器里打开下面的链接，或者用手机扫描二维码，登录并同意授权</div>
+          <div class="step-t">用浏览器打开链接或扫码，登录并同意授权</div>
         </div>
         ${authUrl ? html`
           <div class="qr-panel">
-            <div class="qr-image">${unsafeSVG(qrSvg(authUrl))}</div>
+            ${qrMarkup(authUrl) ? html`<div class="qr-image">${qrMarkup(authUrl)}</div>` : nothing}
             <div class="qr-side">
               <div class="field-label">授权链接</div>
               <div class="link-box" title=${authUrl}>${authUrl}</div>
@@ -111,7 +112,7 @@ export function openAddAccountDialog(options = {}) {
                 <button class="btn btn-outline btn-sm" @click=${() => copyWithToast(authUrl, '授权链接已复制')}>${icon('Copy')}复制链接</button>
                 <a class="btn btn-outline btn-sm" href=${authUrl} target="_blank" rel="noopener">${icon('ExternalLink')}打开链接</a>
               </div>
-              <div class="text-2xs muted">手机号登录也可以，扫码后按浏览器里的提示操作即可。</div>
+              <div class="text-2xs muted">手机号也可以登录，按浏览器提示操作。</div>
             </div>
           </div>` : nothing}
         <div class="step ${stepClass(3)}">
@@ -137,6 +138,12 @@ export function openAddAccountDialog(options = {}) {
     },
   });
 
+  acct.loadProxySlots().then((payload) => {
+    proxySlots = (payload && payload.slots) || [];
+    if (!proxySlots.some((slot) => slot.id === proxySlot)) proxySlot = '';
+    ctl.update();
+  }).catch(() => {});
+
   function stepClass(index) {
     if (index === 1) return phase === 'starting' ? 'active' : phase === 'idle' ? 'active' : 'done';
     if (index === 2) return phase === 'waiting' ? 'active' : phase === 'ok' || phase === 'failed' ? 'done' : '';
@@ -144,12 +151,12 @@ export function openAddAccountDialog(options = {}) {
   }
 
   function stepOneText() {
-    if (phase === 'starting') return '正在向 ' + REALM_NAME[realm] + ' 申请授权链接';
-    if (phase === 'failed') return '申请授权链接没有成功，可以点下方「重新生成链接」再试';
+    if (phase === 'starting') return spaceMixed('正在向' + channelLabel(realm) + '申请授权链接');
+    if (phase === 'failed') return '申请授权链接失败，请点「重新生成链接」再试';
     if (loginDomain) {
-      return '已向 ' + REALM_NAME[realm] + ' (' + loginDomain + ') 申请授权链接';
+      return spaceMixed('已向' + channelLabel(realm) + '（' + loginDomain + '）申请授权链接');
     }
-    return '已向 ' + REALM_NAME[realm] + ' 申请授权链接';
+    return spaceMixed('已向' + channelLabel(realm) + '申请授权链接');
   }
 
   function stopPolling() {
@@ -159,7 +166,7 @@ export function openAddAccountDialog(options = {}) {
     }
   }
 
-  // 关闭弹窗或切换版本时通知服务端放弃这次登录；失败要提示，否则服务端会一直保留这个登录窗口。
+  // 关闭弹窗或切换渠道时通知服务端放弃这次登录；失败要提示，否则服务端会一直保留这个登录窗口。
   function cancelCurrent() {
     if (!state) return Promise.resolve();
     const pending = state;
@@ -189,7 +196,7 @@ export function openAddAccountDialog(options = {}) {
     phase = 'starting';
     ctl.update();
     try {
-      const started = await acct.startLogin(realm, product);
+      const started = await acct.startLogin(realm, product, proxySlot);
       state = started.state;
       authUrl = started.authUrl;
       loginDomain = started.domain || '';

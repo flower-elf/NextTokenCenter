@@ -14,6 +14,8 @@ os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
 os.environ["WB_PROXY_USAGE_DIR"] = _TMP
 
 import wb_accounts
+import wb_channels
+import wb_codearts
 import wb_proxy as proxy
 import wb_settings
 
@@ -176,9 +178,10 @@ class SettingsSaveTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["test_model_intl"], "glm-5.3")
         self.assertEqual(wb_settings.test_model(self.directory, "intl"), "glm-5.3")
-        self.assertEqual(body["test_model_intl_default"], wb_settings.DEFAULT_TEST_MODEL)
         self.assertEqual(wb_settings.test_model(self.directory, "cn"),
                          wb_settings.DEFAULT_TEST_MODEL)
+        self.assertEqual([item["value"] for item in body["identity_options"]["codearts"]],
+                         ["ide", "cli"])
 
     def test_each_exit_keeps_its_own_value(self):
         self.save({"test_model_intl": "gpt-6-astra"})
@@ -219,23 +222,52 @@ class SettingsSaveTests(unittest.TestCase):
         self.assertEqual(wb_settings.test_model(self.directory, "intl"), "glm-5.3")
         self.assertEqual(wb_settings.test_model(self.directory, "cn"), "gpt-6-astra")
 
-    def test_disabled_models_are_stored_deduplicated_and_clearable(self):
-        status, body = self.save({"disabled_models": ["glm-5.3", "glm-5.3", " hy3 "]})
+    def test_model_toggle_changes_one_realm_only(self):
+        wb_settings.set_disabled_models(self.directory, ["default-model"])
+        status, body = self.save({"model_enabled": {"realm": "codearts", "model": "GLM-5.2",
+                                                    "enabled": False}})
         self.assertEqual(status, 200)
-        self.assertEqual(body["disabled_models"], ["glm-5.3", "hy3"])
-        self.assertFalse(wb_settings.model_served(self.directory, "glm-5.3"))
-        self.assertTrue(wb_settings.model_served(self.directory, "grok-4.7"))
-        status, body = self.save({"disabled_models": []})
-        self.assertEqual(status, 200)
-        self.assertEqual(body["disabled_models"], [])
-        self.assertTrue(wb_settings.model_served(self.directory, "glm-5.3"))
+        self.assertEqual(body["model_enabled"]["disabled_models"], ["GLM-5.2"])
+        self.assertFalse(wb_settings.model_served(self.directory, "glm-5.2", "codearts"))
+        self.assertTrue(wb_settings.model_served(self.directory, "glm-5.2", "cn"))
+        self.assertEqual(wb_settings.disabled_models(self.directory), ["default-model"])
+        status, body = self.save({"model_enabled": {"realm": "codearts", "model": "glm-5.2",
+                                                    "enabled": True}})
+        self.assertEqual(body["model_enabled"]["disabled_models"], [])
 
-    def test_a_disabled_models_value_that_is_not_a_list_is_refused(self):
-        for value in ("glm-5.3", 7, None, [7]):
-            with self.subTest(value=value):
-                status, body = self.save({"disabled_models": value})
+    def test_bad_toggles_are_refused(self):
+        wb_settings.set_disabled_models(self.directory, ["default-model"])
+        bad = ({"model_enabled": {"realm": "moon", "model": "glm-5.3", "enabled": False}},
+               {"model_enabled": {"realm": "cn", "model": "", "enabled": False}},
+               {"model_enabled": {"realm": "cn", "model": "glm-5.3", "enabled": "no"}})
+        for payload in bad:
+            with self.subTest(payload=payload):
+                status, _body = self.save(payload)
                 self.assertEqual(status, 400)
-        self.assertEqual(wb_settings.disabled_models(self.directory), [])
+        self.assertEqual(wb_settings.disabled_models(self.directory), ["default-model"])
+        self.assertEqual(wb_settings.disabled_models(self.directory, "codearts"), [])
+
+
+class SettingsIdentityOptionsTests(unittest.TestCase):
+    """设置视图暴露的出站身份选项与账号视图共用后端定义。"""
+
+    def test_settings_view_lists_both_provider_options(self):
+        with tempfile.TemporaryDirectory(prefix="identity-options-") as directory:
+            with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory, POOL=None):
+                view = proxy.runtime_settings_view()
+        options = view["identity_options"]
+        self.assertEqual(options["workbuddy"],
+                         [dict(item) for item in wb_channels.WORKBUDDY_IDENTITIES])
+        self.assertEqual(options["codearts"],
+                         [dict(item) for item in wb_codearts.IDENTITY_OPTIONS])
+        self.assertEqual([item["value"] for item in options["workbuddy"]],
+                         ["workbuddy", "vscode", "cli"])
+        self.assertEqual([item["label"] for item in options["workbuddy"]],
+                         ["WorkBuddy", "VS Code", "CLI"])
+        self.assertEqual([item["value"] for item in options["codearts"]],
+                         ["ide", "cli"])
+        self.assertEqual([item["label"] for item in options["codearts"]],
+                         ["IDE", "CLI"])
 
 
 if __name__ == "__main__":

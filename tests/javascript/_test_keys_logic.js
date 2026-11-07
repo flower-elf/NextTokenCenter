@@ -2,6 +2,7 @@
  * 运行：node tests/javascript/_test_keys_logic.js
  */
 import assert from 'node:assert/strict';
+import './_channels_fixture.js';
 
 import * as logic from '../../app/web/js/pages/keys/logic.js';
 
@@ -9,7 +10,7 @@ const now = new Date(2026, 9, 3, 12, 0, 0).getTime();
 const sec = (ms) => Math.floor(ms / 1000);
 
 const keyRow = (over = {}) => Object.assign({
-  id: 'key-a', name: '甲', realm: '', enabled: true, masked: 'wbk-******demo',
+  id: 'key-a', name: '甲', route: [], enabled: true, masked: 'wbk-******demo',
   models: [], expires_at: 0, quota_tokens: 0, quota_credit: 0, ip_allowlist: [], usage_reset_at: 0,
   usage: { requests: 0, total_tokens: 0, credit: 0, last_used_at: 0 },
 }, over);
@@ -124,8 +125,17 @@ assert.notEqual(logic.validateKeyForm(form({ keyValue: 'abc' })), '', '短于 4 
 assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd' })), '');
 assert.equal(logic.validateKeyForm(form({ editing: true, keyValue: '' })), '',
   '编辑时留空表示不修改，必须能保存');
-assert.notEqual(logic.validateKeyForm(form({ realm: 'us' })), '', '未知出口要拦下来');
-for (const realm of ['', 'intl', 'cn']) assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd', realm })), '');
+const REALMS = ['intl', 'cn', 'codearts'];
+assert.notEqual(logic.validateKeyForm(form({ keyValue: 'abcd', route: ['us'] }), REALMS), '', '未知渠道要拦下来');
+assert.notEqual(logic.validateKeyForm(form({ keyValue: 'abcd', route: ['cn', 'cn'] }), REALMS), '', '重复渠道要拦下来');
+const conflict = logic.validateKeyForm(form({ keyValue: 'abcd', route: ['intl', 'cn'] }), REALMS);
+assert.ok(conflict.includes('国际版') && conflict.includes('国内版'), '同一提供方的渠道互斥: ' + conflict);
+assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd', route: ['cn'] }), REALMS), '');
+assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd', route: ['cn', 'codearts'] }), REALMS), '');
+assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd', route: [] }), REALMS), '', '空路由表示跟随面板');
+assert.equal(logic.routeBindingText([]), '跟随面板默认路由');
+assert.equal(logic.routeBindingText(['cn']), '国内版');
+assert.equal(logic.routeBindingText(['cn', 'codearts']), '国内版 + CodeArts');
 
 for (const days of ['0', '-1', '1.5', '3651', '']) {
   assert.notEqual(logic.validateKeyForm(form({ keyValue: 'abcd', expiryMode: 'days', expiryDays: days })), '',
@@ -142,12 +152,18 @@ assert.ok(ipError.includes('10.0.0.999'), '不合法 IP 要在错误里指名道
 assert.equal(logic.validateKeyForm(form({ keyValue: 'abcd', ipText: '10.0.0.1\n192.168.0.0/16' })), '');
 
 // ---- 表单 → 载荷：省略字段表示保持原值，有效期是绝对时间戳
-const created = logic.buildKeyEntry(form({ keyValue: 'abcd', name: '  甲组  ', realm: 'cn', expiryMode: 'days', expiryDays: 7 }), now);
+assert.deepEqual(logic.formFromRow({}).route, [], '新密钥默认跟随面板');
+assert.equal(logic.formFromRow({}).follow, true);
+assert.deepEqual(logic.formFromRow({ route: ['cn', 'codearts'] }).route, ['cn', 'codearts']);
+assert.equal(logic.formFromRow({ route: ['cn'] }).follow, false);
+const created = logic.buildKeyEntry(form({ keyValue: 'abcd', name: '  甲组  ', route: ['cn', 'codearts'], expiryMode: 'days', expiryDays: 7 }), now);
 assert.equal(created.expires_at, sec(now) + 7 * 86400, '有效期要换算成绝对时间戳');
 assert.equal(created.name, '甲组');
-assert.equal(created.realm, 'cn');
+assert.deepEqual(created.route, ['cn', 'codearts'], '路由原样提交');
+assert.ok(!('realm' in created), '密钥只提交路由，不再提交单个渠道');
 assert.equal(created.enabled, true);
 assert.notEqual(created.name, '', '名字为空时要有兜底，不能提交空名字');
+assert.deepEqual(logic.buildKeyEntry(form({ keyValue: 'abcd' }), now).route, [], '空路由表示跟随面板默认路由');
 
 assert.equal(logic.buildKeyEntry(form({ keyValue: 'abcd', expiryMode: 'never' }), now).expires_at, 0);
 assert.ok(!('expires_at' in logic.buildKeyEntry(form({ keyValue: 'abcd', editing: true, expiryMode: 'keep' }), now)),
@@ -183,10 +199,13 @@ assert.equal(servedPayload.quota_tokens, 10);
 assert.equal(servedPayload.quota_credit, 1);
 assert.deepEqual(servedPayload.ip_allowlist, ['10.0.0.1']);
 
-const oldRow = { id: 'key-old', name: '旧服务端', realm: 'intl', enabled: true };
+const oldRow = { id: 'key-old', name: '旧服务端', route: ['intl'], enabled: true };
 const oldPayload = logic.keyRowPayload(oldRow);
-assert.deepEqual(Object.keys(oldPayload).sort(), ['enabled', 'id', 'key', 'name', 'realm'],
-  '旧字段照旧提交，新字段不在行里就不要带上: ' + JSON.stringify(oldPayload));
+assert.deepEqual(Object.keys(oldPayload).sort(), ['enabled', 'id', 'key', 'name', 'route'],
+  '固定字段照旧提交，扩展字段不在行里就不要带上: ' + JSON.stringify(oldPayload));
+assert.deepEqual(oldPayload.route, ['intl']);
+assert.deepEqual(logic.keyRowPayload({ id: 'key-none', name: '无路由', enabled: true }).route, [],
+  '行里没有路由时按跟随面板提交');
 assert.equal(oldPayload.key, '', '列表里没有明文，空值表示保持原值（服务端口径）');
 
 const rows = [keyRow({ id: 'k1', name: '甲' }), keyRow({ id: 'k2', name: '乙' }), keyRow({ id: 'k3', name: '丙' })];

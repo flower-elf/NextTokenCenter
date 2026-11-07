@@ -22,15 +22,14 @@ import release_tools as tools  # noqa: E402
 # 发布要求仓库持续运行的腿。gate 从 tests.yml 推导它们，
 # 这个元组用于核对推导结果。
 EXPECTED_LEGS = (
-    "ubuntu-latest / python 3.9",
     "ubuntu-latest / python 3.12",
     "windows-latest / python 3.12",
 )
 
 # Windows CPython 把这些模块静态链接进 python312.dll，包内运行时没有对应的 Lib
-# 文件可要求。Linux 构建把 math 做成共享模块，所以宿主机的
+# 文件可要求。Linux 构建把 math 与 zlib 做成共享模块，所以宿主机的
 # sys.builtin_module_names 代表不了 Windows 运行时实际内置的模块。
-WINDOWS_BUILTINS = {"math"}
+WINDOWS_BUILTINS = {"math", "zlib"}
 
 
 def read(*parts):
@@ -40,7 +39,8 @@ def read(*parts):
 
 def make_runtime(directory, extra=()):
     """伪造一个能通过 portable_runtime.verify() 的运行时目录。"""
-    for rel in list(portable_runtime.REQUIRED_FILES) + list(extra):
+    for rel in (list(portable_runtime.REQUIRED_FILES)
+                + list(portable_runtime.SITE_PACKAGE_FILES) + list(extra)):
         path = os.path.join(directory, *rel.split("/"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
@@ -321,10 +321,12 @@ class RuntimeTrimTests(unittest.TestCase):
                         if m not in local and m not in sys.builtin_module_names
                         and m not in WINDOWS_BUILTINS)
         self.assertTrue(needed)
-        covered = set(portable_runtime.REQUIRED_FILES)
+        covered = set(portable_runtime.REQUIRED_FILES) | set(portable_runtime.SITE_PACKAGE_FILES)
         missing = [m for m in needed
                    if ("Lib/%s.py" % m) not in covered
-                   and ("Lib/%s/__init__.py" % m) not in covered]
+                   and ("Lib/%s/__init__.py" % m) not in covered
+                   and ("Lib/site-packages/%s.py" % m) not in covered
+                   and ("Lib/site-packages/%s/__init__.py" % m) not in covered]
         self.assertEqual(missing, [], "这些导入没有出现在运行时常量表里：%s" % missing)
 
     def test_the_documented_trim_is_exactly_what_goes(self):
@@ -365,6 +367,99 @@ class RuntimeTrimTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 portable_runtime.verify(directory)
 
+    def test_verify_rejects_a_runtime_without_the_bundled_packages(self):
+        # 少了 wheel 的运行时解压后 import 直接失败，必须在打包前拦住。
+        for rel in ("Lib/site-packages/brotli.py",
+                    "Lib/site-packages/zstandard/backend_c.cp312-win_amd64.pyd",
+                    "Lib/site-packages/cryptography/hazmat/bindings/_rust.pyd"):
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory(prefix="relrt-") as directory:
+                make_runtime(directory)
+                os.remove(os.path.join(directory, *rel.split("/")))
+                with self.assertRaises(SystemExit):
+                    portable_runtime.verify(directory)
+
+    def test_verify_rejects_the_builds_own_pip(self):
+        # 构建自带的 site-packages 只有 pip；装回去会让包多出几十 MB 且无用途。
+        with tempfile.TemporaryDirectory(prefix="relrt-") as directory:
+            make_runtime(directory)
+            os.makedirs(os.path.join(directory, "Lib", "site-packages", "pip"))
+            with self.assertRaises(SystemExit):
+                portable_runtime.verify(directory)
+
+
+class BundledWheelTests(unittest.TestCase):
+    """便携运行时的第三方包必须是固定、可核对的 wheel。"""
+
+    def test_every_wheel_is_pinned_by_name_version_hash_and_url(self):
+        seen = set()
+        for name, version, filename, digest, url in portable_runtime.BUNDLED_WHEELS:
+            self.assertTrue(filename.startswith("%s-%s-" % (name, version)), filename)
+            self.assertRegex(digest, r"^[0-9a-f]{64}$", filename)
+            self.assertTrue(url.startswith("https://files.pythonhosted.org/"), url)
+            self.assertTrue(url.endswith("/" + filename), url)
+            self.assertNotIn(filename, seen, "wheel 重复登记：%s" % filename)
+            seen.add(filename)
+        names = [n for n, *_ in portable_runtime.BUNDLED_WHEELS]
+        for name in ("cryptography", "brotli", "zstandard"):
+            self.assertIn(name, names)
+
+    def test_requirements_file_pins_the_same_versions(self):
+        # 两个分发渠道必须装同一版本；否则 CI 通过、绿色包里的却是另一份。
+        pinned = {}
+        for line in read("requirements.txt").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            dep = line.split(";", 1)[0].strip()
+            name, sep, version = dep.partition("==")
+            self.assertTrue(sep, "requirements 里的 %s 没有固定版本" % dep)
+            pinned.setdefault(name.strip(), set()).add(version.strip())
+        for name, version, *_ in portable_runtime.BUNDLED_WHEELS:
+            self.assertIn(version, pinned.get(name, set()),
+                          "%s %s 没有写进 requirements.txt" % (name, version))
+
+    def _fake_wheel(self, directory, digest=None):
+        wheels = os.path.join(directory, "wheels")
+        os.makedirs(wheels)
+        filename = "demo-1.0-py3-none-any.whl"
+        path = os.path.join(wheels, filename)
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("demo/__init__.py", b"VALUE = 1\n")
+            zf.writestr("demo-1.0.dist-info/METADATA", b"Name: demo\n")
+        if digest is None:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        saved = portable_runtime.BUNDLED_WHEELS
+        portable_runtime.BUNDLED_WHEELS = (
+            ("demo", "1.0", filename, digest, "https://files.pythonhosted.org/" + filename),)
+        self.addCleanup(setattr, portable_runtime, "BUNDLED_WHEELS", saved)
+        return wheels, filename
+
+    def test_install_wheels_unpacks_into_site_packages(self):
+        with tempfile.TemporaryDirectory(prefix="relwhl-") as directory:
+            wheels, _ = self._fake_wheel(directory)
+            count = portable_runtime.install_wheels(os.path.join(directory, "rt"), wheels)
+            self.assertEqual(count, 2)
+            base = os.path.join(directory, "rt", "Lib", "site-packages")
+            self.assertTrue(os.path.isfile(os.path.join(base, "demo", "__init__.py")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(base, "demo-1.0.dist-info", "METADATA")))
+
+    def test_install_wheels_rejects_a_tampered_file(self):
+        with tempfile.TemporaryDirectory(prefix="relwhl-") as directory:
+            wheels, _ = self._fake_wheel(directory, digest="0" * 64)
+            with self.assertRaises(SystemExit):
+                portable_runtime.install_wheels(os.path.join(directory, "rt"), wheels)
+            self.assertFalse(os.path.exists(os.path.join(directory, "rt")))
+
+    def test_fetch_wheels_reuses_a_verified_file(self):
+        # 已下载且校验和正确的 wheel 不再联网：离线构建与重跑都靠这条。
+        # 校验和不符时 URL 会真的被访问并失败，所以这条同时证明没有联网。
+        with tempfile.TemporaryDirectory(prefix="relwhl-") as directory:
+            wheels, filename = self._fake_wheel(directory)
+            paths = portable_runtime.fetch_wheels(wheels)
+            self.assertEqual(paths, [os.path.join(wheels, filename)])
+
 
 class PortableZipTests(unittest.TestCase):
     # 版本从当前检出的源码读取。版本号更新后工具必须照常构建，
@@ -391,6 +486,10 @@ class PortableZipTests(unittest.TestCase):
                              sorted(files))
             self.assertIn("%s/python/python.exe" % root, names)
             self.assertIn("%s/python/Lib/os.py" % root, names)
+            # site-packages 里的固定 wheel 也要进包，否则解压就 import 失败。
+            self.assertIn("%s/python/Lib/site-packages/brotli.py" % root, names)
+            self.assertIn("%s/python/Lib/site-packages/cryptography/__init__.py" % root,
+                          names)
 
     def test_the_archive_is_not_a_source_archive(self):
         # 不带运行时的 ZIP 起不了网关，构建器不许产出这种产物。
@@ -447,6 +546,9 @@ class PortableZipTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["prefix"], "python/")
             self.assertEqual(manifest["runtime"]["python"], portable_runtime.RUNTIME_VERSION)
             self.assertGreater(manifest["runtime"]["files"], 0)
+            # 第三方包也在运行时子树里；列出名字与版本，便于核对发布内容。
+            self.assertEqual(manifest["runtime"]["packages"],
+                             {n: v for n, v, *_ in portable_runtime.BUNDLED_WHEELS})
 
     def test_the_launchers_look_where_the_runtime_is(self):
         # 打包路径与启动脚本探测的路径必须一致，否则包会悄悄回退到系统解释器。
@@ -459,7 +561,7 @@ class PortableZipTests(unittest.TestCase):
 
     def test_the_archive_root_matches_the_package_layout(self):
         # 解压产物只含一个顶层目录，启动脚本与更新路径据此保持一致。
-        self.assertEqual(tools.PACKAGE_ROOT, "wb-proxy-center")
+        self.assertEqual(tools.PACKAGE_ROOT, "next-token-center")
 
     def test_archive_paths_are_safe(self):
         with tempfile.TemporaryDirectory(prefix="relzip-") as directory:
@@ -527,7 +629,7 @@ class ReleaseBodyTests(unittest.TestCase):
     def test_first_compose_has_the_marker_and_the_fixed_block(self):
         body = tools.compose_body("", self.block)
         self.assertIn(tools.MARKER, body)
-        for expected in ("## 下载说明", "wb-proxy-center-v0.2.0.zip", "checksums.txt"):
+        for expected in ("## 下载说明", "next-token-center-v0.2.0.zip", "checksums.txt"):
             self.assertIn(expected, body)
 
     def test_maintainer_notes_above_the_marker_survive(self):
@@ -546,7 +648,7 @@ class ReleaseBodyTests(unittest.TestCase):
 class MatrixLegsTests(unittest.TestCase):
     """release gate 明确列出每条腿，不信任汇总结果。"""
 
-    def test_the_repository_matrix_is_the_expected_three(self):
+    def test_the_repository_matrix_is_the_expected_two(self):
         self.assertEqual(tuple(matrix_legs.legs()), EXPECTED_LEGS)
 
     def test_dropping_a_leg_narrows_what_the_gate_requires(self):
@@ -555,7 +657,7 @@ class MatrixLegsTests(unittest.TestCase):
         text = read(".github", "workflows", "tests.yml")
         without = text.replace('          - os: windows-latest\n            python: "3.12"\n', "")
         self.assertNotEqual(without, text, "tests.yml 里没有找到预期的 windows 腿")
-        self.assertEqual(tuple(matrix_legs.legs(without)), EXPECTED_LEGS[:2])
+        self.assertEqual(tuple(matrix_legs.legs(without)), EXPECTED_LEGS[:1])
 
     def test_an_unparseable_matrix_yields_nothing(self):
         # 返回空列表代表 gate 必须拒绝，不能理解成无需检查的腿。
@@ -825,7 +927,7 @@ class PackageWorkflowTests(unittest.TestCase):
         self.assertLess(package.index("portable_runtime.py download"),
                         package.index("portable_runtime.py prepare"))
         self.assertNotIn("$RUNTIME_URL", package)
-        self.assertIn("dist/wb-proxy-center-v$VERSION.zip", package)
+        self.assertIn("dist/next-token-center-v$VERSION.zip", package)
         self.assertIn("path: dist/*.zip", package)
         self.assertIn('gh release view "$TAG"', package)
         self.assertIn('gh release upload "$TAG" dist/*.zip --clobber', package)
@@ -849,6 +951,29 @@ class PackageWorkflowTests(unittest.TestCase):
         ignored = read(".gitignore")
         for pattern in ("accounts/*.json", "usage/*.jsonl"):
             self.assertIn(pattern, ignored)
+
+
+class DependencyChannelTests(unittest.TestCase):
+    """三个第三方包要在每个分发渠道都装上。"""
+
+    def test_the_test_workflow_installs_them_before_the_suites(self):
+        text = read(".github", "workflows", "tests.yml")
+        self.assertIn("-r requirements.txt", text)
+        self.assertLess(text.index("-r requirements.txt"), text.index("tests/run_all.py"))
+
+    def test_the_docker_image_installs_the_requirements(self):
+        text = read("Dockerfile")
+        self.assertIn("COPY requirements.txt", text)
+        self.assertIn("-r requirements.txt", text)
+        self.assertNotIn("no pip dependencies", text)
+
+    def test_the_package_job_fetches_the_wheels_and_checks_the_imports(self):
+        package = read(".github", "workflows", "package.yml")
+        self.assertIn("portable_runtime.py wheels", package)
+        self.assertIn("--wheels", package)
+        self.assertIn("import cryptography, brotli, zstandard", package)
+        self.assertLess(package.index("portable_runtime.py wheels"),
+                        package.index("portable_runtime.py prepare"))
 
 
 if __name__ == "__main__":

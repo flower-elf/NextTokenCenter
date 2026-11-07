@@ -28,7 +28,7 @@ import {
   limitTitle,
   modelLimitText,
   quotaExceeded,
-  realmBindingText,
+  routeBindingText,
   summarizeKeys,
   startupKeyRow,
   usageLines,
@@ -148,7 +148,7 @@ export function mount(host, ctx) {
     }
     confirmDialog({
       title: '停用这个密钥？',
-      desc: `停用后，使用密钥「${row.name || '未命名'}」的客户端会立即收到 401。随时可以再启用。`,
+      desc: `停用后，使用密钥「${row.name || '未命名'}」的客户端会立即收到 401。`,
       confirmText: '停用',
       danger: true,
       onConfirm: apply,
@@ -162,7 +162,7 @@ export function mount(host, ctx) {
     }
     confirmDialog({
       title: '重置用量？',
-      desc: `将把密钥「${row.name || '未命名'}」的 Token 与积分统计清零，配额从零开始计算。已经发生的调用记录不会删除。`,
+      desc: `将把密钥「${row.name || '未命名'}」的 Token 与积分统计清零，调用记录保留。`,
       confirmText: '重置',
       onConfirm: () => enqueue(
         () => submit({ reset_key_usage: row.id }, `已重置密钥「${row.name || '未命名'}」的用量`)),
@@ -172,7 +172,7 @@ export function mount(host, ctx) {
   function removeRow(row) {
     confirmDialog({
       title: '删除密钥',
-      desc: `将删除密钥「${row.name || '未命名'}」。使用它的客户端会立即收到 401，此操作无法撤销。`,
+      desc: `删除后无法撤销，使用密钥「${row.name || '未命名'}」的客户端会立即收到 401。`,
       confirmText: '删除',
       danger: true,
       onConfirm: () => enqueue(async () => {
@@ -192,7 +192,7 @@ export function mount(host, ctx) {
 
   function limitCell(row) {
     return html`
-      <div class="col" style="gap:2px" title=${limitTitle(row)}>
+      <div class="col col-tight" title=${limitTitle(row)}>
         <span class="text-xs">${ipLimitText(row)}</span>
         <span class="text-2xs muted">${modelLimitText(row)}</span>
       </div>`;
@@ -202,7 +202,7 @@ export function mount(host, ctx) {
     const [first, quota] = usageLines(row);
     const exceeded = quotaExceeded(row);
     return html`
-      <div class="col" style="gap:2px">
+      <div class="col col-tight">
         <span class="text-xs nums">${first}</span>
         ${quota ? html`<span class="text-2xs ${exceeded ? 'tone-danger' : 'muted'} nums">${quota}</span>` : nothing}
       </div>`;
@@ -223,7 +223,7 @@ export function mount(host, ctx) {
     const kind = summary.kind === 'none' || summary.kind === 'open' || summary.kind === 'locked' ? 'warn' : 'info';
     const startup = startupKeyRow(state.view);
     return html`
-      <div class="col" style="gap:8px">
+      <div class="col">
         <div class="notice notice-${kind}">${icon(kind === 'warn' ? 'TriangleAlert' : 'ShieldCheck')}
           <div class="grow">${summary.text}</div>
         </div>
@@ -250,7 +250,7 @@ export function mount(host, ctx) {
                 <th>名称</th>
                 <th>密钥</th>
                 <th>状态</th>
-                <th>出口绑定</th>
+                <th>渠道路由</th>
                 <th>有效期</th>
                 <th>限制</th>
                 <th>已用</th>
@@ -262,16 +262,16 @@ export function mount(host, ctx) {
               ${rows.map((row, index) => html`
                 <tr>
                   <td>
-                    <div class="col" style="gap:2px">
+                    <div class="col col-tight">
                       <span class="text-sm medium">${row.name || '未命名'}</span>
                       <span class="text-2xs muted">${index + 1} · ${row.created_at || '创建时间未知'}</span>
                     </div>
                   </td>
                   <td><code class="cell-mono">${keyDisplay(row)}</code></td>
                   <td>${statusBadge(row)}</td>
-                  <td><span class="text-xs">${realmBindingText(row.realm)}</span></td>
+                  <td><span class="text-xs">${routeBindingText(row.route)}</span></td>
                   <td>
-                    <div class="col" style="gap:2px">
+                    <div class="col col-tight">
                       <span class="text-xs nums">${expiryText(row)}</span>
                       ${Number(row.expires_at) ? html`<span class="text-2xs muted">${expiryHint(row)}</span>` : nothing}
                     </div>
@@ -294,7 +294,7 @@ export function mount(host, ctx) {
               <div class="row-wrap text-2xs muted">
                 <code class="cell-mono">${keyDisplay(row)}</code>
                 <span>·</span>
-                <span>${realmBindingText(row.realm)}</span>
+                <span>${routeBindingText(row.route)}</span>
               </div>
               <div class="row-wrap text-2xs muted">
                 <span>${expiryText(row)}</span>
@@ -303,7 +303,7 @@ export function mount(host, ctx) {
                 <span>·</span>
                 <span>${modelLimitText(row)}</span>
               </div>
-              <div class="col" style="gap:2px">
+              <div class="col col-tight">
                 ${[usageLines(row)[0], usageLines(row)[1]].filter(Boolean).map((line) => html`<span class="text-2xs nums muted">${line}</span>`)}
                 <span class="text-2xs muted">最近使用 ${lastUsedText(row)}</span>
               </div>
@@ -343,7 +343,7 @@ export function mount(host, ctx) {
           : html`<div class="card">${emptyState({
               icon: 'KeyRound',
               title: '暂无 API 密钥',
-              desc: '创建一个密钥，客户端即可用 OpenAI SDK 或 Claude Code 调用本网关。',
+              desc: '创建一个密钥，客户端即可调用本网关。',
               action: html`<button class="btn btn-primary btn-sm" @click=${openCreate}>${icon('Plus')}新建密钥</button>`,
             })}</div>`}
         ${state.rows.length ? html`
@@ -352,7 +352,7 @@ export function mount(host, ctx) {
   }
 
   function desc() {
-    return '对外网关的分发密钥，支持出口绑定、有效期、IP 白名单、模型限制与配额。';
+    return '对外网关的分发密钥。';
   }
 
   load();

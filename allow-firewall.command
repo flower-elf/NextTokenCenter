@@ -55,7 +55,7 @@ py_ok() {
   elif ! command -v "$1" >/dev/null 2>&1; then
     return 1
   fi
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1
 }
 for cand in "$HERE/python/bin/python3" python3 /usr/bin/python3 \
             /opt/homebrew/bin/python3 /usr/local/bin/python3 python; do
@@ -63,7 +63,7 @@ for cand in "$HERE/python/bin/python3" python3 /usr/bin/python3 \
 done
 
 if [ -z "$PYEXE" ]; then
-  echo "No Python 3.9+ found, so there is nothing to allow yet."
+  echo "No Python 3.12+ found, so there is nothing to allow yet."
   exit 1
 fi
 PYREAL="$("$PYEXE" -c 'import sys; print(sys.executable)' 2>/dev/null || echo "$PYEXE")"

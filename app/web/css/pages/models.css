@@ -1,4 +1,4 @@
-/* 模型页：目录来源、筛选条与模型表格。 */
+/* 模型页：目录来源、模型别名、筛选条与模型表格。 */
 
 .models-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .models-filter .chips { flex: 1 1 360px; }
@@ -6,19 +6,15 @@
 .models-filter-tail { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .models-filter-tail .text-2xs { text-align: right; }
 
-.model-cell { display: flex; flex-direction: column; gap: 2px; min-width: 150px; }
-.model-cell .badge { line-height: 16px; }
+.models-alias .card-head { margin-bottom: 8px; }
+.models-alias .card-sub { margin-top: 4px; }
+.alias-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.alias-row { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; }
+.alias-row svg.lucide, .alias-form > svg.lucide { width: 14px; height: 14px; flex: none; color: var(--muted-foreground); }
+.alias-row .btn { margin-left: auto; flex: none; }
+.alias-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.alias-form .input { flex: 1 1 220px; min-width: 0; }
 
-.effort {
-  display: inline-flex; align-items: center; padding: 0 7px; border-radius: 9999px;
-  background: color-mix(in srgb, var(--violet) 12%, transparent); color: var(--violet);
-  font-size: 11px; line-height: 18px; text-transform: lowercase;
-}
+.model-cell { display: flex; flex-direction: column; gap: 2px; min-width: 150px; }
 
 .table tbody tr.row-off, .mobile-item.row-off { opacity: .55; }
-
-.models-foot {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
-  padding: 10px 16px; font-size: 11px; color: var(--muted-foreground);
-  border-top: 1px solid color-mix(in oklab, var(--border) 40%, transparent);
-}

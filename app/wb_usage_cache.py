@@ -37,11 +37,12 @@ _USAGE_CACHE_NAME = "usage-aggregate-cache.json"
 _USAGE_CACHE_KIND_NAME = "usage-aggregate-cache-%s.json"
 # 状态结构或折叠口径一变就 +1，旧文件整体作废：键顺序算结构的一部分。v2 写盘
 # 按插入顺序；v3 加按日分桶与日/小时时间序列；v4 一类一份文件（快照/analytics 的
-# 日桶带小时子表、series 带分钟环）；v5 "pricing" 记录折叠行真正用到的价（T15）。
+# 日桶带小时子表、series 带分钟环）；v5 "pricing" 记录折叠行真正用到的价（T15）；
+# v6 每个桶带 credit_missing（上游没报扣费的行数，费用估算据此判「未采集」）。
 # 形状对不上就整份作废：升级后第一次刷新全量重折一次，之后 checkpoint 照旧；
 # 价表再变只按「用到的价」判废。升级前的单文件是 v3，只读兼容，作为各类还没有
 # 自己文件时的回退来源。
-_USAGE_CACHE_SCHEMA = 5
+_USAGE_CACHE_SCHEMA = 6
 # 升级前唯一布局的版本号：v3 单文件。只出现在只读回退路径上。
 _USAGE_CACHE_LEGACY_SCHEMA = 3
 _USAGE_CACHE_KINDS = ("snapshot", "by_account", "analytics", "series",
@@ -238,7 +239,7 @@ def _usage_cache_numbers(kind):
 
 _USAGE_CACHE_SNAPSHOT_MAPS = ("cost_missing", "by_model", "by_model_realm", "by_model_acct")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
-                "cached_tokens", "total_tokens", "credit")
+                "cached_tokens", "total_tokens", "credit", "credit_missing")
 
 _USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS
 

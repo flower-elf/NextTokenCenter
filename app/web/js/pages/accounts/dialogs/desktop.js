@@ -2,6 +2,7 @@
 import { html, nothing } from '../../../core/dom.js';
 import { icon } from '../../../core/icons.js';
 import { getState } from '../../../core/store.js';
+import { channelLabel } from '../../../core/channels.js';
 import { openDialog } from '../../../ui/dialog.js';
 import { busyClick, notice } from '../../../ui/widgets.js';
 import { toast, toastError } from '../../../ui/toast.js';
@@ -19,10 +20,10 @@ export function openDesktopScanDialog() {
 
   const ctl = openDialog({
     title: '本机桌面客户端账号',
-    desc: '只读检测本机桌面客户端已经登录的账号，点「导入」才会加入网关。国际版账号归入国际版列表，国内版账号归入国内版列表。',
+    desc: '只读检测本机桌面客户端已登录的账号，点「导入」才会加入网关。',
     width: 720,
     body: () => html`
-      ${notice('info', '桌面客户端自 2026-09-24 起把令牌改成加密存储，扫描到的凭证可能无法直接使用。这个入口暂时不在页面上显示，保留给排查问题时使用。')}
+      ${notice('info', '桌面客户端把令牌改成加密存储，扫描到的凭证可能无法使用。')}
       ${error ? notice('warn', error) : nothing}
       ${detected === null ? html`<p class="text-xs muted">正在检测本机桌面客户端账号…</p>` : scanHtml()}`,
     foot: () => html`
@@ -57,7 +58,7 @@ export function openDesktopScanDialog() {
                   </tr>`)}
               </tbody>
             </table>
-          </div>` : html`<div class="text-2xs muted">未检测到该版本的账号</div>`}
+          </div>` : html`<div class="text-2xs muted">未检测到该渠道的账号</div>`}
       </div>`;
   }
 
@@ -65,7 +66,7 @@ export function openDesktopScanDialog() {
     const valid = detected.filter((item) => item.valid);
     const bad = detected.filter((item) => !item.valid);
     if (!detected.length) {
-      return html`<p class="text-xs muted">没有在本机检测到桌面客户端的登录凭证。确认已经安装并登录客户端之后点「重新扫描」。</p>`;
+      return html`<p class="text-xs muted">没有检测到登录凭证，确认客户端已登录后点「重新扫描」。</p>`;
     }
     return html`
       ${section('国际版 (www.workbuddy.ai)', valid.filter((item) => item.realm !== 'cn'))}
@@ -101,11 +102,12 @@ export function openDesktopScanDialog() {
       const response = await acct.importDesktopCredential(item.path, item.realm);
       const imported = (response.imported || [])[0] || {};
       const name = imported.nickname || String(imported.uid || '').slice(0, 8);
-      toast.success('已导入 ' + name, imported.realm === 'cn' ? '归入国内版列表' : '归入国际版列表');
+      const label = imported.realm ? channelLabel(imported.realm) : '';
+      toast.success('已导入 ' + name, label ? '归入' + label + '列表' : '');
       acct.notifyAccountsChanged();
       await scan();
       if (imported.realm && imported.realm !== getState().viewRealm) {
-        toast.info('这个账号属于' + (imported.realm === 'cn' ? '国内版' : '国际版') + '列表', '切换右上角「查看的版本」即可看到它');
+        toast.info('这个账号属于' + label + '列表', '切换右上角「查看的渠道」即可看到它');
       }
     } catch (err) {
       toastError('导入失败', err);

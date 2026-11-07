@@ -80,6 +80,32 @@ class FingerprintSanitizationTests(unittest.TestCase):
         self.assertIn(clean, sanitized[3]["content"])
         self.assertNotIn("from OhMyOpenCode", sanitized[3]["content"])
 
+class ClaudeCodeIntroTests(unittest.TestCase):
+    """Claude Code 自述首段整句中性化，其余提示词保持原样。"""
+
+    def test_intro_is_replaced(self):
+        text = ("You are Claude Code, Anthropic's official CLI tool for Claude. "
+                "Use the read tool first.")
+        self.assertEqual(
+            S.sanitize_text(text),
+            "You are a helpful AI assistant. Use the read tool first.")
+
+    def test_curly_apostrophe_and_code_suffix(self):
+        text = ("You are Claude Code, Anthropic’s official CLI for Claude Code. "
+                "Keep the rest.")
+        self.assertEqual(
+            S.sanitize_text(text),
+            "You are a helpful AI assistant. Keep the rest.")
+
+    def test_lowercase_intro_is_detected(self):
+        text = "you are claude code, anthropic's official cli tool for claude."
+        self.assertEqual(S.sanitize_text(text), "You are a helpful AI assistant.")
+
+    def test_unrelated_claude_text_untouched(self):
+        text = "You are Claude Code. Use the read tool first."
+        self.assertEqual(S.sanitize_text(text), text)
+
+
 class DshSystemRewriteTests(unittest.TestCase):
     """DSH 的 system 自我介绍触发上游渠道校验时的改写。"""
 

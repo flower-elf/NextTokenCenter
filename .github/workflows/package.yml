@@ -41,8 +41,14 @@ jobs:
       run: echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
     - name: Fetch pinned runtime
       run: python release/portable_runtime.py download --out "${{ runner.temp }}/runtime.tar.gz"
+    - name: Fetch pinned wheels
+      run: python release/portable_runtime.py wheels --out "${{ runner.temp }}/wheels"
     - name: Prepare trimmed runtime
-      run: python release/portable_runtime.py prepare --tarball "${{ runner.temp }}/runtime.tar.gz" --dest python
+      run: python release/portable_runtime.py prepare --tarball "${{ runner.temp }}/runtime.tar.gz" --dest python --wheels "${{ runner.temp }}/wheels"
+    - name: Check the bundled interpreter imports the dependencies
+      # 打包失败要在上传前暴露：site-packages 里少了 wheel，便携包解压即报错。
+      # -B 防止 import 写出 __pycache__，verify 要求运行时树里没有字节码。
+      run: python\python.exe -B -c "import cryptography, brotli, zstandard"
     - name: Build portable package
       shell: bash
       env:
@@ -51,10 +57,10 @@ jobs:
       run: |
         python release/release_tools.py portable \
           --version "$VERSION" --tag "$TAG" --runtime python \
-          --out "dist/wb-proxy-center-v$VERSION.zip"
+          --out "dist/next-token-center-v$VERSION.zip"
     - uses: actions/upload-artifact@v4
       with:
-        name: wb-proxy-center-v${{ steps.version.outputs.value }}
+        name: next-token-center-v${{ steps.version.outputs.value }}
         path: dist/*.zip
     - name: Attach to release
       shell: bash
