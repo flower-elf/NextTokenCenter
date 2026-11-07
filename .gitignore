@@ -1,5 +1,7 @@
 # 核心机密数据（千万不能上传到公共仓库）
 accounts/*.json
+# 切换渠道时网关自己留的备份：文件名不以 .json 结尾，单独挡一道
+accounts/*.bak*
 accounts/agent-backups/
 accounts/codearts/
 !accounts/README.txt
