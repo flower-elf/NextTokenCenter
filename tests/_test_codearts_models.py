@@ -89,6 +89,7 @@ try:
     check("status 200", status == 200, (status, payload))
     ids = [m["id"] for m in payload["data"]]
     check("ids", set(ids) == {"GLM-5.2", "GLM-4.7", "Qwen3-VL-235B",
+                              "deepseek-v4-flash-0731",
                               "deepseek-v4-pro-0901"}, ids)
     check("owned_by", payload["data"][0]["owned_by"] == "codearts")
     check("provider", payload["data"][0]["provider"] == "codearts")

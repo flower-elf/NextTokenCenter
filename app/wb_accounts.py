@@ -2861,6 +2861,10 @@ class SessionAffinity(object):
         self.max_entries = max_entries
         self.history = max(1, int(history))
         self.bindings = {}
+        # 会话键 -> {模型: 已在绑定账号上消耗的 Token}；换号或解绑时清掉。
+        self.tokens = {}
+        # 会话键 -> 上一次换号的时间；冷却期内不再轮换，避免反复丢失前缀缓存。
+        self.rotated = {}
         self._lock = threading.Lock()
     def _live(self, key, now):
         """这个会话未过期的条目，其余就地丢弃。"""
@@ -2870,6 +2874,8 @@ class SessionAffinity(object):
             self.bindings[key] = live
         else:
             self.bindings.pop(key, None)
+            self.tokens.pop(key, None)
+            self.rotated.pop(key, None)
         return live
     def get(self, key):
         """上一轮去的账号（顺延其过期时间）；没有则返回 None。"""
@@ -2887,17 +2893,72 @@ class SessionAffinity(object):
         with self._lock:
             return [uid for uid, _exp in self._live(key, time.time())]
     def bind(self, key, uid):
-        """把 `uid` 置于队首，去重并保留最近 `history` 个。"""
+        """把 `uid` 置于队首，去重并保留最近 `history` 个。换号时清空已消耗的
+        Token 计数，新账号从零开始算单会话阈值。"""
         if not key or not uid: return
         now = time.time()
         with self._lock:
             if len(self.bindings) >= self.max_entries:
                 self.bindings = {k: v for k, v in self.bindings.items()
                                  if v and v[0][1] > now}
-            entries = [entry for entry in (self.bindings.get(key) or [])
-                       if entry[0] != uid]
+                self.tokens = {k: v for k, v in self.tokens.items()
+                               if k in self.bindings}
+                self.rotated = {k: v for k, v in self.rotated.items()
+                                if k in self.bindings}
+            current = self.bindings.get(key) or []
+            previous = current[0][0] if current else None
+            entries = [entry for entry in current if entry[0] != uid]
+            if previous != uid:
+                self.tokens.pop(key, None)
+                if previous:
+                    self.rotated[key] = now
             entries.insert(0, (uid, now + self.ttl))
             self.bindings[key] = entries[:self.history]
+    def consume(self, key, models, tokens):
+        """累加一段会话在若干模型别名上消耗的 Token；只有存在绑定的会话才计数。"""
+        if not key: return
+        try:
+            amount = float(tokens or 0)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0: return
+        if isinstance(models, str):
+            models = [models]
+        names = []
+        for name in (models or []):
+            name = str(name or "")
+            if name not in names:
+                names.append(name)
+        if not names:
+            names = [""]
+        with self._lock:
+            if key not in self.bindings:
+                return
+            per_model = self.tokens.setdefault(key, {})
+            for name in names:
+                per_model[name] = per_model.get(name, 0.0) + amount
+    def usage(self, key, model):
+        """这段会话在指定模型上累计消耗的 Token。"""
+        if not key: return 0.0
+        with self._lock:
+            per_model = self.tokens.get(key) or {}
+            if model in per_model:
+                return per_model[model]
+            lower = str(model or "").lower()
+            for mid, used in per_model.items():
+                if str(mid).lower() == lower:
+                    return used
+            return 0.0
+    def rotated_at(self, key):
+        """上一次换号的时间；没有换过时为 0。"""
+        if not key: return 0.0
+        with self._lock:
+            return self.rotated.get(key, 0.0)
+    def reset_usage(self, key):
+        """清空一段会话的 Token 计数，用于绑定不变但已经触发过轮换的情况。"""
+        if not key: return
+        with self._lock:
+            self.tokens.pop(key, None)
     def demote(self, key, uid=None):
         """从会话里丢掉一个账号，其余保留。失败路径用它替代 unbind：刚失败的账号不能
         接下一次尝试，排在它前面的账号可能还持有会话前缀，下次选号先试它们。默认丢
@@ -2914,10 +2975,14 @@ class SessionAffinity(object):
                 self.bindings[key] = entries
             else:
                 self.bindings.pop(key, None)
+            self.tokens.pop(key, None)
+            self.rotated.pop(key, None)
     def unbind(self, key):
         if not key: return
         with self._lock:
             self.bindings.pop(key, None)
+            self.tokens.pop(key, None)
+            self.rotated.pop(key, None)
     def size(self):
         with self._lock:
             return len(self.bindings)
@@ -3338,6 +3403,42 @@ class CredentialRefresher(threading.Thread):
             "last_error": self.last_error,
             "logs": self.logs[-10:],
         }
+
+
+def model_daily_used(account, model):
+    """账号今天在指定模型上已经统计的 Token；没有计数时返回 0。上游的隐藏每日上限
+    按模型计算，选号时用这个值给已用得少的账号一点优先。"""
+    per = getattr(account, "model_daily_tokens", None)
+    if not isinstance(per, dict) or not model:
+        return 0
+    value = per.get(model)
+    if value is None:
+        lower = str(model).lower()
+        for mid, used in per.items():
+            if str(mid).lower() == lower:
+                value = used
+                break
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def page_slice(snapshot, page, ranks=None):
+    """池子里某一页上的账号。一页是固定槽位：账号在快照中的排名（按 uid 排序）对页
+    大小取模。ranks 由调用方缓存；不给时按快照现算。页大小不小于账号数时整池就是一页。
+    """
+    try:
+        index, size = int(page[0]), int(page[1])
+    except (TypeError, ValueError, IndexError):
+        return snapshot
+    if ranks is None:
+        ranks = dict((uid, rank) for rank, uid in enumerate(
+            sorted(account.uid for account in snapshot if account.uid)))
+    if size <= 1 or size >= len(ranks):
+        return snapshot
+    return [account for account in snapshot
+            if account.uid in ranks and ranks[account.uid] % size == index % size]
 
 
 class AccountPool(object):
@@ -3885,34 +3986,51 @@ class AccountPool(object):
         其他热账号，再走池子的自动偏好。`page` 标记超限对话，在一页内轮转、不做绑定；
         `claim` 在发出账号前先占好每账号的请求名额。
         """
-        exclude = exclude or set()
-        if session_key and not wb_settings.session_affinity(self.dir):
+        exclude = set(exclude or ())
+        affinity_on, limit, cooldown = wb_settings.session_routing(self.dir)
+        if session_key and not affinity_on:
             session_key = None
         had_binding = False
+        rotate_from = None
+        now = time.time()
         if session_key and page is None:
             recent = self.affinity.recent(session_key)
             had_binding = bool(recent)
-            for uid in recent:
-                if uid in exclude:
-                    continue
-                account = self.get(uid)
-                if (account and account.realm == realm and account.ready(model=model)
-                        and _claim(account, model, claim)):
-                    # 绑定命中也算一次接单：评分分配按「最近一小时实际接到的
-                    # 份额」判断忙闲，漏掉这些请求会把最忙的账号看成最闲的。
-                    self.affinity.bind(session_key, uid)
-                    account.mark_pick()
-                    self.count_routing("bound_hit")
-                    return account
-            if had_binding:
-                # 绑定的账号此刻都不能接单（冷却、限额、令牌失效、名额满）：
-                # 这段对话改由别的账号接手，接手账号重算完整前缀后缓存跟着它。
-                self.count_routing("bound_lost")
+            if (recent and limit > 0
+                    and self.affinity.usage(session_key, model) >= limit
+                    and now - self.affinity.rotated_at(session_key) >= cooldown):
+                # 单会话消耗到上限：下一轮换号，先把当前账号排除；没有别的账号时
+                # 下面会退回来，照样服务。
+                rotate_from = recent[0]
+                exclude.add(rotate_from)
+            else:
+                for uid in recent:
+                    if uid in exclude:
+                        continue
+                    account = self.get(uid)
+                    if (account and account.realm == realm and account.ready(model=model)
+                            and _claim(account, model, claim)):
+                        # 绑定命中也算一次接单：评分分配按「最近一小时实际接到的
+                        # 份额」判断忙闲，漏掉这些请求会把最忙的账号看成最闲的。
+                        self.affinity.bind(session_key, uid)
+                        account.mark_pick()
+                        self.count_routing("bound_hit")
+                        return account
+                if had_binding:
+                    # 绑定的账号此刻都不能接单（冷却、限额、令牌失效、名额满）：
+                    # 这段对话改由别的账号接手，接手账号重算完整前缀后缓存跟着它。
+                    self.count_routing("bound_lost")
         account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
                             claim=claim)
         if account is None and page is not None:
             # 页内没有可用账号时从页外找：总好过完全不服务。
             account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
+        if account is None and rotate_from is not None:
+            # 没有别的账号能接：留在这个账号上，重置计数以免每轮都重复尝试。
+            exclude.discard(rotate_from)
+            account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
+            if account is not None:
+                self.affinity.reset_usage(session_key)
         # 页内对话刻意不绑定：轮转让这一页的每个账号保持热度，绑定会让它回到
         # 单个账号（正是它被释放出来的状态）。轮转位置由页游标保存。
         if account and session_key and page is None:
@@ -4048,24 +4166,7 @@ class AccountPool(object):
         return chosen[0]
 
     def _page_slice(self, snapshot, page):
-        """池子里某一页上的账号。一页是固定槽位：账号在本区域账号中的排名（按 uid
-        排序）对页大小取模。按区域排名才能让页保持声明的容量（全局排名会让某页只剩
-        一个可用账号，把会话绑死在那里）；按 uid 排序也让页在重启与重载后稳定。
-        页不会大于区域：页大小覆盖全部账号时，这一页就是该区域的全部。
-        """
-        try:
-            index, size = int(page[0]), int(page[1])
-        except (TypeError, ValueError, IndexError):
-            return snapshot
-        ranks = self._page_ranks(snapshot)
-        if size <= 1 or size >= len(ranks):
-            return snapshot
-        out = []
-        for account in snapshot:
-            rank = ranks.get(account.uid)
-            if rank is not None and rank % size == index % size:
-                out.append(account)
-        return out
+        return page_slice(snapshot, page, self._page_ranks(snapshot))
 
     def _page_ranks(self, snapshot):
         """uid -> 在快照账号中的排名，缓存到快照变化为止。快照是按区域过滤后的池
@@ -4087,8 +4188,9 @@ class AccountPool(object):
         欠账总和的比例是应担份额，减去最近一小时实际接到的份额，差得最多的先派。
         候选只包括此刻能接单的账号（接不了单的算进总和会把其余账号的份额压平）。
         评分前先过临期积分层；估计剩余接近耗尽的组合获得一点倾斜，但不独占流量。
-        优先级已经由外层分层决定，评分不再重复考虑。`cursor_key` 让超限对话用自己
-        的页游标，页内轮转不挪动整池游标。
+        同分时该模型今天用得少的账号优先，避开上游隐藏的单模型每日上限。优先级
+        已经由外层分层决定，评分不再重复考虑。`cursor_key` 让超限对话用自己的页
+        游标，页内轮转不挪动整池游标。
         """
         exclude = exclude or set()
         if snapshot is None:
@@ -4166,11 +4268,14 @@ class AccountPool(object):
             if model:
                 weight = weights.get((snapshot[index].uid, model), 1)
                 urgency = max(0, weight - 1) * REMAINING_URGENCY_STEP
+            # 同一模型今天用得少的账号优先，避开上游隐藏的单模型每日上限；
+            # 只作评分相同时的细分，欠账与忙闲仍然决定主要份额。
+            model_load = model_daily_used(snapshot[index], model)
             # 评分相同时欠账多的先派，没有欠账的账号不会靠平局拿到新对话。
-            ranked.append((done - share - urgency, -share, loads[index],
-                           (index - start) % total, index))
+            ranked.append((done - share - urgency, -share, model_load,
+                           loads[index], (index - start) % total, index))
         ranked.sort()
-        for _score, _share, _hour, _offset, index in ranked:
+        for _score, _share, _model_load, _hour, _offset, index in ranked:
             account = snapshot[index]
             if account.ready(model=model) and _claim(account, model, claim):
                 advance(index)

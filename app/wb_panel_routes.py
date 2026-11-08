@@ -985,6 +985,40 @@ class PanelRoutes(object):
                                    "invalid_request_error")
             wb_settings.set_session_affinity(_g().ACCOUNTS_DIR, raw)
             reply["session_affinity"] = raw
+        if "session_rotation_megatokens" in payload:
+            raw = payload.get("session_rotation_megatokens")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "session_rotation_megatokens must be a number",
+                                   "invalid_request_error")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return self._error(400, "session_rotation_megatokens must be a number",
+                                   "invalid_request_error")
+            try:
+                reply["session_rotation_megatokens"] = \
+                    wb_settings.set_session_rotation_megatokens(
+                        _g().ACCOUNTS_DIR, value)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+        if "session_rotation_cooldown_minutes" in payload:
+            raw = payload.get("session_rotation_cooldown_minutes")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(
+                    400, "session_rotation_cooldown_minutes must be a number",
+                    "invalid_request_error")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return self._error(
+                    400, "session_rotation_cooldown_minutes must be a number",
+                    "invalid_request_error")
+            try:
+                reply["session_rotation_cooldown_minutes"] = \
+                    wb_settings.set_session_rotation_cooldown_minutes(
+                        _g().ACCOUNTS_DIR, value)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         if "messages_format" in payload:
             raw = payload.get("messages_format")
             if raw not in wb_settings.MESSAGES_FORMATS:

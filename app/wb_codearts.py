@@ -1402,6 +1402,8 @@ class CodeArtsPool(object):
             or DEFAULT_CONCURRENCY_LIMIT)
         self.affinity = wb_accounts.SessionAffinity()
         self._cursor = 0
+        # 超过消息上限的会话按页轮转，页游标各存一份；与整池游标分开。
+        self._page_cursors = {}
         self._manual_weights = {}
         self._expiry_weights = {}
         self._lock = threading.RLock()
@@ -1780,28 +1782,62 @@ class CodeArtsPool(object):
         return changed
 
     # ---- 调度 ----
-    def pick(self, model="", session_key=None, exclude=None, allowed_accounts=None):
+    def pick(self, model="", session_key=None, exclude=None, allowed_accounts=None,
+             page=None):
         """选一个能接单的账号：会话粘性 > 优先级 > 手动权重 > 临期积分 > 智能评分。
 
-        优先级数字最小的一层先接单，整层都没有可交的账号时才看下一层。
+        优先级数字最小的一层先接单，整层都没有可交的账号时才看下一层。`page` 标记
+        超限对话，在一页内轮转、不做绑定；页内没有可接单的账号时退回整池。
         """
         exclude = set(exclude or ())
         now = time.time()
         with self._lock:
             accounts = list(self.accounts)
+        if page is not None:
+            picked = self._pick_from(wb_accounts.page_slice(accounts, page),
+                                     model, exclude, allowed_accounts, now,
+                                     cursor_key=page)
+            if picked is not None:
+                return picked
+            return self._pick_from(accounts, model, exclude, allowed_accounts, now)
         # 会话粘性：同一段对话优先回到上次的账号；开关关掉时不看绑定。
-        if session_key and wb_settings.session_affinity(self.accounts_dir):
-            for uid in self.affinity.recent(session_key):
-                if uid in exclude:
-                    continue
-                if allowed_accounts is not None and uid not in allowed_accounts:
-                    continue
-                acct = self.get(uid)
-                if (acct and acct.healthy(now, model) and acct.has_capacity()
-                        and acct.has_model(model)):
-                    acct.mark_pick(now)
-                    self.affinity.bind(session_key, uid)
-                    return acct
+        affinity_on, limit, cooldown = wb_settings.session_routing(
+            self.accounts_dir)
+        rotate_from = None
+        if session_key and affinity_on:
+            recent = self.affinity.recent(session_key)
+            if (recent and limit > 0
+                    and self.affinity.usage(session_key, model) >= limit
+                    and now - self.affinity.rotated_at(session_key) >= cooldown):
+                # 单会话消耗到上限：下一轮换号，先把当前账号排除；没有别的账号时
+                # 下面会退回来，照样服务。
+                rotate_from = recent[0]
+                exclude.add(rotate_from)
+            else:
+                for uid in recent:
+                    if uid in exclude:
+                        continue
+                    if allowed_accounts is not None and uid not in allowed_accounts:
+                        continue
+                    acct = self.get(uid)
+                    if (acct and acct.healthy(now, model) and acct.has_capacity()
+                            and acct.has_model(model)):
+                        acct.mark_pick(now)
+                        self.affinity.bind(session_key, uid)
+                        return acct
+        picked = self._pick_from(accounts, model, exclude, allowed_accounts, now)
+        if picked is None and rotate_from is not None:
+            # 没有别的账号能接：留在这个账号上，重置计数以免每轮都重复尝试。
+            exclude.discard(rotate_from)
+            picked = self._pick_from(accounts, model, exclude,
+                                     allowed_accounts, now)
+            if picked is not None:
+                self.affinity.reset_usage(session_key)
+        return picked
+
+    def _pick_from(self, accounts, model, exclude, allowed_accounts, now,
+                   cursor_key=None):
+        """在给定账号集合里按优先级与权重选号，不处理会话绑定。"""
         candidates = [
             a for a in accounts
             if a.uid not in exclude
@@ -1816,7 +1852,8 @@ class CodeArtsPool(object):
             if picked is None:
                 picked = self._pick_expiring_first(tier, now)
             if picked is None:
-                picked = self._pick_scored(tier, now)
+                picked = self._pick_scored(tier, now, cursor_key=cursor_key,
+                                           model=model)
             if picked is not None:
                 picked.mark_pick(now)
                 return picked
@@ -1883,15 +1920,19 @@ class CodeArtsPool(object):
             setattr(self, state_name, state)
         return chosen[0]
 
-    def _pick_scored(self, pool, now):
-        """按积分到期义务与最近一小时的接单份额评分：欠账多且最近清闲的先派。优先级
-        已由外层分层决定，评分不再重复考虑。
+    def _pick_scored(self, pool, now, cursor_key=None, model=""):
+        """按积分到期义务与最近一小时的接单份额评分：欠账多且最近清闲的先派。同分时
+        该模型今天用得少的账号优先。优先级已由外层分层决定，评分不再重复考虑。
+        cursor_key 非空时使用该页自己的轮转位置。
         """
         total = len(pool)
         if total == 0:
             return None
         with self._lock:
-            start = self._cursor
+            if cursor_key is None:
+                start = self._cursor
+            else:
+                start = self._page_cursors.get(cursor_key, 0)
         targets = {acct.uid: acct.credit_target_per_day(now=now) for acct in pool}
         known = sorted(value for value in targets.values() if value is not None)
         if not known:
@@ -1912,12 +1953,17 @@ class CodeArtsPool(object):
         for index, acct in enumerate(pool):
             share = (backlog[acct.uid] / total_backlog) if total_backlog > 0 else 0.0
             done = (loads[acct.uid] / float(total_hour)) if total_hour > 0 else 0.0
-            ranked.append((done - share, -share, loads[acct.uid],
+            # 同一模型今天用得少的账号优先，避开上游隐藏的单模型每日上限。
+            model_load = wb_accounts.model_daily_used(acct, model)
+            ranked.append((done - share, -share, model_load, loads[acct.uid],
                            (index - start) % total, index))
         ranked.sort()
-        index = ranked[0][4]
+        index = ranked[0][5]
         with self._lock:
-            self._cursor = (index + 1) % total
+            if cursor_key is None:
+                self._cursor = (index + 1) % total
+            else:
+                self._page_cursors[cursor_key] = (index + 1) % total
         return pool[index]
 
     def bind_session(self, session_key, uid):
@@ -3691,8 +3737,11 @@ def _no_account_error(pool, model, allowed_accounts=None):
     raise CodeArtsNoAccounts(message)
 
 
-def open_chat(config, body, session_key=None, allowed_accounts=None):
-    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。"""
+def open_chat(config, body, session_key=None, allowed_accounts=None, page=None):
+    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。
+
+    `page` 非空表示超限对话按页轮转，这一轮不写会话绑定。
+    """
     pool = pool_for(config["accounts_dir"])
     # 聊天路径顺带推进号池守卫与积分消耗速度：CodeArts 不走 WorkBuddy 的每日
     # 守卫推送，少了这一步，日限额与智能评分在纯 CodeArts 网关上永远不更新。
@@ -3706,9 +3755,15 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
     last_error = None
     last_uid = None
     attempts = max(2, len(accounts) + 1)
+
+    def demote(uid):
+        """超限对话按页轮转，不碰旧的会话绑定。"""
+        if page is None:
+            pool.demote_session(session_key, uid)
+
     for _ in range(attempts):
         acct = pool.pick(model, session_key=session_key, exclude=exclude,
-                         allowed_accounts=allowed_accounts)
+                         allowed_accounts=allowed_accounts, page=page)
         if acct is None:
             break
         if not pool.acquire(acct):
@@ -3719,14 +3774,15 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             stream, used = _open_on_account(acct, body, session_key)
             handed = True
             pool.note_success(acct, model=used)
-            pool.bind_session(session_key, acct.uid)
+            if page is None:
+                pool.bind_session(session_key, acct.uid)
             return stream, acct, used
         except CodeArtsBadRequest:
             raise
         except CodeArtsAuthError as exc:
             # 换过令牌还是 401/403：冷却这个账号，交给别的账号；不停用。
             pool.note_cooldown(acct, _auth_cooldown(len(accounts)), str(exc))
-            pool.demote_session(session_key, acct.uid)
+            demote(acct.uid)
             exclude.add(acct.uid)
             last_error, last_uid = exc, acct.uid
         except CodeArtsUpstreamError as exc:
@@ -3740,7 +3796,7 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
                     reset_at=getattr(exc, "reset_at", None))
             else:
                 pool.note_failure(acct, str(exc))
-            pool.demote_session(session_key, acct.uid)
+            demote(acct.uid)
             exclude.add(acct.uid)
             last_error, last_uid = exc, acct.uid
         except CodeArtsUnavailable as exc:
@@ -3748,12 +3804,12 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             if _looks_like_local_network(cause or exc):
                 raise CodeArtsLocalNetwork(str(exc))
             pool.note_failure(acct, str(exc))
-            pool.demote_session(session_key, acct.uid)
+            demote(acct.uid)
             exclude.add(acct.uid)
             last_error, last_uid = exc, acct.uid
         except CodeArtsError as exc:
             pool.note_failure(acct, str(exc))
-            pool.demote_session(session_key, acct.uid)
+            demote(acct.uid)
             exclude.add(acct.uid)
             last_error, last_uid = exc, acct.uid
         finally:
@@ -5227,6 +5283,8 @@ def apply_pool_guards(config, refresh=False):
         any(int(value or 0) > 0 for value in values[key].values())
         for key in ("daily_token_limit", "daily_credit_limit",
                     "model_daily_token_limit"))
+    if wb_settings.session_rotation_megatokens(accounts_dir) > 0:
+        wants = True
     tokens = models = None
     if wants:
         import wb_usage

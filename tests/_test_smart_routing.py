@@ -185,6 +185,15 @@ class ScoredPlacementTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(pool.routing_snapshot()["smart_pick"], 8 * 1500)
 
+    def test_the_model_with_less_daily_usage_wins_the_tiebreak(self):
+        a = account("uid-a")
+        b = account("uid-b")
+        a.model_daily_tokens = {MODEL: 100}
+        b.model_daily_tokens = {MODEL: 0}
+        pool = pool_with(a, b)
+        self.assertEqual(pool.pick(realm="cn", model=MODEL).uid, "uid-b",
+                         "隐藏的单模型每日限额靠已用 Token 少的账号优先来避开")
+
 
 class DispatchOrderTests(unittest.TestCase):
     """分配顺序：优先级分层 > 手动权重 > 智能分配；整层拿不到名额时换下一层。"""
@@ -382,6 +391,93 @@ class RoutingCounterTests(unittest.TestCase):
             self.pool.count_routing("nope")
 
 
+class SessionRotationTests(unittest.TestCase):
+    """单会话消耗超过阈值后换号，避免一段长对话把同一个账号压到 429。"""
+
+    def setUp(self):
+        self.pool = pool_with(account("uid-a"), account("uid-b"))
+        os.makedirs(self.pool.dir, exist_ok=True)
+        P.POOL = self.pool
+        wb_settings.set_session_rotation_megatokens(self.pool.dir, 1.0)
+        self.addCleanup(
+            wb_settings.set_session_rotation_megatokens, self.pool.dir, 100)
+
+    def test_the_default_threshold_is_100_megatokens(self):
+        fresh = tempfile.mkdtemp(prefix="wb-default-")
+        self.assertEqual(wb_settings.session_rotation_megatokens(fresh), 100.0)
+        self.assertEqual(wb_settings.session_rotation_tokens(fresh), 100000000.0)
+        self.assertEqual(
+            wb_settings.session_rotation_cooldown_minutes(fresh), 10.0)
+
+    def test_the_setting_round_trips_and_rejects_bad_values(self):
+        wb_settings.set_session_rotation_megatokens(self.pool.dir, 2.5)
+        self.assertEqual(wb_settings.session_rotation_megatokens(self.pool.dir), 2.5)
+        self.assertEqual(wb_settings.session_rotation_tokens(self.pool.dir), 2500000.0)
+        for bad in (-1, True, "x", None, 10 ** 10):
+            with self.assertRaises(ValueError):
+                wb_settings.set_session_rotation_megatokens(self.pool.dir, bad)
+        self.assertEqual(wb_settings.session_rotation_megatokens(self.pool.dir), 2.5)
+        wb_settings.set_session_rotation_cooldown_minutes(self.pool.dir, 5)
+        self.assertEqual(
+            wb_settings.session_rotation_cooldown_minutes(self.pool.dir), 5)
+        for bad in (-1, True, "x", None, 10 ** 10):
+            with self.assertRaises(ValueError):
+                wb_settings.set_session_rotation_cooldown_minutes(self.pool.dir, bad)
+        self.assertEqual(
+            wb_settings.session_rotation_cooldown_minutes(self.pool.dir), 5)
+        self.addCleanup(
+            wb_settings.set_session_rotation_cooldown_minutes, self.pool.dir, 10)
+
+    def test_usage_below_the_limit_keeps_the_binding(self):
+        first = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.pool.affinity.consume("s1", MODEL, 999999)
+        again = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertEqual(again.uid, first.uid)
+
+    def test_usage_past_the_limit_picks_another_account(self):
+        first = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.pool.affinity.consume("s1", MODEL, 1000000)
+        again = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertNotEqual(again.uid, first.uid)
+        self.assertEqual(self.pool.affinity.get("s1"), again.uid)
+        self.assertEqual(self.pool.affinity.usage("s1", MODEL), 0.0)
+
+    def test_usage_on_another_model_does_not_rotate(self):
+        first = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.pool.affinity.consume("s1", "glm-5.3", 2000000)
+        again = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertEqual(again.uid, first.uid,
+                         "另一个模型的消耗不该触发本模型的轮换")
+
+    def test_a_recent_rotation_waits_for_the_cooldown(self):
+        first = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.pool.affinity.consume("s1", MODEL, 1000000)
+        second = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertNotEqual(second.uid, first.uid)
+        self.pool.affinity.consume("s1", MODEL, 1000000)
+        third = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertEqual(third.uid, second.uid,
+                         "冷却期内又换号，说明轮换过于频繁")
+
+    def test_a_completed_row_counts_toward_the_session(self):
+        self.pool.affinity.bind("row-s", "uid-a")
+        U.bind_audit({"session_key": "row-s"})
+        try:
+            U.record_usage(MODEL, {"total_tokens": 1234},
+                           account="uid-a", key="k1")
+        finally:
+            U.bind_audit(None)
+        self.assertEqual(self.pool.affinity.usage("row-s", MODEL), 1234)
+
+    def test_the_only_account_is_reused_and_the_counter_resets(self):
+        self.pool.accounts = [account("uid-a")]
+        first = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.pool.affinity.consume("s1", MODEL, 1000000)
+        again = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
+        self.assertEqual(again.uid, first.uid)
+        self.assertEqual(self.pool.affinity.usage("s1", MODEL), 0.0)
+
+
 class DailyCreditFoldTests(unittest.TestCase):
     """今日积分的折叠与今日 Token 共用一份增量扫描。"""
 
@@ -491,9 +587,10 @@ class TransientRetryTests(unittest.TestCase):
                                        io.BytesIO(b""))
         resp, acc, _ = self._drive_until_ok([error, error, ok])
         self.assertIs(resp, ok)
-        self.assertEqual(acc.uid, "uid-a")
-        self.assertEqual(self.calls, ["Bearer tok-uid-a"] * 3,
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(set(self.calls), {self.calls[0]},
                          "两次 503 之后没有回到同一个账号：%r" % (self.calls,))
+        self.assertEqual(acc.uid, self.calls[0].split("tok-")[1])
 
     def _drive_until_ok(self, replies, session_key="s-transient"):
         self._install(replies)
@@ -505,9 +602,10 @@ class TransientRetryTests(unittest.TestCase):
         reply = urllib.error.URLError("connection reset by peer")
         resp, acc, _ = self._drive_until_ok([reply, ok])
         self.assertIs(resp, ok)
-        self.assertEqual(self.calls, ["Bearer tok-uid-a"] * 2,
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(set(self.calls), {self.calls[0]},
                          "连接抖动之后没有回到同一个账号：%r" % (self.calls,))
-        self.assertEqual(acc.uid, "uid-a")
+        self.assertEqual(acc.uid, self.calls[0].split("tok-")[1])
 
     def test_turning_affinity_off_picks_again_every_turn(self):
         ok = object()
@@ -517,7 +615,8 @@ class TransientRetryTests(unittest.TestCase):
         uids = [P.open_upstream(self._payload(), session_key="s-off", target_realm="cn",
                                 lease=P.SlotLease())[1].uid
                 for _ in range(2)]
-        self.assertEqual(uids, ["uid-a", "uid-b"], "关闭会话粘性后同一对话还固定在一个账号上")
+        self.assertEqual(len(set(uids)), 2,
+                         "关闭会话粘性后同一对话还固定在一个账号上：%r" % (uids,))
         self.assertIsNone(self.pool.affinity.get("s-off"))
 
         wb_settings.set_session_affinity(P.ACCOUNTS_DIR, True)

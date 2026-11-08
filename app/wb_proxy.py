@@ -406,7 +406,7 @@ def resize_chat_slots(ready_accounts):
 #: WB_PROXY_CATALOG_DIR 覆盖。
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(APP_DIR)
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 # 用量记账：每个上游响应都带 usage 块，网关同时为每个请求写一行 JSONL。
 # 默认目录在本脚本旁边，可用 --usage-dir 或 WB_PROXY_USAGE_DIR 覆盖。
 USAGE_DIR = os.environ.get("WB_PROXY_USAGE_DIR") \
@@ -620,6 +620,8 @@ def runtime_settings_view():
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
         "session_affinity": wb_settings.session_affinity(ACCOUNTS_DIR),
+        "session_rotation_megatokens": wb_settings.session_rotation_megatokens(ACCOUNTS_DIR),
+        "session_rotation_cooldown_minutes": wb_settings.session_rotation_cooldown_minutes(ACCOUNTS_DIR),
         "routing": (POOL.routing_snapshot() if POOL else {}),
         "messages_format": wb_settings.messages_format(ACCOUNTS_DIR),
         "messages_format_default": wb_settings.DEFAULT_MESSAGES_FORMAT,
@@ -1908,6 +1910,10 @@ def _free_model_credit_fallback_enabled():
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
                   allow_credit_fallback=True, allow_product_switch=True,
                   only_uid=None, lease=None):
+    # 会话键写进本次请求的审计上下文：用量落盘时据此累计单会话 Token。
+    audit = wb_usage.current_audit()
+    if audit is not None:
+        audit["session_key"] = session_key
     # 守卫与选路输入先于提供方分流：CodeArts 聊天也必须按今天的用量刷新
     # 每日/单模型限额与消耗速度，不能只在看板打开或启动时推进。
     wb_usage.apply_daily_guards()
@@ -1944,6 +1950,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         # 面板关闭会话粘性：每一轮都重新选号。
         session_key = None
         affinity_page = None
+    if audit is not None:
+        audit["session_key"] = session_key
     total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
     tried = set()
     # 同一次请求内每个账号最多刷新一次 token：401 可能只是访问令牌过期，

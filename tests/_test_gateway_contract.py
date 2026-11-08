@@ -788,10 +788,14 @@ class MissingCreditTests(unittest.TestCase):
              "models": [{"model": "ca-model", "input": 1.0,
                          "cached_input": 1.0, "output": 1.0}]})
         row = out["models"][0]
+        self.assertTrue(row["priced"])
+        self.assertAlmostEqual(row["official_cny"], 0.0015)
         self.assertIsNone(row["credit"])
         self.assertTrue(row["credit_missing"])
         self.assertIsNone(row["saved_cny"])
         self.assertIsNone(row["paid_cny"])
+        self.assertEqual(out["summary"]["official_cny"], 0.0015)
+        self.assertEqual(out["summary"]["priced_models"], 1)
         self.assertEqual(out["summary"]["credit_missing"], 1)
         self.assertEqual(out["summary"]["saved_cny"], 0.0)
 

@@ -7,7 +7,7 @@ import { getJSON } from '../core/api.js';
 import { getState } from '../core/store.js';
 import { fmtNumber, fmtCredit, fmtCny, spaceMixed } from '../core/format.js';
 import {
-  pageHeader, statCard, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock,
+  pageHeader, statCard, badge, loadErrorPage, loadErrorInline, skeletonStats, skeletonBlock,
 } from '../ui/widgets.js';
 import { rangeLabel, scopeText, creditKnown } from './stats/logic.js';
 import { createRangeControls } from './stats/range.js';
@@ -59,10 +59,14 @@ export function mount(host) {
     return value == null ? '—' : fmtCny(value);
   }
 
-  /** 上游没有返回单次扣费：后端给 credit_missing，或 credit 缺失；这类行不参与节省额计算。 */
-  function creditMissing(row) {
-    return row.credit_missing === true
-      || row.credit === null || row.credit === undefined || row.credit === '';
+  /** 这一行没有折算积分支出：上游整段窗口都没有返回单次扣费。 */
+  function creditUncollected(row) {
+    return row.paid_cny == null;
+  }
+
+  /** 部分请求没有返回单次扣费；已采集的部分仍参与积分折算。 */
+  function creditPartial(row) {
+    return !creditUncollected(row) && row.credit_missing === true;
   }
 
   function priceTitle(row) {
@@ -75,7 +79,7 @@ export function mount(host) {
     const summary = (data && data.summary) || {};
     const rows = (data && data.models) || [];
     const pricedRows = rows.filter((row) => row.priced);
-    const knownPriced = pricedRows.filter((row) => !creditMissing(row));
+    const knownPriced = pricedRows.filter((row) => !creditUncollected(row));
     const noPricedCredit = pricedRows.length > 0 && knownPriced.length === 0;
     const savedKnown = !noPricedCredit && creditKnown(summary.saved_cny);
     const tone = savedKnown && summary.saved_cny > 0 ? 'success' : (savedKnown && summary.saved_cny < 0 ? 'danger' : '');
@@ -151,7 +155,8 @@ export function mount(host) {
             </thead>
             <tbody>
               ${rows.map((row) => {
-                const missing = creditMissing(row);
+                const missing = creditUncollected(row);
+                const partial = creditPartial(row);
                 return html`
                 <tr>
                   <td>
@@ -160,7 +165,7 @@ export function mount(host) {
                       ? nothing
                       : html`<div class="text-2xs muted">未配置价格，按 0 计</div>`}
                     ${row.priced && missing
-                      ? html`<div class="text-2xs muted">上游未返回扣费，按未采集处理</div>`
+                      ? html`<div class="text-2xs muted">上游未返回扣费，官方价格照常计入合计</div>`
                       : nothing}
                   </td>
                   <td class="right nums">${fmtNumber(row.requests)}</td>
@@ -168,7 +173,11 @@ export function mount(host) {
                   <td class="right nums matrix-opt">${fmtNumber(row.cached_tokens)}</td>
                   <td class="right nums matrix-opt">${fmtNumber(row.completion_tokens)}</td>
                   <td class="right nums" title=${priceTitle(row)}>${row.priced ? money(row.official_cny) : html`<span class="muted">—</span>`}</td>
-                  <td class="right nums">${missing ? html`<span class="muted" title="上游没有返回单次扣费">未采集</span>` : fmtCredit(row.credit)}</td>
+                  <td class="right nums">${missing
+                    ? badge('不参与积分折算', 'warning', {
+                        small: true, title: '上游没有返回单次扣费，积分支出按未采集处理',
+                      })
+                    : html`<span title=${partial ? '部分请求未返回单次扣费，按已采集部分折算' : nothing}>${fmtCredit(row.credit)}</span>`}</td>
                   <td class="right nums matrix-opt">${row.priced && !missing ? money(row.paid_cny) : html`<span class="muted">—</span>`}</td>
                   <td class="right nums">
                     ${row.priced && !missing && row.saved_cny != null
@@ -181,7 +190,7 @@ export function mount(host) {
           </table>
         </div>
         <div class="card-foot">
-          只统计已完成的请求，未采集扣费的模型不参与折算。
+          只统计已完成的请求；未返回单次扣费的模型，官方价格照常计入合计，积分支出不参与折算。
           ${(data.unpriced_models || []).length
             ? ' 未定价模型：' + data.unpriced_models.join('、') + '，填写价格后进入合计。'
             : nothing}
@@ -211,7 +220,7 @@ export function mount(host) {
         ${statCards()}
         ${data.summary && Number(data.summary.credit_missing) > 0 ? html`
           <div class="notice notice-warn" role="status">${icon('TriangleAlert')}
-            <div class="grow">有 ${fmtNumber(data.summary.credit_missing)} 个模型未返回单次扣费，不参与积分折算。</div>
+            <div class="grow">有 ${fmtNumber(data.summary.credit_missing)} 个模型未返回单次扣费，官方价格照常计入合计，积分不参与折算。</div>
           </div>` : nothing}
         ${tableCard()}
       </div>`;

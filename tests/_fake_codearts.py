@@ -152,6 +152,8 @@ class FakeState(object):
              "model_parameters": {"context_window": 131072, "max_tokens": 8192}},
         ]
         self.benefit_models = [
+            {"model_id": "deepseek-v4-flash-0731", "model_name": "deepseek-v4-flash-0731",
+             "context_window": 65536, "max_tokens": 4096},
             {"model_id": "deepseek-v4-pro-0901", "model_name": "deepseek-v4-pro-0901",
              "context_window": 65536, "max_tokens": 4096},
         ]

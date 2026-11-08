@@ -32,6 +32,12 @@ export function createGatewayTab(page) {
     sections: [{ fields: [
       { id: 'sessionAffinity', key: 'session_affinity', kind: 'switch', default: true,
         label: '会话粘性', desc: '同一段对话固定使用同一个账号。' },
+      { id: 'sessionRotation', key: 'session_rotation_megatokens', kind: 'number',
+        default: 100, min: 0, max: 10000, suffix: 'M',
+        label: '单会话轮换阈值', desc: '单位 M（百万 Token）。同一段对话在同一账号的同一模型上累计消耗超过这个值后，下一轮重新选号；0 表示不限制。' },
+      { id: 'sessionRotationCooldown', key: 'session_rotation_cooldown_minutes', kind: 'number',
+        default: 10, min: 0, max: 1440, suffix: '分钟',
+        label: '轮换冷却', desc: '两次轮换至少间隔这么久，避免反复换号丢掉前缀缓存；0 表示不设冷却。' },
     ] }],
   });
 

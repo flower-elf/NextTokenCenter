@@ -29,7 +29,7 @@ export const ROUTES = [
 
 // 设置页的标签：地址为 #/settings/<id>。
 export const SETTINGS_TABS = [
-  { id: 'gateway', title: '网关行为', icon: 'Server', keywords: '定时任务 号池调度 会话粘性 优先级 手动权重 积分刷新 网络工具 Messages 接口 默认路由 签到时段 随机间隔 渠道' },
+  { id: 'gateway', title: '网关行为', icon: 'Server', keywords: '定时任务 号池调度 会话粘性 单会话轮换 轮换阈值 冷却 手动权重 积分刷新 网络工具 Messages 接口 默认路由 签到时段 随机间隔 渠道' },
   { id: 'workbuddy', title: 'WorkBuddy', icon: 'Bot', provider: 'workbuddy',
     keywords: 'WorkBuddy 国际版 国内版 定时任务 账号池守卫 保留积分 每日限额 自动切换 每日活跃 打卡 上游超时 设备令牌 提示词 接口测试模型 出站身份 免费模型 失败退避 连接复用 媒体生成 生图 生视频' },
   { id: 'codearts', title: 'CodeArts', icon: 'Cloud', provider: 'codearts',

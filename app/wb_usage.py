@@ -152,6 +152,23 @@ def _extract_usage(usage):
         "total_tokens": usage.get("total_tokens") or 0,
         "credit": credit,
     }
+
+def _note_session_usage(audit, account, model, requested_model, fields):
+    """把这次请求的 Token 按模型记到会话上；只有聊天请求在审计上下文里带了会话键。
+    客户端请求 id 与上游计费 id 不同时，两个键都记，选号用哪一个都能看到消耗。"""
+    session_key = (audit or {}).get("session_key")
+    if not session_key or not account:
+        return
+    tokens = fields.get("total_tokens") or (
+        fields.get("prompt_tokens", 0) + fields.get("completion_tokens", 0))
+    if not tokens:
+        return
+    models = [model]
+    for alias in (requested_model, (audit or {}).get("upstream_model")):
+        if alias and alias not in models:
+            models.append(alias)
+    wb_channels.note_session_usage(session_key, account, models, tokens)
+
 def row_realm(row):
     """日志行所属的 realm。
 
@@ -389,6 +406,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     row["key"] = key or ""
     if audit is None:
         audit = current_audit()
+    _note_session_usage(audit, account, model, requested_model, fields)
     row.update(audit_columns(audit))
     _apply_route_columns(row, audit)
     if not row["key_id"]:
@@ -660,6 +678,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     row["key"] = key or ""
     if audit is None:
         audit = current_audit()
+    _note_session_usage(audit, account, model, None, fields)
     row.update(audit_columns(audit))
     _apply_route_columns(row, audit)
     if not row["key_id"]:

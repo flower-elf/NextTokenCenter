@@ -1157,6 +1157,91 @@ def session_affinity(accounts_dir):
 def set_session_affinity(accounts_dir, enabled):
     return _set_flag(accounts_dir, "session_affinity", enabled)
 
+
+SESSION_ROTATION_MTOKENS_KEY = "session_rotation_megatokens"
+SESSION_ROTATION_MTOKENS_DEFAULT = 100.0
+SESSION_ROTATION_MTOKENS_MAX = 10000.0
+SESSION_ROTATION_COOLDOWN_KEY = "session_rotation_cooldown_minutes"
+SESSION_ROTATION_COOLDOWN_DEFAULT = 10.0
+SESSION_ROTATION_COOLDOWN_MAX = 1440.0
+
+
+def _non_negative_number(raw, fallback, hard_max):
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value != value or value in (float("inf"), float("-inf")):
+        return fallback
+    return min(max(value, 0.0), hard_max)
+
+
+def session_rotation_megatokens(accounts_dir):
+    """同一段对话在同一账号的同一模型上累计消耗超过这个百万 Token 数后重新选号；
+    0 表示不限制。每个模型的输入输出 Token 不同，阈值按模型分别累计。非法值按默认值。"""
+    return _non_negative_number(
+        load(accounts_dir).get(SESSION_ROTATION_MTOKENS_KEY),
+        SESSION_ROTATION_MTOKENS_DEFAULT, SESSION_ROTATION_MTOKENS_MAX)
+
+
+def set_session_rotation_megatokens(accounts_dir, value):
+    if isinstance(value, bool):
+        raise ValueError("session_rotation_megatokens must be a number")
+    try:
+        megatokens = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("session_rotation_megatokens must be a number")
+    if (megatokens != megatokens or megatokens < 0
+            or megatokens > SESSION_ROTATION_MTOKENS_MAX):
+        raise ValueError("session_rotation_megatokens must be between 0 and %g"
+                         % SESSION_ROTATION_MTOKENS_MAX)
+    return _store(accounts_dir, SESSION_ROTATION_MTOKENS_KEY, megatokens)
+
+
+def session_rotation_cooldown_minutes(accounts_dir):
+    """两次轮换至少间隔的分钟数；0 表示不设冷却。轮换会丢掉前缀缓存，冷却避免
+    大请求密集时反复换号。非法值按默认值。"""
+    return _non_negative_number(
+        load(accounts_dir).get(SESSION_ROTATION_COOLDOWN_KEY),
+        SESSION_ROTATION_COOLDOWN_DEFAULT, SESSION_ROTATION_COOLDOWN_MAX)
+
+
+def set_session_rotation_cooldown_minutes(accounts_dir, value):
+    if isinstance(value, bool):
+        raise ValueError("session_rotation_cooldown_minutes must be a number")
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("session_rotation_cooldown_minutes must be a number")
+    if (minutes != minutes or minutes < 0
+            or minutes > SESSION_ROTATION_COOLDOWN_MAX):
+        raise ValueError("session_rotation_cooldown_minutes must be between 0 and %g"
+                         % SESSION_ROTATION_COOLDOWN_MAX)
+    return _store(accounts_dir, SESSION_ROTATION_COOLDOWN_KEY, minutes)
+
+
+def session_rotation_tokens(accounts_dir):
+    """阈值换算成 Token，供选号比较使用。"""
+    return session_rotation_megatokens(accounts_dir) * 1_000_000.0
+
+
+def session_routing(accounts_dir):
+    """一次读取会话粘性、单会话轮换阈值与冷却，供选号热路径使用。"""
+    data = load(accounts_dir)
+    affinity = data.get("session_affinity")
+    affinity = True if affinity is None else affinity is True
+    tokens = _non_negative_number(
+        data.get(SESSION_ROTATION_MTOKENS_KEY),
+        SESSION_ROTATION_MTOKENS_DEFAULT,
+        SESSION_ROTATION_MTOKENS_MAX) * 1_000_000.0
+    cooldown = _non_negative_number(
+        data.get(SESSION_ROTATION_COOLDOWN_KEY),
+        SESSION_ROTATION_COOLDOWN_DEFAULT,
+        SESSION_ROTATION_COOLDOWN_MAX) * 60.0
+    return affinity, tokens, cooldown
+
 UPSTREAM_DEFAULTS = {
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,

@@ -127,8 +127,8 @@ def estimate(by_model, config):
     priced=False、金额按 0 计、不进入合计；缓存命中价已按剩余输入算，不重复计费。
 
     credit_missing 计数来自折叠：上游没报单次扣费的行（例如 CodeArts）不写 0，
-    这里把该模型标成「未采集」，paid/saved 不参与合计；否则 0 会被当成免费请求，
-    把官方价全额算成节省。"""
+    这里把该模型标成「未采集」，积分折算支出与节省额不参与合计；官方价格照常
+    计入合计。否则 0 会被当成免费请求，把官方价全额算成节省。"""
     config = config if isinstance(config, dict) else _default_config()
     credit_price = _number(config.get("credit_price"))
     prices = {}

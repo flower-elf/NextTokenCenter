@@ -652,9 +652,11 @@ class WorkBuddyProvider(object):
             pool.apply_expiring_window(guards["expiring_window_days"])
             pool._guard_static = static
             published += 2
+        rotation_on = wb_settings.session_rotation_megatokens(directory) > 0
         wants = (any(value > 0 for value in token_limits.values())
                  or any(value > 0 for value in credit_limits.values())
-                 or any(value > 0 for value in model_limits.values()))
+                 or any(value > 0 for value in model_limits.values())
+                 or rotation_on)
         stats = wb_usage.daily_usage_stats(ttl=0 if refresh else None) if wants else None
         if refresh or any(value > 0 for value in token_limits.values()):
             pool.apply_daily_token_limit(
@@ -665,7 +667,8 @@ class WorkBuddyProvider(object):
                 credit_limits, stats["credits"] if stats is not None else None,
                 wb_usage.free_models_by_realm())
             published += 1
-        if refresh or any(value > 0 for value in model_limits.values()):
+        if (refresh or any(value > 0 for value in model_limits.values())
+                or rotation_on):
             pool.apply_model_daily_token_limit(
                 model_limits, stats["models"] if stats is not None else None)
             published += 1
@@ -749,6 +752,12 @@ class WorkBuddyProvider(object):
             "fetched_at": info.get("fetched_at"),
         })
         return result
+
+    def note_session_usage(self, session_key, account, models, tokens):
+        """把这次请求在若干模型别名上消耗的 Token 记到会话上。"""
+        pool = self._pool()
+        if pool is not None:
+            pool.affinity.consume(session_key, models, tokens)
 
     def open_stream(self, payload, session_key, realm, only_uid=None, lease=None):
         return _gateway().open_upstream(payload, session_key=session_key,
@@ -1013,6 +1022,12 @@ class CodeArtsProvider(object):
         })
         return result
 
+    def note_session_usage(self, session_key, account, models, tokens):
+        """把这次请求在若干模型别名上消耗的 Token 记到会话上。"""
+        pool = getattr(account, "pool", None)
+        if pool is not None:
+            pool.affinity.consume(session_key, models, tokens)
+
     def open_stream(self, payload, session_key, realm, only_uid=None, lease=None):
         """返回 (流, 账号, 思考档位)，与 WorkBuddy 的 open_upstream 同形。
 
@@ -1020,12 +1035,21 @@ class CodeArtsProvider(object):
         调用方统一签名而存在。
         """
         import wb_codearts
+        import wb_usage
         cfg = self._config()
         try:
             body = wb_codearts.build_chat_body(payload, session_key)
+            # 客户端没给会话标识时按消息前缀派生，与 WorkBuddy 共用同一个开关与
+            # 超限分页规则；否则同一段对话每轮都会换账号，前缀缓存拿不到。
+            page = None
+            if not session_key:
+                session_key, page = _gateway().affinity_route(body.get("messages"))
+                audit = wb_usage.current_audit()
+                if audit is not None:
+                    audit["session_key"] = session_key
             allowed = [only_uid] if only_uid else None
             stream, account, _billed = wb_codearts.open_chat(
-                cfg, body, session_key, allowed_accounts=allowed)
+                cfg, body, session_key, allowed_accounts=allowed, page=page)
         except wb_codearts.CodeArtsError as exc:
             raise self._error(exc)
         return stream, account, body.get("reasoning_effort")
@@ -1062,6 +1086,16 @@ def find_account(uid):
         if account is not None:
             return candidate, account
     return None, None
+
+
+def note_session_usage(session_key, account_uid, models, tokens):
+    """把一次请求在若干模型别名上消耗的 Token 记到会话上，供轮换阈值判断。"""
+    if not session_key or not account_uid or not tokens:
+        return
+    provider, account = find_account(account_uid)
+    if provider is None or account is None:
+        return
+    provider.note_session_usage(session_key, account, models, tokens)
 
 
 def all_views(realm=None):

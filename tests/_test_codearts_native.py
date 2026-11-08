@@ -336,7 +336,7 @@ try:
     ids = [m["id"] for m in models]
     check("agent/builtin/benefit merged", set(ids) ==
           {"GLM-5.2", "GLM-4.7", "Qwen3-VL-235B",
-           "deepseek-v4-pro-0901"}, ids)
+           "deepseek-v4-flash-0731", "deepseek-v4-pro-0901"}, ids)
     check("benefit marked", acct.is_benefit("deepseek-v4-pro-0901") is True)
     check("normal not benefit", acct.is_benefit("GLM-5.2") is False)
     agent_req = next((r for r in state.requests

@@ -411,6 +411,49 @@ try:
     check("session affinity object reused",
           isinstance(pool.affinity, wb_accounts.SessionAffinity))
 
+    print("== derived affinity ==")
+    convo = {"model": "deepseek-v4-flash-0731", "stream": False,
+             "messages": [{"role": "system", "content": "router"},
+                          {"role": "user", "content": "hello"}]}
+    provider = wb_channels.provider("codearts")
+    stream, first_turn, _ = provider.open_stream(convo, None, "codearts")
+    b"".join(stream)
+    stream.close()
+    stream, second_turn, _ = provider.open_stream(convo, None, "codearts")
+    b"".join(stream)
+    stream.close()
+    check("a message prefix without a session id sticks to one account",
+          first_turn.uid == second_turn.uid, (first_turn.uid, second_turn.uid))
+    derived, derived_page = wb_proxy.affinity_route(
+        C.build_chat_body(convo).get("messages"))
+    check("the derived key is bound",
+          derived_page is None and pool.affinity.get(derived) == first_turn.uid,
+          (derived, derived_page, pool.affinity.get(derived)))
+
+    print("== session rotation ==")
+    pool.affinity.bind("rotate-below", "u2")
+    pool.affinity.consume("rotate-below", "deepseek-v4-flash-0731", 999999)
+    wb_settings.set_session_rotation_megatokens(ACCOUNTS, 1.0)
+    try:
+        below = pool.pick("deepseek-v4-flash-0731", session_key="rotate-below")
+        check("usage below the limit keeps the binding", below.uid == "u2",
+              below.uid)
+        pool.affinity.bind("rotate-over", "u2")
+        pool.affinity.consume("rotate-over", "deepseek-v4-flash-0731", 1000000)
+        over = pool.pick("deepseek-v4-flash-0731", session_key="rotate-over")
+        check("usage past the limit picks another account", over.uid != "u2",
+              over.uid)
+        pool.bind_session("rotate-over", over.uid)
+        check("the new account starts with a fresh counter",
+              pool.affinity.get("rotate-over") == over.uid
+              and pool.affinity.usage("rotate-over", "deepseek-v4-flash-0731") == 0.0,
+              (pool.affinity.get("rotate-over"),
+               pool.affinity.usage("rotate-over", "deepseek-v4-flash-0731")))
+    finally:
+        wb_settings.set_session_rotation_megatokens(ACCOUNTS, 100)
+        pool.affinity.unbind("rotate-below")
+        pool.affinity.unbind("rotate-over")
+
     print("== pinned account ==")
     body = {"model": "GLM-5.2",
             "messages": [{"role": "user", "content": "hi"}], "stream": False}
@@ -465,6 +508,63 @@ try:
 finally:
     wb_proxy.POOL = None
     stop_server(srv)
+
+print("== page rotation ==")
+_page_dir = os.path.join(_TMP.name, "page-pool")
+os.makedirs(_page_dir, exist_ok=True)
+_page_pool = C.CodeArtsPool(_page_dir, C.load_config(_page_dir))
+_page_pool.accounts = [C.CodeArtsAccount({"user_id": "p%d" % i}, _page_pool)
+                       for i in range(6)]
+_page_picks = [_page_pool.pick("", page=(0, 2)).uid for _ in range(6)]
+check("a CodeArts page visits one slot per account",
+      set(_page_picks) == {"p0", "p2", "p4"}, _page_picks)
+for _uid in ("p0", "p2", "p4"):
+    _page_pool.get(_uid).disabled = True
+_fallback = _page_pool.pick("", page=(0, 2))
+check("an empty page falls back to the whole pool",
+      _fallback is not None and _fallback.uid in {"p1", "p3", "p5"},
+      _fallback.uid if _fallback else None)
+
+print("== daily credit spread ==")
+# CodeArts 每个账号每天领 100 积分，当天不用就作废；新会话必须铺开到每个账号。
+_daily_dir = os.path.join(_TMP.name, "daily-pool")
+os.makedirs(_daily_dir, exist_ok=True)
+_daily_pool = C.CodeArtsPool(_daily_dir, C.load_config(_daily_dir))
+_daily_pool.accounts = [C.CodeArtsAccount({"user_id": "d%d" % i}, _daily_pool)
+                        for i in range(3)]
+for _acct in _daily_pool.accounts:
+    _acct.expiring_window_days = 7
+    _acct.info = {
+        "credits": {
+            "total": {"amount": 100.0, "used": 0.0, "remain": 100.0, "expiring": 100.0},
+            "bonus": {"amount": 100.0, "used": 0.0, "remain": 100.0, "expiring": 100.0},
+        },
+    }
+_daily_picks = [_daily_pool.pick("deepseek-v4-flash-0731",
+                                 session_key="daily-%d" % i).uid
+                for i in range(6)]
+check("daily expiring credits spread across accounts",
+      set(_daily_picks) == {"d0", "d1", "d2"}, _daily_picks)
+_daily_pool.get("d0").info["credits"]["bonus"]["expiring"] = 0.0
+_daily_pool.get("d0").info["credits"]["total"]["expiring"] = 0.0
+_next_daily = _daily_pool.pick("deepseek-v4-flash-0731",
+                               session_key="daily-next")
+check("an account without daily credits stops being preferred",
+      _next_daily.uid in {"d1", "d2"},
+      _next_daily.uid if _next_daily else None)
+
+print("== model tiebreak ==")
+_tie_dir = os.path.join(_TMP.name, "tie-pool")
+os.makedirs(_tie_dir, exist_ok=True)
+_tie_pool = C.CodeArtsPool(_tie_dir, C.load_config(_tie_dir))
+_tie_pool.accounts = [C.CodeArtsAccount({"user_id": "t0"}, _tie_pool),
+                      C.CodeArtsAccount({"user_id": "t1"}, _tie_pool)]
+_tie_pool.accounts[0].model_daily_tokens = {"deepseek-v4-flash-0731": 100}
+_tie_pool.accounts[1].model_daily_tokens = {"deepseek-v4-flash-0731": 0}
+_tie_pick = _tie_pool.pick("deepseek-v4-flash-0731")
+check("the model with less daily usage wins the tiebreak",
+      _tie_pick is not None and _tie_pick.uid == "t1",
+      _tie_pick.uid if _tie_pick else None)
 
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
