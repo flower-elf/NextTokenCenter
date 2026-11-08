@@ -186,9 +186,8 @@ def _bootstrap_runtime(gateway, args):
     gateway.POOL.apply_proxy_slots()
     gateway.POOL.apply_reserve_credits()
     wb_usage.apply_routing_inputs(refresh=True)
-    # WB_MAX_CONCURRENT_CHAT=auto：按两个提供方刚加载完的账号池确定并发上限。此刻
-    # 监听器还没启动，没有请求能占住名额，信号量替换是安全的。
-    gateway.resize_chat_slots(gateway.provider_counts()["ready"])
+    # 启动时按设置确定并发上限、超时与网络工具参数；此刻监听器还没启动。
+    gateway.apply_runtime_settings(startup=True)
     wb_usage.apply_daily_guards()
     # 虚拟档位别名默认停止处理；操作者在模型页勾选后，excluded_seen 保证
     # 下一次启动不会又关掉。

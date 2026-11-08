@@ -4,7 +4,7 @@ import { icon } from '../../core/icons.js';
 import { copyButton } from '../../ui/widgets.js';
 import { aboutRows } from './logic.js';
 
-const GITHUB_URL = 'https://github.com/flower-elf/DSNetwork-center';
+const GITHUB_URL = 'https://github.com/flower-elf/NextTokenCenter';
 
 export function createAboutTab(page) {
   return {

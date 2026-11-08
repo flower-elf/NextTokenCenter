@@ -45,6 +45,9 @@ def row(at, model, prompt, completion, cached=0, credit=0):
 
 now = time.time()
 _lt = time.localtime(now)
+# 固定到当天中午：测试运行在午夜前后时，"today" 窗口的边界不会在计算过程中换天。
+now = time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday, 12, 0, 0, 0, 0, -1))
+_lt = time.localtime(now)
 TODAY0 = time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday, 0, 0, 0, 0, 0, -1))
 MONTH0 = time.mktime((_lt.tm_year, _lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
 _uncollected = row(MONTH0 + 7200, "glm-5.3", 1000, 0)

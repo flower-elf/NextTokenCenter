@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -1242,6 +1243,176 @@ def session_routing(accounts_dir):
         SESSION_ROTATION_COOLDOWN_MAX) * 60.0
     return affinity, tokens, cooldown
 
+RUNTIME_NUMBER_FIELDS = {
+    "chat_slot_wait": ("WB_CHAT_SLOT_WAIT", 30.0, 0.0, 600.0),
+    "client_timeout": ("WB_CLIENT_TIMEOUT", 120.0, 1.0, 3600.0),
+    "web_max_rounds": ("WB_MAX_WEB_ROUNDS", 3.0, 1.0, 8.0),
+    "web_cooldown": ("WB_WEB_COOLDOWN", 600.0, 0.0, 86400.0),
+    "web_cache_ttl": ("WB_WEB_CACHE_TTL", 600.0, 0.0, 86400.0),
+    "web_min_interval": ("WB_WEB_MIN_INTERVAL", 0.5, 0.0, 60.0),
+    "web_budget": ("WB_WEB_BUDGET", 25.0, 0.0, 600.0),
+}
+RUNTIME_TEXT_FIELDS = ("proxy_discover_host", "proxy_discover_ports")
+RUNTIME_SETTING_KEYS = (("max_concurrent_chat", "max_payload_mib")
+                        + tuple(RUNTIME_NUMBER_FIELDS) + RUNTIME_TEXT_FIELDS)
+
+
+def _runtime_number(raw, default, low, high):
+    if isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return min(max(value, low), high)
+
+
+def _runtime_concurrency(raw):
+    if raw is None:
+        return 32
+    text = str(raw).strip().lower()
+    if text in ("auto", "pool", "dynamic"):
+        return "auto"
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        return 32
+    return value if 1 <= value <= 4096 else 32
+
+
+def _clean_port_range(value):
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("proxy_discover_ports cannot be empty")
+    if "-" in text:
+        lo, _, hi = text.partition("-")
+    else:
+        lo = hi = text
+    if not lo.strip().isdigit() or not hi.strip().isdigit():
+        raise ValueError("proxy_discover_ports must be a port or a-b range")
+    lo, hi = int(lo), int(hi)
+    if lo < 1 or hi > 65535 or lo > hi:
+        raise ValueError("proxy_discover_ports must be between 1 and 65535")
+    return "%d-%d" % (lo, hi) if "-" in text else str(lo)
+
+
+def _runtime_megabytes(data):
+    raw = os.environ.get("WB_MAX_PAYLOAD_BYTES")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return max(1, int(round(value / 1048576.0)))
+    raw = data.get("max_payload_mib")
+    if isinstance(raw, bool):
+        return 16
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 16
+    return min(max(value, 1), 1024)
+
+
+def _runtime_text(raw, default):
+    text = str(raw or "").strip()
+    return text or default
+
+
+def runtime_settings(accounts_dir):
+    """一次读取运行时调优：并发、超时、网络工具与代理发现。环境变量优先。"""
+    data = load(accounts_dir)
+    out = {}
+    for key, (env, default, low, high) in RUNTIME_NUMBER_FIELDS.items():
+        raw = os.environ.get(env)
+        if raw is None:
+            raw = data.get(key)
+        out[key] = _runtime_number(raw, default, low, high)
+    raw = os.environ.get("WB_MAX_CONCURRENT_CHAT")
+    if raw is None:
+        raw = data.get("max_concurrent_chat")
+    out["max_concurrent_chat"] = _runtime_concurrency(raw)
+    mib = _runtime_megabytes(data)
+    out["max_payload_mib"] = mib
+    raw_bytes = os.environ.get("WB_MAX_PAYLOAD_BYTES")
+    if raw_bytes is not None:
+        try:
+            value = int(raw_bytes)
+        except (TypeError, ValueError):
+            value = 0
+        out["max_payload_bytes"] = value if value > 0 else mib * 1048576
+    else:
+        out["max_payload_bytes"] = mib * 1048576
+    out["proxy_discover_host"] = _runtime_text(
+        os.environ.get("WB_PROXY_DISCOVER_HOST")
+        if os.environ.get("WB_PROXY_DISCOVER_HOST") is not None
+        else data.get("proxy_discover_host"),
+        "cli-proxy-mihomo")
+    try:
+        ports = _clean_port_range(
+            os.environ.get("WB_PROXY_DISCOVER_PORTS")
+            if os.environ.get("WB_PROXY_DISCOVER_PORTS") is not None
+            else data.get("proxy_discover_ports"))
+    except ValueError:
+        ports = "17901-17910"
+    out["proxy_discover_ports"] = ports
+    return out
+
+
+def proxy_discover_host(accounts_dir):
+    return runtime_settings(accounts_dir)["proxy_discover_host"]
+
+
+def proxy_discover_ports(accounts_dir):
+    return runtime_settings(accounts_dir)["proxy_discover_ports"]
+
+
+def set_runtime_setting(accounts_dir, key, value):
+    if key == "max_concurrent_chat":
+        text = str(value or "").strip().lower()
+        if text in ("auto", "pool", "dynamic"):
+            stored = "auto"
+        else:
+            try:
+                stored = int(text)
+            except (TypeError, ValueError):
+                raise ValueError("max_concurrent_chat must be a number or auto")
+            if not 1 <= stored <= 4096:
+                raise ValueError("max_concurrent_chat must be between 1 and 4096")
+        return _store(accounts_dir, key, stored)
+    if key == "max_payload_mib":
+        if isinstance(value, bool):
+            raise ValueError("max_payload_mib must be a whole number")
+        try:
+            stored = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("max_payload_mib must be a whole number")
+        if not 1 <= stored <= 1024:
+            raise ValueError("max_payload_mib must be between 1 and 1024")
+        return _store(accounts_dir, key, stored)
+    if key in RUNTIME_NUMBER_FIELDS:
+        _env, _default, low, high = RUNTIME_NUMBER_FIELDS[key]
+        if isinstance(value, bool):
+            raise ValueError("%s must be a number" % key)
+        try:
+            stored = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("%s must be a number" % key)
+        if not math.isfinite(stored) or stored < low or stored > high:
+            raise ValueError("%s must be between %g and %g" % (key, low, high))
+        return _store(accounts_dir, key, stored)
+    if key == "proxy_discover_host":
+        text = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,253}", text):
+            raise ValueError("proxy_discover_host is not a valid host")
+        return _store(accounts_dir, key, text)
+    if key == "proxy_discover_ports":
+        return _store(accounts_dir, key, _clean_port_range(value))
+    raise KeyError(key)
+
 UPSTREAM_DEFAULTS = {
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
@@ -1660,6 +1831,34 @@ def env_overrides():
             usage[key] = {"name": name, "value": str(min(value, USAGE_LIMITS[key]))}
     if usage:
         out["usage"] = usage
+    for key, (name, default, low, high) in RUNTIME_NUMBER_FIELDS.items():
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        value = _runtime_number(raw, default, low, high)
+        out[key] = {"name": name, "value": str(value)}
+    raw = os.environ.get("WB_MAX_CONCURRENT_CHAT")
+    if raw is not None:
+        out["max_concurrent_chat"] = {
+            "name": "WB_MAX_CONCURRENT_CHAT",
+            "value": str(_runtime_concurrency(raw)),
+        }
+    raw = os.environ.get("WB_MAX_PAYLOAD_BYTES")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            out["max_payload_mib"] = {
+                "name": "WB_MAX_PAYLOAD_BYTES",
+                "value": str(max(1, int(round(value / 1048576.0)))),
+            }
+    for key, name in (("proxy_discover_host", "WB_PROXY_DISCOVER_HOST"),
+                      ("proxy_discover_ports", "WB_PROXY_DISCOVER_PORTS")):
+        raw = os.environ.get(name)
+        if raw is not None:
+            out[key] = {"name": name, "value": str(raw).strip()}
     return out
 
 

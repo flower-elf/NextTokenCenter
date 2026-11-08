@@ -135,11 +135,11 @@ class DocStyleTests(unittest.TestCase):
         self.assertEqual(offenders, [], "\n" + "\n".join(offenders))
 
     def test_readme_carries_no_changelog(self):
-        """README 只描述当前功能，版本记录写在 GitHub Release 说明里。"""
+        """README 只描述当前功能，版本记录写在 GitHub Release 说明里；允许指向 Releases 的“更新日志”入口。"""
         if not os.path.isfile(os.path.join(ROOT, "README.md")):
             self.skipTest("README.md 暂时撤除")
         text = read("README.md")
-        self.assertNotRegex(text, r"(?m)^#{1,3} .*(版本更新记录|更新日志|Unreleased|Changelog)")
+        self.assertNotRegex(text, r"(?m)^#{1,3} .*(版本更新记录|Unreleased|Changelog)")
         self.assertNotRegex(text, r"(?m)^#{2,3} v\d")
 
 

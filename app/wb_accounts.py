@@ -3424,23 +3424,6 @@ def model_daily_used(account, model):
         return 0
 
 
-def page_slice(snapshot, page, ranks=None):
-    """池子里某一页上的账号。一页是固定槽位：账号在快照中的排名（按 uid 排序）对页
-    大小取模。ranks 由调用方缓存；不给时按快照现算。页大小不小于账号数时整池就是一页。
-    """
-    try:
-        index, size = int(page[0]), int(page[1])
-    except (TypeError, ValueError, IndexError):
-        return snapshot
-    if ranks is None:
-        ranks = dict((uid, rank) for rank, uid in enumerate(
-            sorted(account.uid for account in snapshot if account.uid)))
-    if size <= 1 or size >= len(ranks):
-        return snapshot
-    return [account for account in snapshot
-            if account.uid in ranks and ranks[account.uid] % size == index % size]
-
-
 class AccountPool(object):
     def __init__(self, directory, log=None):
         self.dir = directory
@@ -3456,11 +3439,6 @@ class AccountPool(object):
         self._remaining_weights = {}
         # 手动权重（weight > 1 才生效）的平滑加权轮询累计值，与临期偏好的轮次分开。
         self._manual_weights = {}
-        # 页内选号（超限对话）的每页游标，键是 (页号, 页大小)；整池选号仍用 _cursor，
-        # 两个游标互不挪动对方的位置。
-        self._page_cursors = {}
-        # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
-        self._page_order_cache = None
         self.affinity = SessionAffinity()
         self._stats_lock = threading.Lock()
         self.routing_stats = {name: 0 for name in ROUTING_COUNTERS}
@@ -3981,10 +3959,9 @@ class AccountPool(object):
         return ""
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
-                         page=None, claim=None):
+                         claim=None):
         """为对话的一轮挑选账号：有绑定的对话沿用上一轮的账号，不可用时先试本会话的
-        其他热账号，再走池子的自动偏好。`page` 标记超限对话，在一页内轮转、不做绑定；
-        `claim` 在发出账号前先占好每账号的请求名额。
+        其他热账号，再走池子的自动偏好。`claim` 在发出账号前先占好每账号的请求名额。
         """
         exclude = set(exclude or ())
         affinity_on, limit, cooldown = wb_settings.session_routing(self.dir)
@@ -3993,7 +3970,7 @@ class AccountPool(object):
         had_binding = False
         rotate_from = None
         now = time.time()
-        if session_key and page is None:
+        if session_key:
             recent = self.affinity.recent(session_key)
             had_binding = bool(recent)
             if (recent and limit > 0
@@ -4020,20 +3997,14 @@ class AccountPool(object):
                     # 绑定的账号此刻都不能接单（冷却、限额、令牌失效、名额满）：
                     # 这段对话改由别的账号接手，接手账号重算完整前缀后缓存跟着它。
                     self.count_routing("bound_lost")
-        account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
-                            claim=claim)
-        if account is None and page is not None:
-            # 页内没有可用账号时从页外找：总好过完全不服务。
-            account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
+        account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
         if account is None and rotate_from is not None:
             # 没有别的账号能接：留在这个账号上，重置计数以免每轮都重复尝试。
             exclude.discard(rotate_from)
             account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
             if account is not None:
                 self.affinity.reset_usage(session_key)
-        # 页内对话刻意不绑定：轮转让这一页的每个账号保持热度，绑定会让它回到
-        # 单个账号（正是它被释放出来的状态）。轮转位置由页游标保存。
-        if account and session_key and page is None:
+        if account and session_key:
             self.affinity.bind(session_key, account.uid)
             if not had_binding:
                 self.count_routing("fresh_binding")
@@ -4041,18 +4012,15 @@ class AccountPool(object):
             self.count_routing("no_key")
         return account
 
-    def pick(self, realm=None, exclude=None, model=None, page=None, claim=None):
+    def pick(self, realm=None, exclude=None, model=None, claim=None):
         """按优先级分层选号：优先级数字最小的一层先接单，整层都拿不到名额时才看
         下一层。层内的顺序是手动权重 >1 的账号，然后是智能分配。
         """
         exclude = set(exclude or ())
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
-        if page is not None:
-            snapshot = self._page_slice(snapshot, page)
         for tier in self._priority_tiers(snapshot, exclude, model):
-            account = self._pick_in_tier(tier, exclude, model=model, claim=claim,
-                                         cursor_key=page)
+            account = self._pick_in_tier(tier, exclude, model=model, claim=claim)
             if account is not None:
                 return account
         return None
@@ -4072,7 +4040,7 @@ class AccountPool(object):
         for priority in sorted(tiers):
             yield tiers[priority]
 
-    def _pick_in_tier(self, tier, exclude, model=None, claim=None, cursor_key=None):
+    def _pick_in_tier(self, tier, exclude, model=None, claim=None):
         """一层账号里的选号：手动权重 >1 的先接单，然后是始终打开的智能分配。"""
         while True:
             account = self._pick_weighted_first(tier, exclude, model)
@@ -4083,7 +4051,7 @@ class AccountPool(object):
                 return account
             exclude.add(account.uid)
         return self._pick_scored(exclude=exclude, model=model, claim=claim,
-                                 snapshot=tier, cursor_key=cursor_key)
+                                 snapshot=tier)
 
     def _pick_weighted_first(self, snapshot, exclude, model):
         """手动权重 > 1 的账号优先接单，或 None（没有可交的）。权重是用户在面板上的
@@ -4165,23 +4133,8 @@ class AccountPool(object):
             setattr(self, state_name, state)
         return chosen[0]
 
-    def _page_slice(self, snapshot, page):
-        return page_slice(snapshot, page, self._page_ranks(snapshot))
-
-    def _page_ranks(self, snapshot):
-        """uid -> 在快照账号中的排名，缓存到快照变化为止。快照是按区域过滤后的池
-        （不含可用性判断），排名只在该区域增删账号时才会变。
-        """
-        uids = tuple(sorted(a.uid for a in snapshot if a.uid))
-        cached = self._page_order_cache
-        if cached is not None and cached[0] == uids:
-            return cached[1]
-        ranks = dict((uid, rank) for rank, uid in enumerate(uids))
-        self._page_order_cache = (uids, ranks)
-        return ranks
-
     def _pick_scored(self, realm=None, exclude=None, model=None, claim=None,
-                     snapshot=None, cursor_key=None):
+                     snapshot=None):
         """按积分到期节奏与最近一小时的忙闲给新对话选号。
 
         到期前每天要消耗掉的积分是义务，义务减去今天的消耗速度是欠账；欠账占候选
@@ -4189,8 +4142,7 @@ class AccountPool(object):
         候选只包括此刻能接单的账号（接不了单的算进总和会把其余账号的份额压平）。
         评分前先过临期积分层；估计剩余接近耗尽的组合获得一点倾斜，但不独占流量。
         同分时该模型今天用得少的账号优先，避开上游隐藏的单模型每日上限。优先级
-        已经由外层分层决定，评分不再重复考虑。`cursor_key` 让超限对话用自己的页
-        游标，页内轮转不挪动整池游标。
+        已经由外层分层决定，评分不再重复考虑。
         """
         exclude = exclude or set()
         if snapshot is None:
@@ -4200,8 +4152,7 @@ class AccountPool(object):
         if total == 0:
             return None
         with self._lock:
-            start = (self._page_cursors.get(cursor_key, 0) if cursor_key is not None
-                     else self._cursor)
+            start = self._cursor
         now = time.time()
         candidates = [index for index, account in enumerate(snapshot)
                       if account.uid not in exclude and account.servable(model=model)
@@ -4210,12 +4161,9 @@ class AccountPool(object):
             return None
 
         def advance(index):
-            """推进这一轮用的游标：页游标与整池游标互不影响。"""
+            """推进整池轮询游标。"""
             with self._lock:
-                if cursor_key is not None:
-                    self._page_cursors[cursor_key] = (index + 1) % total
-                else:
-                    self._cursor = (index + 1) % total
+                self._cursor = (index + 1) % total
 
         def take(account):
             """结算一次智能分配命中：推进轮询游标、记录来源并计入忙闲。"""

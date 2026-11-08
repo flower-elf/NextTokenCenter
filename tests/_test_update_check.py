@@ -44,7 +44,7 @@ def release(tag, **overrides):
         "tag_name": tag,
         "draft": False,
         "prerelease": False,
-        "html_url": "https://github.com/flower-elf/DSNetwork-center/releases/tag/" + tag,
+        "html_url": "https://github.com/flower-elf/NextTokenCenter/releases/tag/" + tag,
         "published_at": "2026-10-08T00:00:00Z",
     }
     entry.update(overrides)
@@ -69,7 +69,7 @@ class FakeFetcher(object):
 
 
 def tag_url(tag):
-    return ("https://github.com/flower-elf/DSNetwork-center"
+    return ("https://github.com/flower-elf/NextTokenCenter"
             "/releases/tag/" + tag)
 
 

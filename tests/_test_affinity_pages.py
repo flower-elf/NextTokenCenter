@@ -1,8 +1,6 @@
-"""验证会话亲和的暖账号回退与超长会话分页轮换契约。
+"""验证会话亲和的暖账号回退契约。
 
-账号不可用时，会话沿最近使用列表回退到见过它的暖账号，前缀缓存继续命中；
-超过 ``WB_AFFINITY_MAX_MSGS`` 的会话在 ``WB_AFFINITY_PAGE_SIZE`` 大小的分页内轮换，
-让分页内每个账号保持前缀缓存温热，超大请求体仍分散在多个账号上。
+账号不可用时，会话沿最近使用列表回退到见过它的暖账号，前缀缓存继续命中。
 
 运行方式：python tests/run_all.py affinity。
 """
@@ -154,91 +152,6 @@ class WarmFallbackTests(unittest.TestCase):
         history = pool.affinity.recent("s")
         self.assertIn("warm", history)
         self.assertIn("fresh", history)
-
-
-class PageRotationTests(unittest.TestCase):
-    """超过上限后，会话在池的一个分页内轮换。"""
-
-    def _pool(self, uids=("a", "b", "c", "d", "e", "f")):
-        return make_pool([make_account(uid) for uid in uids])
-
-    def test_a_page_holds_one_slot_per_account(self):
-        pool = self._pool()
-        self.assertEqual([a.uid for a in pool._page_slice(pool.accounts, (0, 2))],
-                         ["a", "c", "e"])
-        self.assertEqual([a.uid for a in pool._page_slice(pool.accounts, (1, 2))],
-                         ["b", "d", "f"])
-
-    def test_the_page_does_not_depend_on_the_load_order(self):
-        """按 uid 排序，会话的分页在重新加载后保持稳定。"""
-        pool = self._pool()
-        shuffled = list(reversed(pool.accounts))
-        self.assertEqual(sorted(a.uid for a in pool._page_slice(shuffled, (0, 3))),
-                         sorted(a.uid for a in pool._page_slice(pool.accounts, (0, 3))))
-
-    def test_a_page_is_scoped_to_its_realm(self):
-        """混合 realm 的池不能把某个 realm 的分页缩到不足 size。
-
-        跨整个池排序会把外部 realm 的账号排进分页，realm 过滤后剩下的账号不足 size，
-        甚至只剩一个，会话就又固定在单账号上，这正是长度上限要避免的状态。
-        """
-        intl = [make_account("intl-%d" % i, realm="intl") for i in range(6)]
-        pool = make_pool([make_account("cn-0", realm="cn"),
-                          make_account("cn-1", realm="cn")] + intl)
-        self.assertEqual(sorted(a.uid for a in pool._page_slice(intl, (0, 3))),
-                         ["intl-0", "intl-3"])
-        self.assertEqual(sorted(a.uid for a in pool._page_slice(intl, (1, 3))),
-                         ["intl-1", "intl-4"])
-
-    def test_rotation_visits_every_member_of_the_page(self):
-        pool = self._pool()
-        picks = [pool.pick(realm="cn", page=(0, 2)).uid for _ in range(6)]
-        self.assertEqual(set(picks), {"a", "c", "e"})
-        self.assertNotEqual(picks[0], picks[1],
-                            "a page must keep taking turns, not pin")
-
-    def test_a_page_rotation_does_not_move_the_pool_cursor(self):
-        pool = self._pool()
-        before = pool._cursor
-        for _ in range(4):
-            pool.pick(realm="cn", page=(0, 2))
-        self.assertEqual(pool._cursor, before)
-        # 页内接单也计入最近一小时的忙闲，先清掉，只看整池从原游标起步。
-        for account in pool.accounts:
-            account._pick_stamps.clear()
-        self.assertEqual([pool.pick(realm="cn").uid for _ in range(3)],
-                         ["a", "b", "c"])
-
-    def test_a_page_with_nobody_ready_falls_back_to_the_pool(self):
-        pool = self._pool()
-        for uid in ("a", "c", "e"):
-            pool.get(uid).enabled = False
-        picked = pool.pick_for_session(realm="cn", session_key="s", page=(0, 2))
-        self.assertIn(picked.uid, {"b", "d", "f"})
-
-    def test_a_page_conversation_is_not_bound(self):
-        """建立绑定会把会话重新固定到单账号上，正是它刚离开的状态。"""
-        pool = self._pool()
-        pool.pick_for_session(realm="cn", session_key="s", page=(0, 2))
-        self.assertIsNone(pool.affinity.get("s"))
-        self.assertEqual(pool.affinity.recent("s"), [])
-
-    def test_no_page_means_the_whole_pool(self):
-        pool = self._pool()
-        picks = {pool.pick(realm="cn").uid for _ in range(6)}
-        self.assertEqual(picks, {"a", "b", "c", "d", "e", "f"})
-
-    def test_a_page_larger_than_the_pool_is_the_whole_pool(self):
-        pool = self._pool(("a", "b"))
-        self.assertEqual({pool.pick(realm="cn", page=(0, 5)).uid for _ in range(4)},
-                         {"a", "b"})
-
-    def test_garbage_pages_fall_back_to_the_whole_pool(self):
-        pool = self._pool(("a", "b"))
-        for page in (("x", "y"), (0,), None):
-            self.assertEqual(
-                {pool.pick(realm="cn", page=page).uid for _ in range(4)},
-                {"a", "b"})
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import urllib.request
 import wb_settings
 
 # 主路径：走 API 不抓 HTML，页面改版不影响检查。查的是本仓库，版本号与来源仓库无关。
-REPO = "flower-elf/DSNetwork-center"
+REPO = "flower-elf/NextTokenCenter"
 RELEASES_URL = "https://api.github.com/repos/%s/releases" % REPO
 # 回退路径：302 Location 末尾是最新稳定版 tag；按网页计流量，不受 API 匿名配额
 # 60 次/小时/出口 IP 的限制，也不需要凭据。

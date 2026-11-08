@@ -463,7 +463,7 @@ class _FakePool(object):
     def count_ready(self, realm, model=None):
         return len([a for a in self.accounts if a.realm == realm and a.enabled])
 
-    def pick_for_session(self, realm, session_key=None, exclude=(), model=None, page=None,
+    def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
                          claim=None):
         for acc in self.accounts:
             if (acc.realm == realm and acc.enabled and acc.uid not in set(exclude or ())

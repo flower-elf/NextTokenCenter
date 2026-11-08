@@ -424,11 +424,11 @@ try:
     stream.close()
     check("a message prefix without a session id sticks to one account",
           first_turn.uid == second_turn.uid, (first_turn.uid, second_turn.uid))
-    derived, derived_page = wb_proxy.affinity_route(
+    derived = wb_proxy.affinity_route(
         C.build_chat_body(convo).get("messages"))
     check("the derived key is bound",
-          derived_page is None and pool.affinity.get(derived) == first_turn.uid,
-          (derived, derived_page, pool.affinity.get(derived)))
+          pool.affinity.get(derived) == first_turn.uid,
+          (derived, pool.affinity.get(derived)))
 
     print("== session rotation ==")
     pool.affinity.bind("rotate-below", "u2")
@@ -508,22 +508,6 @@ try:
 finally:
     wb_proxy.POOL = None
     stop_server(srv)
-
-print("== page rotation ==")
-_page_dir = os.path.join(_TMP.name, "page-pool")
-os.makedirs(_page_dir, exist_ok=True)
-_page_pool = C.CodeArtsPool(_page_dir, C.load_config(_page_dir))
-_page_pool.accounts = [C.CodeArtsAccount({"user_id": "p%d" % i}, _page_pool)
-                       for i in range(6)]
-_page_picks = [_page_pool.pick("", page=(0, 2)).uid for _ in range(6)]
-check("a CodeArts page visits one slot per account",
-      set(_page_picks) == {"p0", "p2", "p4"}, _page_picks)
-for _uid in ("p0", "p2", "p4"):
-    _page_pool.get(_uid).disabled = True
-_fallback = _page_pool.pick("", page=(0, 2))
-check("an empty page falls back to the whole pool",
-      _fallback is not None and _fallback.uid in {"p1", "p3", "p5"},
-      _fallback.uid if _fallback else None)
 
 print("== daily credit spread ==")
 # CodeArts 每个账号每天领 100 积分，当天不用就作废；新会话必须铺开到每个账号。

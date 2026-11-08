@@ -12,11 +12,12 @@ import wb_accounts
 import wb_ipintel
 import wb_settings
 
-PROXY_DISCOVER_HOST = os.environ.get("WB_PROXY_DISCOVER_HOST") or "cli-proxy-mihomo"
+DEFAULT_DISCOVER_HOST = "cli-proxy-mihomo"
+DEFAULT_DISCOVER_PORTS = "17901-17910"
 
 
-def _proxy_port_range():
-    raw = os.environ.get("WB_PROXY_DISCOVER_PORTS") or "17901-17910"
+def _proxy_port_range(raw=None):
+    raw = raw or os.environ.get("WB_PROXY_DISCOVER_PORTS") or DEFAULT_DISCOVER_PORTS
     if "-" in raw:
         lo, _, hi = raw.partition("-")
         if lo.strip().isdigit() and hi.strip().isdigit():
@@ -65,11 +66,12 @@ def probe_proxy_intel(proxy_url, timeout=12):
     }
 
 
-def discover_proxy_slots():
-    """探测配置好的 mihomo 主机与端口，列出可连通的出口。"""
+def discover_proxy_slots(host=None, ports=None):
+    """探测配置好的代理主机与端口，列出可连通的出口。"""
+    host = host or os.environ.get("WB_PROXY_DISCOVER_HOST") or DEFAULT_DISCOVER_HOST
     out = []
-    for port in _proxy_port_range():
-        url = "http://%s:%d" % (PROXY_DISCOVER_HOST, port)
+    for port in _proxy_port_range(ports):
+        url = "http://%s:%d" % (host, port)
         probe = probe_proxy_intel(url)
         probe["url"] = url
         probe["reachable"] = probe["ok"]

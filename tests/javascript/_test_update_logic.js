@@ -6,8 +6,8 @@ import assert from 'node:assert/strict';
 import { releaseUrl, updateAvailable } from '../../app/web/js/core/update.js';
 
 assert.equal(
-  releaseUrl({ release_url: 'https://github.com/flower-elf/DSNetwork-center/releases/tag/v1.2.3' }),
-  'https://github.com/flower-elf/DSNetwork-center/releases/tag/v1.2.3',
+  releaseUrl({ release_url: 'https://github.com/flower-elf/NextTokenCenter/releases/tag/v1.2.3' }),
+  'https://github.com/flower-elf/NextTokenCenter/releases/tag/v1.2.3',
   'GitHub 发布页原样保留');
 assert.equal(releaseUrl({ release_url: ' https://github.com/x ' }), 'https://github.com/x',
   '两端空白先去掉再判断');
@@ -17,12 +17,12 @@ assert.equal(releaseUrl({ release_url: '' }), '');
 assert.equal(releaseUrl({}), '');
 assert.equal(releaseUrl(null), '');
 assert.equal(
-  releaseUrl({ release_url: '', releases_url: 'https://github.com/flower-elf/DSNetwork-center/releases' }),
-  'https://github.com/flower-elf/DSNetwork-center/releases',
+  releaseUrl({ release_url: '', releases_url: 'https://github.com/flower-elf/NextTokenCenter/releases' }),
+  'https://github.com/flower-elf/NextTokenCenter/releases',
   '没有单条发布链接时退回发布页总入口');
 assert.equal(releaseUrl({ release_url: 'https://evil.example/x',
-                          releases_url: 'https://github.com/flower-elf/DSNetwork-center/releases' }),
-  'https://github.com/flower-elf/DSNetwork-center/releases',
+                          releases_url: 'https://github.com/flower-elf/NextTokenCenter/releases' }),
+  'https://github.com/flower-elf/NextTokenCenter/releases',
   '坏链接跳过，继续看兜底');
 
 assert.equal(updateAvailable({ update_available: true, latest_version: '1.2.3' }), true);

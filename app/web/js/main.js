@@ -152,7 +152,7 @@ function openPanelOptions() {
       <div class="col">
         <span class="section-label">链接</span>
         <div class="pill-group">
-          <a class="pill-btn" href="https://github.com/flower-elf/DSNetwork-center" target="_blank" rel="noopener noreferrer">${icon('Github')}GitHub 项目仓库</a>
+          <a class="pill-btn" href="https://github.com/flower-elf/NextTokenCenter" target="_blank" rel="noopener noreferrer">${icon('Github')}GitHub 项目仓库</a>
           <button type="button" class="pill-btn" @click=${() => { ctl.close(); navigate('keys'); }}>${icon('KeyRound')}客户端接入</button>
         </div>
       </div>

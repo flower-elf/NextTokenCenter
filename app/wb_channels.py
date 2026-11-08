@@ -1039,17 +1039,15 @@ class CodeArtsProvider(object):
         cfg = self._config()
         try:
             body = wb_codearts.build_chat_body(payload, session_key)
-            # 客户端没给会话标识时按消息前缀派生，与 WorkBuddy 共用同一个开关与
-            # 超限分页规则；否则同一段对话每轮都会换账号，前缀缓存拿不到。
-            page = None
+            # 客户端没给会话标识时按消息前缀派生，与 WorkBuddy 共用同一个开关。
             if not session_key:
-                session_key, page = _gateway().affinity_route(body.get("messages"))
+                session_key = _gateway().affinity_route(body.get("messages"))
                 audit = wb_usage.current_audit()
                 if audit is not None:
                     audit["session_key"] = session_key
             allowed = [only_uid] if only_uid else None
             stream, account, _billed = wb_codearts.open_chat(
-                cfg, body, session_key, allowed_accounts=allowed, page=page)
+                cfg, body, session_key, allowed_accounts=allowed)
         except wb_codearts.CodeArtsError as exc:
             raise self._error(exc)
         return stream, account, body.get("reasoning_effort")

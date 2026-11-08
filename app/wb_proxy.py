@@ -401,12 +401,42 @@ def resize_chat_slots(ready_accounts):
     log("chat slots : %d (one per ready account across providers; "
         "WB_MAX_CONCURRENT_CHAT=auto)" % wanted)
     return wanted
+
+
+def apply_runtime_settings(startup=False):
+    """把面板或环境变量的并发、超时、网络工具设置推到各模块。"""
+    global _chat_slots, MAX_PAYLOAD_BYTES, CHAT_SLOT_WAIT_SECONDS
+    global MAX_CONCURRENT_CHAT, CHAT_SLOTS_AUTO
+    values = wb_settings.runtime_settings(ACCOUNTS_DIR)
+    MAX_PAYLOAD_BYTES = int(values["max_payload_bytes"])
+    CHAT_SLOT_WAIT_SECONDS = float(values["chat_slot_wait"])
+    desired = values["max_concurrent_chat"]
+    CHAT_SLOTS_AUTO = desired == "auto"
+    if CHAT_SLOTS_AUTO:
+        resize_chat_slots(provider_counts()["ready"] if POOL else 0)
+    else:
+        target = int(desired)
+        if startup or target > MAX_CONCURRENT_CHAT:
+            MAX_CONCURRENT_CHAT = target
+            _chat_slots = threading.BoundedSemaphore(target)
+        elif target < MAX_CONCURRENT_CHAT:
+            log("chat slots : fixed %d saved; restart to apply" % target,
+                level="WARN")
+    import wb_http
+    wb_http.Handler.timeout = int(values["client_timeout"])
+    import wb_webtools
+    wb_webtools.MAX_WEB_ROUNDS = int(values["web_max_rounds"])
+    wb_webtools.CACHE_TTL = float(values["web_cache_ttl"])
+    wb_webtools.COOLDOWN_BLOCKED = float(values["web_cooldown"])
+    wb_webtools.MIN_INTERVAL = float(values["web_min_interval"])
+    wb_webtools.SEARCH_BUDGET = float(values["web_budget"])
+    return values
 #: 目录落盘存档：每次成功从上游 /v3/config 拉到清单就写一份响应体副本，仅留档，
 #: 网关自己不读。与 usage 一样运行时产生并列入 .gitignore；目录用
 #: WB_PROXY_CATALOG_DIR 覆盖。
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(APP_DIR)
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 # 用量记账：每个上游响应都带 usage 块，网关同时为每个请求写一行 JSONL。
 # 默认目录在本脚本旁边，可用 --usage-dir 或 WB_PROXY_USAGE_DIR 覆盖。
 USAGE_DIR = os.environ.get("WB_PROXY_USAGE_DIR") \
@@ -549,6 +579,7 @@ def runtime_settings_view():
         }
         item["status"] = wb_settings.key_status(item, stat, now)
         keys.append(item)
+    runtime = wb_settings.runtime_settings(ACCOUNTS_DIR)
     return {
         "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
         "api_key_set": bool(key),
@@ -613,6 +644,17 @@ def runtime_settings_view():
             wb_settings.panel_update_check_interval_hours(ACCOUNTS_DIR),
         # 被环境变量控制的项：面板标出环境变量的当前取值，控件仍可编辑。
         "env_overrides": wb_settings.env_overrides(),
+        "max_concurrent_chat": runtime["max_concurrent_chat"],
+        "max_payload_mib": runtime["max_payload_mib"],
+        "chat_slot_wait": runtime["chat_slot_wait"],
+        "client_timeout": runtime["client_timeout"],
+        "web_max_rounds": runtime["web_max_rounds"],
+        "web_cooldown": runtime["web_cooldown"],
+        "web_cache_ttl": runtime["web_cache_ttl"],
+        "web_min_interval": runtime["web_min_interval"],
+        "web_budget": runtime["web_budget"],
+        "proxy_discover_host": runtime["proxy_discover_host"],
+        "proxy_discover_ports": runtime["proxy_discover_ports"],
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
         "usage": wb_settings.usage_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
@@ -651,62 +693,24 @@ def affinity_debug_enabled():
     return wb_settings.affinity_debug(ACCOUNTS_DIR)
 
 
-# 亲和的上限：对话超过这么多条消息后停止绑定账号。亲和把整段对话固定在一个账号上，
-# 上下文单调增长，该账号反复接收越来越大的请求体。实测（wk4 实例，2026-10-08，333 个
-# 请求）请求体与上游断连率的关系：
-#
-#     msgs <150    82 个请求   断连率  0.0%
-#     msgs 150-300 59 个请求   断连率  3.4%
-#     msgs 300-400 64 个请求   断连率  7.8%
-#     msgs 400-500 50 个请求   断连率 10.0%
-#
-# 断连（TimeoutError / RemoteDisconnected）触发重试，把 8.8s 的请求拖到 11.6s。超过阈值后
-# 放弃亲和重新参与轮询：丢掉前缀缓存，换断连和重试消失。阈值不能太低（本实例 94% 的
-# 请求缓存命中率来自亲和）。设 0 表示不限制，保持 1.6.x 的原有行为。
-AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
-# 超限对话改成【页内轮转】而不是撒到整个池子。整池轮转下每个账号要等「池子大小」轮才
-# 再见到这段对话，间隔超过上游缓存存活期就整段漏。线上实测（2026-10-10，37706 条请求）：
-# 超限对话占 59% 的 prompt token，却贡献了 64% 的漏掉量，签名是只命中约 24k 的系统提示
-# ——典型的「落在没预热过的账号上」。页内轮转把「再见到」的周期从「池子大小」轮缩到
-# size 轮，超大请求体仍摊在 size 个账号上。
-#
-# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样固定账号（等于取消上限）；
-# 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
-AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
 def affinity_route(messages):
-    """这段对话的 (session_key, page)。session_key 是稳定的对话键；page 是池页 (index, size)，
-    仅消息数超过 AFFINITY_MAX_MSGS 的对话用它做页内轮转，其余为 None。两者都来自同一个
-    头部哈希，同一段对话每轮取值一致，不需要服务端状态。客户端自带会话标识时优先用它，
-    否则按对话前缀派生，两者共用「会话粘性」开关，关掉就完全不绑定。"""
+    """这段对话的稳定键。客户端自带会话标识时优先用它，否则按前两条消息派生；
+    两者共用「会话粘性」开关，关掉就完全不绑定。"""
     if not wb_settings.session_affinity(ACCOUNTS_DIR):
-        return None, None
+        return None
     try:
         msgs = messages or []
         if not msgs:
-            return None, None
+            return None
         head = msgs[:2]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        digest = hashlib.sha256(blob).hexdigest()[:16]
-        key = "pfx-" + digest
-        if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
-            if AFFINITY_PAGE_SIZE > 1:
-                page = (int(digest[:8], 16) % AFFINITY_PAGE_SIZE, AFFINITY_PAGE_SIZE)
-                if affinity_debug_enabled():
-                    log("affinity: %d msgs (> %d), page %d/%d"
-                        % (len(msgs), AFFINITY_MAX_MSGS, page[0], page[1]))
-                return key, page
-            if AFFINITY_PAGE_SIZE == 1:
-                # 和普通对话一样固定账号，等于取消上限。
-                return key, None
-            if affinity_debug_enabled():
-                log("affinity: skip %d msgs (> %d), letting the pool rotate"
-                    % (len(msgs), AFFINITY_MAX_MSGS))
-            return None, None
-        return key, None
+        return "pfx-" + hashlib.sha256(blob).hexdigest()[:16]
     except Exception:
-        return None, None
+        return None
+
+
 def derive_affinity_key(messages):
-    return affinity_route(messages)[0]
+    return affinity_route(messages)
 def prompt_fingerprint(messages):
     """出站 prompt 的隐私安全指纹：缓存命中要求前缀逐字节相同，这组哈希回答前缀是否稳定、
     对话是否连续，不存储任何文本。"""
@@ -1939,17 +1943,15 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     upstream_body = (prebuilt_body if prebuilt_body is not None
                      else build_upstream_body(payload))
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。位置放在 build_upstream_body
-    # 之后，保证键与真正发往上游的消息一致；affinity_page 只在超限对话上有值。
-    affinity_page = None
+    # 之后，保证键与真正发往上游的消息一致。
     if not session_key:
-        session_key, affinity_page = affinity_route(upstream_body.get("messages"))
+        session_key = affinity_route(upstream_body.get("messages"))
         if session_key and affinity_debug_enabled():
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
     if not wb_settings.session_affinity(ACCOUNTS_DIR):
         # 面板关闭会话粘性：每一轮都重新选号。
         session_key = None
-        affinity_page = None
     if audit is not None:
         audit["session_key"] = session_key
     total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
@@ -2026,7 +2028,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         else:
             account = POOL.pick_for_session(
                 realm=realm, session_key=session_key, exclude=tried, model=model,
-                page=affinity_page,
                 claim=(lambda candidate: lease.claim(candidate, model))
                       if lease is not None else None) if POOL else None
         if account is None:

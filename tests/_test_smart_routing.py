@@ -13,6 +13,7 @@ import time
 import threading
 import unittest
 import urllib.error
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
 _TMP = tempfile.mkdtemp(prefix="wb-routing-")
@@ -476,6 +477,70 @@ class SessionRotationTests(unittest.TestCase):
         again = self.pool.pick_for_session(realm="cn", session_key="s1", model=MODEL)
         self.assertEqual(again.uid, first.uid)
         self.assertEqual(self.pool.affinity.usage("s1", MODEL), 0.0)
+
+
+class RuntimeSettingsTests(unittest.TestCase):
+    """并发、超时、网络工具与代理发现的设置读写，环境变量优先。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="wb-runtime-")
+
+    def test_defaults(self):
+        values = wb_settings.runtime_settings(self.dir)
+        self.assertEqual(values["max_concurrent_chat"], 32)
+        self.assertEqual(values["max_payload_mib"], 16)
+        self.assertEqual(values["max_payload_bytes"], 16 * 1048576)
+        self.assertEqual(values["chat_slot_wait"], 30.0)
+        self.assertEqual(values["client_timeout"], 120.0)
+        self.assertEqual(values["web_max_rounds"], 3.0)
+        self.assertEqual(values["web_cooldown"], 600.0)
+        self.assertEqual(values["web_cache_ttl"], 600.0)
+        self.assertEqual(values["web_min_interval"], 0.5)
+        self.assertEqual(values["web_budget"], 25.0)
+        self.assertEqual(values["proxy_discover_host"], "cli-proxy-mihomo")
+        self.assertEqual(values["proxy_discover_ports"], "17901-17910")
+
+    def test_environment_wins(self):
+        env = {
+            "WB_MAX_CONCURRENT_CHAT": "auto",
+            "WB_MAX_PAYLOAD_BYTES": str(32 * 1048576),
+            "WB_WEB_COOLDOWN": "42",
+            "WB_PROXY_DISCOVER_HOST": "proxy.local",
+            "WB_PROXY_DISCOVER_PORTS": "100-101",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            values = wb_settings.runtime_settings(self.dir)
+        self.assertEqual(values["max_concurrent_chat"], "auto")
+        self.assertEqual(values["max_payload_mib"], 32)
+        self.assertEqual(values["max_payload_bytes"], 32 * 1048576)
+        self.assertEqual(values["web_cooldown"], 42.0)
+        self.assertEqual(values["proxy_discover_host"], "proxy.local")
+        self.assertEqual(values["proxy_discover_ports"], "100-101")
+
+    def test_settings_round_trip(self):
+        wb_settings.set_runtime_setting(self.dir, "max_concurrent_chat", "auto")
+        wb_settings.set_runtime_setting(self.dir, "max_payload_mib", 32)
+        wb_settings.set_runtime_setting(self.dir, "web_max_rounds", 5)
+        wb_settings.set_runtime_setting(self.dir, "proxy_discover_host", "proxy.local")
+        wb_settings.set_runtime_setting(self.dir, "proxy_discover_ports", "100-101")
+        values = wb_settings.runtime_settings(self.dir)
+        self.assertEqual(values["max_concurrent_chat"], "auto")
+        self.assertEqual(values["max_payload_bytes"], 32 * 1048576)
+        self.assertEqual(values["web_max_rounds"], 5.0)
+        self.assertEqual(values["proxy_discover_host"], "proxy.local")
+        self.assertEqual(values["proxy_discover_ports"], "100-101")
+
+    def test_invalid_values_are_refused(self):
+        for key, value in (
+            ("max_concurrent_chat", 0),
+            ("max_payload_mib", 0),
+            ("web_max_rounds", 9),
+            ("web_min_interval", -1),
+            ("proxy_discover_host", "http://proxy"),
+            ("proxy_discover_ports", "0-1"),
+        ):
+            with self.assertRaises(ValueError):
+                wb_settings.set_runtime_setting(self.dir, key, value)
 
 
 class DailyCreditFoldTests(unittest.TestCase):

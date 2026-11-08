@@ -1303,6 +1303,18 @@ class PanelRoutes(object):
                     "invalid_request_error")
             reply["task_jitter_max"] = wb_settings.set_task_jitter_max(
                 _g().ACCOUNTS_DIR, value)
+        runtime_saved = False
+        for key in wb_settings.RUNTIME_SETTING_KEYS:
+            if key not in payload:
+                continue
+            try:
+                reply[key] = wb_settings.set_runtime_setting(
+                    _g().ACCOUNTS_DIR, key, payload.get(key))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            runtime_saved = True
+        if runtime_saved:
+            _g().apply_runtime_settings()
         if "scheduler_hours" in payload:
             try:
                 cleaned = wb_settings.set_scheduler_hours(
@@ -1493,7 +1505,9 @@ class PanelRoutes(object):
                 reply["name"] = (updated or {}).get("name", "")
             return self._json(200, reply)
         if path == "/proxy/discover":
-            return self._json(200, {"candidates": wb_proxy_slots.discover_proxy_slots()})
+            return self._json(200, {"candidates": wb_proxy_slots.discover_proxy_slots(
+                wb_settings.proxy_discover_host(_g().ACCOUNTS_DIR),
+                wb_settings.proxy_discover_ports(_g().ACCOUNTS_DIR))})
         return self._error(404, "not found", "invalid_request_error")
 
     # ---- 一键配置客户端接入（wb_agents） ----
